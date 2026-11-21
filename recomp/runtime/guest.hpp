@@ -142,7 +142,17 @@ inline uint64_t out(double d) {
 inline uint32_t fadd(uint32_t n, uint32_t m) { return out(f32(in(n)) + f32(in(m))); }
 inline uint32_t fsub(uint32_t n, uint32_t m) { return out(f32(in(n)) - f32(in(m))); }
 inline uint32_t fmul(uint32_t n, uint32_t m) { return out(f32(in(n)) * f32(in(m))); }
+// Division by zero is defined in IEEE arithmetic (an infinity, or the default
+// NaN for 0/0), as on the SH-4; MSVC warns about it once inlined next to a zero.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4723)
+#endif
 inline uint32_t fdiv(uint32_t n, uint32_t m) { return out(f32(in(n)) / f32(in(m))); }
+inline uint64_t ddiv(uint64_t n, uint64_t m) { return out(f64(in(n)) / f64(in(m))); }
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 inline uint32_t fsqrt(uint32_t n) { return out(std::sqrt(f32(in(n)))); }
 // fmac: FR0 * FRm + FRn, rounded once.
 inline uint32_t fmac(uint32_t fr0, uint32_t m, uint32_t n) { return out(std::fma(f32(in(fr0)), f32(in(m)), f32(in(n)))); }
@@ -151,7 +161,6 @@ inline uint32_t fcmp_gt(uint32_t n, uint32_t m) { return f32(in(n)) > f32(in(m))
 inline uint64_t dadd(uint64_t n, uint64_t m) { return out(f64(in(n)) + f64(in(m))); }
 inline uint64_t dsub(uint64_t n, uint64_t m) { return out(f64(in(n)) - f64(in(m))); }
 inline uint64_t dmul(uint64_t n, uint64_t m) { return out(f64(in(n)) * f64(in(m))); }
-inline uint64_t ddiv(uint64_t n, uint64_t m) { return out(f64(in(n)) / f64(in(m))); }
 inline uint64_t dsqrt(uint64_t n) { return out(std::sqrt(f64(in(n)))); }
 inline uint32_t dcmp_eq(uint64_t n, uint64_t m) { return f64(in(n)) == f64(in(m)); }
 inline uint32_t dcmp_gt(uint64_t n, uint64_t m) { return f64(in(n)) > f64(in(m)); }
