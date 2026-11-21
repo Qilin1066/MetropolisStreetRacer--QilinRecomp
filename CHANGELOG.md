@@ -13,9 +13,11 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ### Changed
 - **The launcher is replaced natively, not lifted** (`docs/roadmap-and-design-targets.md`). Only the game, `MSR.BIN`, is lifted.
+- **The sister projects are mentioned by their new names** (GBTGhoulies--QilinRecomp, RhythmHeavenFever--QilinRecomp for Beat the Beat, ApbArcade--QilinRecomp: renamed by the owner; GitHub redirects the old names).
 
 ### Added
 - **The hand-over between launcher and game** (`docs/disc-and-boot-analysis.md`), read from both programs: the argument block, the arguments the game takes, the attract loop that crosses programs, what the native replacement has to do, and what is still to confirm against the original running.
+- **Licence: GPL-3.0** (`LICENSE`; the README's Licence section), as in all the QilinRecomp projects by the owner's choice. The project had none before, which left everyone without the right to use it.
 
 ## [0.3.0] - 2026-11-21
 The game's disc is read. It boots a launcher that loads the game over itself; both are built on Sega's own libraries, the decoder agrees with binutils on every word of both, and function discovery finds 5,209 functions in the game.

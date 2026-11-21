@@ -1,6 +1,6 @@
 # MetropolisStreetRacer--QillinRecomp
 
-A static recompilation of **Metropolis Street Racer** (Bizarre Creations, Sega Dreamcast, 2000–2001) into portable C++23 with a Vulkan 1.3 renderer, aimed at 64-bit Windows, Linux and macOS, on x86-64 or ARM64. Anything with a Vulkan 1.3 driver is in scope, including the Raspberry Pi 4 (Mesa 24.3+); every 64-bit Mac with a Metal GPU that runs macOS 10.15 (Catalina) or later, Intel or Apple Silicon, is covered through MoltenVK. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor. The requirements and scope are the same as [GBTG-Qilincomp](https://github.com/Qilin1066/GBTGhoulies-Qilincomp)'s and BeatTheBeat-QilinComp's.
+A static recompilation of **Metropolis Street Racer** (Bizarre Creations, Sega Dreamcast, 2000–2001) into portable C++23 with a Vulkan 1.3 renderer, aimed at 64-bit Windows, Linux and macOS, on x86-64 or ARM64. Anything with a Vulkan 1.3 driver is in scope, including the Raspberry Pi 4 (Mesa 24.3+); every 64-bit Mac with a Metal GPU that runs macOS 10.15 (Catalina) or later, Intel or Apple Silicon, is covered through MoltenVK. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor. The requirements and scope are the same as [GBTGhoulies--QilinRecomp](https://github.com/Qilin1066/GBTGhoulies--QilinRecomp)'s and RhythmHeavenFever--QilinRecomp's.
 
 > **No game data is included, and none ever will be.** You need your own copy of the game: the North American release (`MK-51012`, `V1.010`). The tools read the disc image and the disc's files from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repo.
 
@@ -81,6 +81,12 @@ This compares the decoder with GNU objdump (`-m sh4 -EL`): mnemonic and every op
 | `recomp/tests/` | Unit tests on a synthetic disc image, the decoder and synthetic programs, so they need no game files |
 | `tools/check/` | The decoder cross-check against GNU objdump |
 | `docs/` | Roadmap and design targets, prior art, analysis and status notes |
+
+## Licence
+
+This project's own code and documentation are under the [GNU General Public License, version 3](LICENSE) (GPL-3.0), as in the other QilinRecomp projects: you may use, share, change and sell it, but anything you distribute that is built from it must come with its full source under the same licence.
+
+The game itself is Sega's and Bizarre Creations' and is not covered by anything here: you need your own copy, and nothing built from it may be shared.
 
 ## Design targets (short version)
 

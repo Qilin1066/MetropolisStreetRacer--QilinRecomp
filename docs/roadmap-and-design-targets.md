@@ -2,7 +2,7 @@
 
 **Guiding principle: efficiency and reliability come first.** Every design choice is judged on whether it makes the game cheaper to run on low-end hardware and whether it fails loudly and predictably instead of silently misbehaving.
 
-The requirements and scope are the same as GBTGhoulies-Qilincomp's (Grabbed by the Ghoulies) and BeatTheBeat-QilinComp's. Where the Dreamcast differs from the Xbox and the Wii, this document says how the same rule applies. Anything marked *to confirm* is a starting position that the analysis of the real disc must prove or replace; nothing here is assumed silently.
+The requirements and scope are the same as GBTGhoulies--QilinRecomp's (Grabbed by the Ghoulies) and RhythmHeavenFever--QilinRecomp's. Where the Dreamcast differs from the Xbox and the Wii, this document says how the same rule applies. Anything marked *to confirm* is a starting position that the analysis of the real disc must prove or replace; nothing here is assumed silently.
 
 ## Targets
 - **Game:** *Metropolis Street Racer* (Bizarre Creations, Sega, 2000–2001), the North American Dreamcast release: `MK-51012`, `V1.010`, dated 2000-11-30. The disc holds two programs that matter, a launcher (`1ST_READ.BIN`) and the game (`MSR.BIN`), each recognised by its SHA-256 (`disc-and-boot-analysis.md`). The web browser on the disc is out of scope. The three European pressings are other binaries and out of scope for now.

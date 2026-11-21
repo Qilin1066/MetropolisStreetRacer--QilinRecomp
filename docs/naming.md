@@ -1,6 +1,6 @@
 # Naming
 
-**Qilin** is the author's name. It goes on the *tools*, the things that do the recompiling. It doesn't go on the game. This is the same rule as GBTG-Qilincomp's and BeatTheBeat-QilinComp's.
+**Qilin** is the author's name. It goes on the *tools*, the things that do the recompiling. It doesn't go on the game. This is the same rule as GBTGhoulies--QilinRecomp's and RhythmHeavenFever--QilinRecomp's.
 
 | Thing | Name | Why |
 |---|---|---|

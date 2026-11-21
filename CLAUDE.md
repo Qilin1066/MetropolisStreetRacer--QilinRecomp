@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Static recompilation of **Metropolis Street Racer** (Dreamcast, North American release) to native code. Same requirements and scope as the sister projects Qilin1066/GBTGhoulies-Qilincomp, BeatTheBeat-QilinComp and ApbArcade-QilinComp. When something here is silent, do what they do.
+Static recompilation of **Metropolis Street Racer** (Dreamcast, North American release) to native code. Same requirements and scope as the sister projects Qilin1066/GBTGhoulies--QilinRecomp, RhythmHeavenFever--QilinRecomp and ApbArcade--QilinRecomp. When something here is silent, do what they do.
 
 ## Requirements (non-negotiable)
 
