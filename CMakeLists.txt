@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(MetropolisStreetRacerQilinRecomp VERSION 0.5.0 LANGUAGES CXX)
+project(MetropolisStreetRacerQilinRecomp VERSION 0.6.0 LANGUAGES CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -70,6 +70,7 @@ add_library(qilin_core STATIC
     recomp/src/report.cpp
     recomp/src/decoder.cpp
     recomp/src/cfg.cpp
+    recomp/src/lifter.cpp
 )
 target_include_directories(qilin_core PUBLIC recomp/src)
 target_link_libraries(qilin_core PUBLIC qilin_disc PRIVATE qilin_warnings)
@@ -80,9 +81,35 @@ target_link_libraries(qilin PRIVATE qilin_core qilin_warnings)
 qilin_tool(qilin)
 target_compile_definitions(qilin PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
 
+# ---- What lifted code runs on: header-only, plus the dispatch table lookup ----
+add_library(qilin_runtime INTERFACE)
+target_include_directories(qilin_runtime INTERFACE recomp/runtime)
+if(MSVC)
+    target_compile_options(qilin_runtime INTERFACE /fp:precise)
+else()
+    target_compile_options(qilin_runtime INTERFACE -ffp-contract=off -fno-fast-math)
+endif()
+
+# ---- Lifted code (optional): the output of `qilin lift`, which is derived
+# from the game and so lives outside the repository ----
+#   qilin lift disc/MSR.BIN --out gen && cmake -B build -DQILIN_GEN_DIR=$PWD/gen
+# qilin_difftest runs it against the original code (tools/difftest), with
+# memory accesses checked.
+set(QILIN_GEN_DIR "" CACHE PATH "qilin lift output directory")
+if(QILIN_GEN_DIR)
+    file(GLOB QILIN_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
+    add_library(qilin_gen_checked STATIC ${QILIN_GEN_SOURCES} recomp/runtime/dispatch.cpp)
+    target_include_directories(qilin_gen_checked PUBLIC "${QILIN_GEN_DIR}")
+    target_compile_definitions(qilin_gen_checked PUBLIC QILIN_CHECKED_MEMORY)
+    target_link_libraries(qilin_gen_checked PUBLIC qilin_runtime PRIVATE qilin_warnings)
+    add_executable(qilin_difftest tools/difftest/harness.cpp)
+    target_link_libraries(qilin_difftest PRIVATE qilin_gen_checked qilin_disc qilin_warnings)
+    qilin_tool(qilin_difftest)
+endif()
+
 # ---- Tests (no game files needed) ----
 enable_testing()
 add_executable(qilin_tests recomp/tests/tests.cpp)
-target_link_libraries(qilin_tests PRIVATE qilin_core qilin_warnings)
+target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)

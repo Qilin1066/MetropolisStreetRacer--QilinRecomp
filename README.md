@@ -1,4 +1,4 @@
-# MetropolisStreetRacer--QillinRecomp
+# MetropolisStreetRacer--QilinRecomp
 
 A static recompilation of **Metropolis Street Racer** (Bizarre Creations, Sega Dreamcast, 2000–2001) into portable C++23 with a Vulkan 1.3 renderer, aimed at 64-bit Windows, Linux and macOS, on x86-64 or ARM64. Anything with a Vulkan 1.3 driver is in scope, including the Raspberry Pi 4 (Mesa 24.3+); every 64-bit Mac with a Metal GPU that runs macOS 10.15 (Catalina) or later, Intel or Apple Silicon, is covered through MoltenVK. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor. The requirements and scope are the same as [GBTGhoulies--QilinRecomp](https://github.com/Qilin1066/GBTGhoulies--QilinRecomp)'s and RhythmHeavenFever--QilinRecomp's.
 
@@ -18,7 +18,9 @@ Roadmap step 1, **analysis**, is under way. The disc has been read: it boots a l
 | This game's disc: build, programs, system layer, file list | ✅ recorded (not Windows CE; Shinobi 1.68, Kamui 2, CRI ADX and Sofdec). The game's own file formats and the hand-over between launcher and game are next |
 | Function discovery + CFG (constant propagation for calls through the literal pool, delay slots, literal pools, the Hitachi compiler's jump tables) | 🔨 on the game: 5,247 functions, all 22 jump tables resolved, **99.2% of the bytes accounted for** (code, literals, tables, padding, referenced data, dead code), 10 suspects. 43 spans (10,024 bytes) are still unexplained (`docs/recompiler-core.md`) |
 | Floating-point mode analysis (FPSCR's PR, SZ and FR at every instruction whose meaning depends on them) | 🔨 proven for 1,498 of the game's 1,507 floating-point functions (66,433 of 66,561 instructions); nothing runs in the wrong precision. Nine functions left: double-precision runtime helpers and library routines (`docs/recompiler-core.md`) |
-| Lifter → C++, differential test against the original code | next |
+| Lifter → C++, slice 1 (integer code, memory, branches with delay slots, calls, jump tables) | 🔨 3,614 of the game's 5,247 functions lifted (178,297 instructions); the generated C++ compiles warning-free. The rest need floating point (1,507), are privileged (125) or branch into a delay slot (1) |
+| Differential test: each lifted function against the original code under QEMU's SH-4, from random states, comparing every register and all of RAM | 🔨 **0 failures**; 1,676 functions pass, 1,938 have no conclusive trial yet (random inputs fault, or a callee isn't lifted) |
+| Lifter slice 2: floating point | next |
 | Runtime: system layer, GD-ROM files, graphics on Vulkan, audio, input, saves | later (see roadmap) |
 
 ## Versions and changes
@@ -60,12 +62,24 @@ build/qilin insns   disc/MSR.BIN [-o listing.txt]             # every word of a 
 build/qilin cfg     disc/MSR.BIN [--json cfg.json]            # function discovery + control flow, summary
 build/qilin coverage disc/MSR.BIN [--list]                    # every byte: code, literal, table, padding, data, dead or unknown (exit 3 if any unknown)
 build/qilin suspects disc/MSR.BIN                             # functions with problems, for review
+build/qilin lift    disc/MSR.BIN --out gen                    # lift every function it can to C++ (gen/ is derived from the game: never commit it)
 build/qilin fpmode  disc/MSR.BIN [--list]                     # floating-point mode proof: what is unproven (exit 3 if anything is)
 build/qilin trial   disc/MSR.BIN --base 0x8c0664cc            # explore one address as a function; why it would or wouldn't be accepted
 build/qilin disasm  words.bin [--base 0x8c010000]             # a file of little-endian words, decoded
 ```
 
 `disc/` is gitignored: never commit it. `MSR.BIN` is the game and `1ST_READ.BIN` the launcher; every command takes either. Each is a flat image of code and data mixed, so `insns` and `profile` cover both until function discovery tells them apart.
+
+### Differential test
+
+```sh
+build/qilin lift disc/MSR.BIN --out gen
+cmake -S . -B build-dt -DCMAKE_BUILD_TYPE=Release -DQILIN_GEN_DIR=$PWD/gen
+cmake --build build-dt --parallel --target qilin_difftest
+python3 tools/difftest/difftest.py --harness build-dt/qilin_difftest --bin disc/MSR.BIN --gen gen [--trials 3] [--only 8c0100a0]
+```
+
+Runs each lifted function and the original code from the same random state and compares all registers and all of RAM. The original runs under `qemu-system-sh4` (`apt install qemu-system-misc`), driven through its debugger port.
 
 ### Decoder check
 
@@ -80,9 +94,11 @@ This compares the decoder with GNU objdump (`-m sh4 -EL`): mnemonic and every op
 
 | Path | What |
 |---|---|
-| `recomp/src/` | Recompiler core: `gdrom` (disc images), `bootfile` (IP.BIN and the boot file), `sha256`, `decoder` (SH-4), `cfg` (function discovery + control flow), `report` (JSON), `main` (CLI) |
+| `recomp/src/` | Recompiler core: `gdrom` (disc images), `bootfile` (IP.BIN and the boot file), `sha256`, `decoder` (SH-4), `cfg` (function discovery, control flow, floating-point mode), `lifter` (SH-4 → C++), `report` (JSON), `main` (CLI) |
+| `recomp/runtime/` | What lifted code runs on: the register context, memory access, arithmetic helpers, the function table lookup |
 | `recomp/tests/` | Unit tests on a synthetic disc image, the decoder and synthetic programs, so they need no game files |
 | `tools/check/` | The decoder cross-check against GNU objdump |
+| `tools/difftest/` | The differential test: lifted code against the original under QEMU |
 | `docs/` | Roadmap and design targets, prior art, analysis and status notes |
 
 ## Licence

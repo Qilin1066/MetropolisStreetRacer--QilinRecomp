@@ -4,7 +4,7 @@
 
 | Thing | Name | Why |
 |---|---|---|
-| The repo / project | MetropolisStreetRacer--QillinRecomp | The game plus the toolchain that ports it |
+| The repo / project | MetropolisStreetRacer--QilinRecomp | The game plus the toolchain that ports it |
 | The recompiler CLI | `qilin` | The author's tool: short, unique, easy to type |
 | C++ namespaces of the recompiler and runtime | `qilin`, `qilin::sh4` (the decoder), `qilin::rt`, `qilin::gen` | Project namespace; avoids collisions with game, SDK or system names |
 | Build options, macros, CMake targets | `QILIN_*`, `qilin_*` | Same prefix as the namespace, so it's obvious what owns them |

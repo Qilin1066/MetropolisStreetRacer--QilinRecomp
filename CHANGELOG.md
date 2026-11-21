@@ -11,6 +11,19 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-21
+The first lifted code: 3,614 of the game's 5,247 functions as C++, and a differential test that runs each against the original instructions. No failures.
+
+### Added
+- **Lifter, slice 1** (`recomp/src/lifter.*`, `qilin lift <program> --out <dir>`): integer code with the T, S, Q and M bits, MACH/MACL, PR and GBR; every load and store form; branches with their delay slots in the CPU's order; direct and indirect calls with a check that the callee returned where it should; tail calls and fall-through; the compiler's jump tables as a `switch`; PC-relative loads as constants. Registers live in host locals and are synced to the context around calls and returns. A function with an instruction the slice doesn't cover isn't lifted, and the reason is reported.
+- **Runtime header** (`recomp/runtime/guest.hpp`, `dispatch.cpp`): the register context, flat little-endian memory (checked, alignment included, in test builds), the arithmetic helpers (`addc`, `subc`, `addv`, `subv`, `div1`, `mac.l`, `mac.w`, `shad`, `shld`), what stops lifted code (`rt::Stop`), and the function-table lookup for indirect calls.
+- **Differential test** (`tools/difftest/`): each lifted function and the original code from the same random state, comparing r0–r15, PR, GBR, MACH, MACL, the status bits and all 16 MiB of RAM. The original runs under `qemu-system-sh4`, driven through its debugger port; QEMU is run as a tool. Built with `-DQILIN_GEN_DIR`.
+- **Results on the game** (`docs/recompiler-core.md`): 3,614 functions lifted (1,507 need floating point, 125 are privileged, 1 branches into a delay slot); the generated C++ compiles without warnings under GCC 14 with warnings as errors. Differential test, 3 trials each: **0 failures**, 1,676 pass, 1,938 without a conclusive trial yet. Breaking a helper on purpose makes it fail, as it should.
+- **Tests:** the lifter's output for calls, delay slots, `bt.s`, `rts`, jump tables, tail calls and what it refuses; the runtime helpers, with the manual's 32 ÷ 16 division through `div1`.
+
+### Changed
+- **The repository is MetropolisStreetRacer--QilinRecomp** (renamed by the owner: the old name had a typo). README and `docs/naming.md` follow.
+
 ## [0.5.0] - 2026-11-21
 The floating-point mode analysis: what the lifter needs to know before it can emit any floating-point code. Proven for 1,498 of the game's 1,507 functions that use floating point.
 

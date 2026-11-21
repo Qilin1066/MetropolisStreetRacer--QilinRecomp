@@ -1,6 +1,6 @@
 # Recompiler core
 
-Design and results of the recompiler's pieces, in the order they are built. So far: the decoder, function discovery with control flow, and the floating-point mode analysis.
+Design and results of the recompiler's pieces, in the order they are built. So far: the decoder, function discovery with control flow, the floating-point mode analysis, the lifter's first slice and the differential test.
 
 ## SH-4 decoder (v0.1.0)
 
@@ -174,3 +174,73 @@ The same floating-point encoding means different things depending on three bits 
 - An entry mode per function, from its call sites, for the double-precision helpers.
 - Read the three bank-swapping library routines; decide whether they are lifted or belong to a replaced library.
 - Confirm the program's entry mode against the original running.
+
+## Lifter, slice 1: integer code (v0.6.0)
+
+`recomp/src/lifter.*` (the lifter), `recomp/runtime/guest.hpp` (what its output runs on), `qilin lift <program> --out <dir>`.
+
+### What it produces
+
+One C++ function per guest function, `void fn_8c010202(rt::Context& c)`:
+
+- **Registers in locals.** The general registers the function uses are host locals, loaded from the context at entry. The ones it writes go back to the context before control leaves (a call, a tail call, a return), and all of them are read again after a call. The T bit is a local too. PR, GBR, MACH/MACL and the S, Q and M bits are used in the context directly.
+- **Control flow as labels and gotos**, one label per branch target, in address order.
+- **Delay slots in the CPU's order.** A delayed branch and its slot are one unit: the branch reads what it needs (its condition for `bt.s`/`bf.s`, its target register for `jsr`/`jmp`/`braf`/`bsrf`, PR for `rts`; a call sets PR), then the slot's instruction runs, then control moves.
+- **Calls.** A call the analysis resolved is a direct C++ call; one through a register it couldn't resolve goes through the generated function table (`rt::call`), and an address that isn't a function stops. Every call sets PR to the return address and checks, when the callee comes back, that it returned there; a callee that returned somewhere else stops (`BadReturn`).
+- **Tail calls** (a jump to another function, a function that runs into the next) are a call followed by a return.
+- **Jump tables** are a `switch` on the target address with the table's proven targets as cases, and a stop as the default.
+- **PC-relative loads are constants.** The literal pool is read when lifting, not at run time.
+- **Memory** is `base + address`, little-endian as on every host, so loads and stores are plain. With `QILIN_CHECKED_MEMORY` (test and bring-up builds) every access is checked against the mapped regions and for alignment, and stops with the instruction's address otherwise.
+- **Nothing silent.** An instruction this slice doesn't cover makes the function fail to lift, with the address and the reason; calling a function that wasn't lifted stops (`NotLifted`).
+
+### What slice 1 covers
+
+All integer instructions with T, S, Q and M (including `div1`, `mac.l`, `mac.w`, the carry and overflow forms, shifts and rotates), every load and store form, GBR-relative access, branches, calls, tail calls, jump tables, `pref` (a store-queue flush stops as unsupported for now; anything else is a hint) and `trapa` (stops). Not yet: floating point (slice 2), a branch into a delay slot, a constant jump inside a function. Never: privileged instructions.
+
+### On the game
+
+| | `MSR.BIN` |
+|---|---|
+| Functions lifted | **3,614 of 5,247 (68.9%)**, 178,297 instructions |
+| Not lifted: floating point | 1,507 |
+| Not lifted: privileged | 125 |
+| Not lifted: a branch into a delay slot | 1 |
+
+The generated C++ (15 files) compiles without a warning under GCC 14 with `-Wall -Wextra -Wpedantic -Wshadow -Werror`.
+
+## Differential test (v0.6.0)
+
+`tools/difftest/difftest.py` and `tools/difftest/harness.cpp` (`qilin_difftest`, built when CMake is given `-DQILIN_GEN_DIR`).
+
+### How it works
+
+Each trial gives a function random registers (many of them pointers into a heap and a stack filled with random words and more pointers) and random T, S, Q, M, GBR, MACH and MACL. It runs **the original code under QEMU's SH-4** and **the lifted C++** from the same state, and compares everything: r0–r15, PR, GBR, MACH, MACL, the four status bits, and every byte of the 16 MiB of RAM. Whole call trees run on both sides.
+
+- **The reference is `qemu-system-sh4`**, its `r2d` board, whose RAM sits at the Dreamcast's address. The test drives it through its debugger port: writes the state, sets breakpoints at the return address and the exception vectors, continues, reads the registers back and has the machine dump its RAM. QEMU is run as a tool, like binutils. The sister projects use Unicorn for this; Unicorn has no SH-4.
+- **Conclusive** means both sides returned to the caller. Then everything must match, or the function fails.
+- **Inconclusive**, counted by kind: the lifted code stopped (an access outside RAM or unaligned, a call into a function that isn't lifted yet, an indirect jump to an address that isn't a function), the function returned through a PR it loaded from random memory, or the original ran past two seconds or shut the reference machine down. The reference machine isn't a Dreamcast, so what happens outside RAM isn't comparable.
+- **A failure** is also: the lifted code returned to its caller and the original didn't, or the reverse.
+
+### Result
+
+All 3,614 lifted functions, 3 trials each, seed 1 (36 minutes):
+
+| | |
+|---|---|
+| **Fail** | **0** |
+| Pass (at least one conclusive trial, every one equal) | 1,676 |
+| Untested (no conclusive trial) | 1,938 |
+| Conclusive trials | 4,150 |
+
+Inconclusive trials: 3,811 memory faults in the lifted code, 1,723 calls into functions not lifted yet, 442 where the original shut the reference machine down, 336 where it ran too long, 310 bad jumps, 65 returns to somewhere else, 5 unsupported.
+
+- **The test can fail.** With one helper broken on purpose (`mov.b` loads not sign-extended), a run over the first 500 functions failed 4 of them.
+- **More than half the lifted functions are untested**, and that is the number to bring down. Random inputs fault quickly in functions that take pointers to structures, use absolute addresses, or touch hardware registers; 1,723 trials ended in a callee that needs floating point. What will raise it: slice 2 (so callees are lifted), inputs shaped by what the function dereferences, and later the real thing, the game running.
+- **A pass is evidence, not proof**: 3 random trials don't visit every path.
+- **Not yet done:** the lifted code under UBSan; Clang and MSVC builds of the generated code.
+
+### Next
+
+- Slice 2: floating point, on the mode analysis.
+- Raise the tested share: smarter inputs; more trials; a second seed.
+- The one function with a branch into a delay slot; constant jumps inside a function.

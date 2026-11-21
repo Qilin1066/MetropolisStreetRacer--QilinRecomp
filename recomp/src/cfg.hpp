@@ -153,6 +153,7 @@ public:
     explicit Cfg(const BootFile& boot);
     void run();
 
+    const BootFile& boot() const { return boot_; }
     const std::map<uint32_t, Function>& functions() const { return funcs_; }
     const std::vector<Suspect>& suspects() const { return suspects_; }
     const std::vector<uint32_t>& rejected() const { return rejected_; }  // weak candidates that weren't clean

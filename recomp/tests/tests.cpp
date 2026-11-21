@@ -17,6 +17,8 @@
 #include "cfg.hpp"
 #include "decoder.hpp"
 #include "gdrom.hpp"
+#include "guest.hpp"
+#include "lifter.hpp"
 #include "report.hpp"
 #include "sha256.hpp"
 
@@ -517,6 +519,130 @@ void test_cfg() {
     CHECK(writes(0xFFFF) == 0);
 }
 
+// ---------------------------------------------------------------- lifter and runtime helpers
+
+void test_lifter() {
+    constexpr uint32_t B = 0x8C010000u;
+    // mov.l L,r1 ; jsr @r1 ; nop ; bt.s 0x12 ; clrt ; mov #1,r0 ; bra 0x12 ; nop ; ... ; (12) rts ; nop ; (18) L
+    const BootFile boot = program({
+        /* 00 */ 0x4F22,  // sts.l pr,@-r15
+        /* 02 */ 0xD105,  // mov.l 0x18,r1      (the address of the callee)
+        /* 04 */ 0x410B,  // jsr @r1
+        /* 06 */ 0x6143,  // mov r4,r1          (in the slot: after the target is read)
+        /* 08 */ 0x8D03,  // bt.s 0x12
+        /* 0a */ 0x0008,  // clrt               (in the slot: after the condition is read)
+        /* 0c */ 0xE001,  // mov #1,r0
+        /* 0e */ 0xA000,  // bra 0x12
+        /* 10 */ 0x0009,  // nop
+        /* 12 */ 0x4F26,  // lds.l @r15+,pr
+        /* 14 */ 0x000B,  // rts
+        /* 16 */ 0x6F56,  // mov.l @r5+,r15     (in the slot: after PR is read)
+        /* 18 */ 0x001C, 0x8C01,
+        /* 1c callee */ 0x000B,  // rts
+        /* 1e */ 0x0009,
+    });
+    Cfg cfg(boot);
+    cfg.run();
+    CHECK(cfg.functions().size() == 2);
+    const Lifter lifter(cfg);
+    if (cfg.functions().contains(B)) {
+        const LiftResult r = lifter.lift(cfg.functions().at(B));
+        CHECK(r.ok);
+        const std::string& code = r.code;
+        CHECK(code.contains("void fn_8c010000(rt::Context& c) {"));
+        // A push: the value stored, then the decrement.
+        CHECK(code.contains("rt::st32(r15 - 4, c.pr); r15 -= 4;"));
+        // The literal is a constant; the call is direct, sets PR, runs the slot, and checks the return.
+        CHECK(code.contains("r1 = 0x8c01001cu;"));
+        CHECK(code.contains("{ c.pr = 0x8c010008u; r1 = r4; QILIN_OUT fn_8c01001c(c); "
+                            "rt::returned_to(c, 0x8c010008u, 0x8c010004u); QILIN_IN }"));
+        // bt.s: the condition from before the slot.
+        CHECK(code.contains("{ const bool take = t; t = 0; if (take) goto L_8c010012; }"));
+        CHECK(code.contains("goto L_8c010012;\nL_8c010012:\n"));
+        // rts: PR from before the slot, which here pops into r15.
+        CHECK(code.contains("{ const uint32_t ret = c.pr; QILIN_PC(0x8c010016u); r15 = rt::ld32(r5); r5 += 4; "
+                            "QILIN_OUT c.ret = ret; return; }"));
+        // Registers written go back to the context; registers used are read again after a call.
+        CHECK(code.contains("#define QILIN_OUT c.r[0] = r0; c.r[1] = r1; c.r[5] = r5; c.r[15] = r15; c.t = t;\n"));
+        CHECK(code.contains("#define QILIN_IN r0 = c.r[0]; r1 = c.r[1]; r4 = c.r[4]; r5 = c.r[5]; r15 = c.r[15]; t = c.t;\n"));
+        CHECK(!code.contains("    ;\n"));  // nops leave nothing behind
+    }
+    // The compiler's switch becomes a switch on the target, and a tail call a call and return.
+    {
+        const BootFile sw = program({0x0009, 0x0009, 0x6043, 0xE103, 0x3012, 0x890B, 0x4000, 0x6103, 0xC701, 0x001D, 0x0023, 0x0009,
+                                     0x0006, 0x0008, 0x000C, 0xE001, 0x000B, 0x0009, 0xD301, 0x432B, 0x0009, 0x0000,
+                                     0x0034, 0x8C01, 0x0000, 0x0000, 0x000B, 0x0009});
+        Cfg c2(sw);
+        c2.run();
+        const LiftResult r = Lifter(c2).lift(c2.functions().at(B));
+        CHECK(r.ok);
+        CHECK(r.code.contains("{ const uint32_t target = 0x8c010018u + r0; switch (target) { "
+                              "case 0x8c01001eu: goto L_8c01001e; case 0x8c010020u: goto L_8c010020; "
+                              "case 0x8c010024u: goto L_8c010024; default: rt::bad_jump(0x8c010014u, target); } }"));
+        CHECK(r.code.contains("QILIN_OUT fn_8c010034(c); return;"));
+        CHECK(r.code.contains("if (t) goto L_8c010024;"));
+    }
+    // What this slice refuses, with the reason.
+    {
+        const BootFile fp = program({0xF210, 0x000B, 0x0009});  // fadd fr1,fr2
+        Cfg c3(fp);
+        c3.run();
+        const LiftResult r = Lifter(c3).lift(c3.functions().at(B));
+        CHECK(!r.ok && r.fail_at == B && r.why == "floating point (slice 2)");
+        const BootFile priv = program({0x0002, 0x000B, 0x0009});  // stc sr,r0
+        Cfg c4(priv);
+        c4.run();
+        const LiftResult p = Lifter(c4).lift(c4.functions().at(B));
+        CHECK(!p.ok && p.why == "privileged");
+    }
+
+    // ---- the helpers generated code calls ----
+    uint32_t t = 1;
+    CHECK(rt::addc(0xFFFFFFFFu, 0, t) == 0 && t == 1);
+    CHECK(rt::addc(1, 2, t) == 4 && t == 0);
+    CHECK(rt::subc(0, 0, t) == 0 && t == 0);
+    t = 1;
+    CHECK(rt::subc(0, 0, t) == 0xFFFFFFFFu && t == 1);
+    CHECK(rt::subc(5, 3, t) == 1 && t == 0);
+    CHECK(rt::addv(0x7FFFFFFFu, 1, t) == 0x80000000u && t == 1);
+    CHECK(rt::addv(1, 1, t) == 2 && t == 0);
+    CHECK(rt::subv(0x80000000u, 1, t) == 0x7FFFFFFFu && t == 1);
+    CHECK(rt::subv(3, 5, t) == 0xFFFFFFFEu && t == 0);
+    CHECK(rt::cmp_str(0x11223344u, 0x55663377u) == 1 && rt::cmp_str(0x11223344u, 0x44332211u) == 0);
+    CHECK(rt::shad(0x80000000u, 0xFFFFFFFFu) == 0xC0000000u);   // right by 1, arithmetic
+    CHECK(rt::shad(0x80000000u, 0xFFFFFFE0u) == 0xFFFFFFFFu);   // right by 32: all sign
+    CHECK(rt::shad(1, 4) == 16 && rt::shad(1, 36) == 16);       // left by the low five bits
+    CHECK(rt::shld(0x80000000u, 0xFFFFFFFFu) == 0x40000000u);
+    CHECK(rt::shld(0x80000000u, 0xFFFFFFE0u) == 0);
+    // div1: the manual's 32 / 16 unsigned division (shll16 ; div0u ; 16 x div1 ; rotcl ; extu.w).
+    const auto divide = [](uint32_t dividend, uint32_t divisor) {
+        rt::Context c;
+        uint32_t tt = 0, rn = dividend;
+        const uint32_t rm = divisor << 16;
+        for (int i = 0; i < 16; ++i) rn = rt::div1(c, rn, rm, tt);
+        return (rn << 1 | tt) & 0xFFFFu;
+    };
+    CHECK(divide(1000, 7) == 142 && divide(0, 5) == 0 && divide(65535, 1) == 65535 && divide(0x12345678u, 0x4321u) == 0x12345678u / 0x4321u);
+    // mac.l saturates to 48 bits when S is set; mac.w saturates MACL.
+    {
+        rt::Context c;
+        c.mach = 0x00007FFFu, c.macl = 0xFFFFFFFFu;
+        rt::mac_l(c, 2, 3);
+        CHECK(c.mach == 0x00008000u && c.macl == 5);
+        c.mach = 0x00007FFFu, c.macl = 0xFFFFFFFFu, c.s = 1;
+        rt::mac_l(c, 2, 3);
+        CHECK(c.mach == 0x00007FFFu && c.macl == 0xFFFFFFFFu);
+        c = {};
+        c.s = 1, c.macl = 0x7FFFFFFFu;
+        rt::mac_w(c, 2, 3);
+        CHECK(c.macl == 0x7FFFFFFFu && c.mach == 1);
+        c = {};
+        c.macl = 0xFFFFFFFFu;
+        rt::mac_w(c, 0xFFFFu, 1);  // -1 * 1 added to 0x00000000_FFFFFFFF
+        CHECK(c.macl == 0xFFFFFFFEu && c.mach == 0);
+    }
+}
+
 // ---------------------------------------------------------------- GD-ROM
 
 // A synthetic GD-ROM's high-density area, as 2048-byte sectors from sector
@@ -770,6 +896,7 @@ int main() {
     test_ip_bin();
     test_boot_file();
     test_cfg();
+    test_lifter();
     test_gdrom();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
