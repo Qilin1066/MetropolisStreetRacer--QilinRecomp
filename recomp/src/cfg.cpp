@@ -13,32 +13,79 @@ namespace {
 using sh4::Insn;
 using sh4::Op;
 
-// The general registers known to hold a constant at some point.
+// What is known at one point of a function: for each general register, which
+// of its bits are known and their values (a register whose bits are all
+// known holds a constant); and the three FPSCR bits that change what
+// floating-point instructions mean.
 struct State {
     std::array<uint32_t, 16> value{};
-    uint16_t known = 0;
+    std::array<uint32_t, 16> bits{};   // which bits of `value` are known
+    uint8_t fp = 0, fp_known = 0;      // FPSCR.PR, SZ, FR as kFpPr | kFpSz | kFpFr
+    uint8_t saved = 0, saved_known = 0;  // the mode `sts.l fpscr,@-r15` last pushed
+    bool saved_valid = false;
 
-    bool has(unsigned r) const { return known >> r & 1; }
-    void set(unsigned r, uint32_t v) {
-        value[r] = v;
-        known = static_cast<uint16_t>(known | 1u << r);
-    }
-    void forget(uint16_t mask) { known = static_cast<uint16_t>(known & ~mask); }
-    bool operator==(const State& o) const {
-        if (known != o.known) return false;
+    bool has(unsigned r) const { return bits[r] == ~0u; }
+    void set(unsigned r, uint32_t v) { value[r] = v, bits[r] = ~0u; }
+    void set_bits(unsigned r, uint32_t v, uint32_t known) { value[r] = v & known, bits[r] = known; }
+    void forget(uint16_t mask) {
         for (unsigned r = 0; r < 16; ++r)
-            if (has(r) && value[r] != o.value[r]) return false;
-        return true;
+            if (mask >> r & 1) bits[r] = 0;
+    }
+    bool operator==(const State& o) const {
+        for (unsigned r = 0; r < 16; ++r)
+            if (bits[r] != o.bits[r] || (value[r] & bits[r]) != (o.value[r] & o.bits[r])) return false;
+        return fp_known == o.fp_known && (fp & fp_known) == (o.fp & o.fp_known) && saved_valid == o.saved_valid &&
+               (!saved_valid || (saved_known == o.saved_known && (saved & saved_known) == (o.saved & o.saved_known)));
     }
 };
 
-// Where two paths join, a register is known only if both agree on it.
+// Where two paths join, a bit is known only if both agree on it.
 State meet(const State& a, const State& b) {
     State m = a;
-    m.known = static_cast<uint16_t>(a.known & b.known);
-    for (unsigned r = 0; r < 16; ++r)
-        if (m.has(r) && a.value[r] != b.value[r]) m.forget(static_cast<uint16_t>(1u << r));
+    for (unsigned r = 0; r < 16; ++r) {
+        m.bits[r] = a.bits[r] & b.bits[r] & ~(a.value[r] ^ b.value[r]);
+        m.value[r] = a.value[r] & m.bits[r];
+    }
+    m.fp_known = static_cast<uint8_t>(a.fp_known & b.fp_known & ~(a.fp ^ b.fp));
+    m.fp = static_cast<uint8_t>(a.fp & m.fp_known);
+    m.saved_valid = a.saved_valid && b.saved_valid;
+    m.saved_known = static_cast<uint8_t>(a.saved_known & b.saved_known & ~(a.saved ^ b.saved));
+    m.saved = static_cast<uint8_t>(a.saved & m.saved_known);
     return m;
+}
+
+// FPSCR's PR, SZ and FR are bits 19, 20 and 21: kFpPr, kFpSz, kFpFr shifted up.
+constexpr unsigned kFpscrShift = 19;
+
+// Which mode bits an instruction's meaning depends on.
+uint8_t fp_needs(const Insn& in) {
+    const sh4::Spec& s = sh4::spec(in.op);
+    if (!(s.flags & sh4::kFloat)) return 0;
+    uint8_t need = 0;
+    if (s.flags & sh4::kFpPrecision) need |= kFpPr;
+    if (s.flags & sh4::kFpSize) need |= kFpSz;
+    for (const sh4::Opnd o : s.operands) {
+        using enum sh4::Opnd;
+        if (o == FRn || o == FRm || o == FR0 || o == DRn || o == FVn || o == FVm || o == Xmtrx) need |= kFpFr;
+    }
+    // These are only defined in one precision, so PR has to be known for them too.
+    switch (in.op) {
+    case Op::fmac: case Op::fipr: case Op::ftrv: case Op::fsca: case Op::fsrra: case Op::fldi0: case Op::fldi1:
+    case Op::fcnvsd: case Op::fcnvds:
+        need |= kFpPr;
+        break;
+    default: break;
+    }
+    return need;
+}
+
+// The value PR must have for an instruction defined in one precision only: 0, 1, or -1 for either.
+int fp_required_pr(Op op) {
+    switch (op) {
+    case Op::fmac: case Op::fipr: case Op::ftrv: case Op::fsca: case Op::fsrra: case Op::fldi0: case Op::fldi1: return 0;
+    case Op::fcnvsd: case Op::fcnvds: return 1;
+    default: return -1;
+    }
 }
 
 constexpr uint32_t kMaxPadding = 32;  // hand-written library routines are aligned to 32 bytes with nops
@@ -157,6 +204,94 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
     // One instruction (with its delay slot, if it has one): where control
     // goes next and with which constants. With `record`, also what it tells
     // us about the function.
+    // The state after one instruction that isn't a branch (delay slots
+    // included). With `record`, also what the instruction tells us.
+    const auto transfer = [&](const Insn& in, uint32_t pc, const State& st, bool record) {
+        State s = st;
+        if (const uint8_t need = fp_needs(in); need && record) {
+            f.fp_modes.emplace_back(pc, static_cast<uint8_t>((st.fp & st.fp_known) | st.fp_known << 4));
+            const int pr = fp_required_pr(in.op);
+            if (need & ~st.fp_known) f.fp_unknown.push_back(pc);
+            else if (pr >= 0 && ((st.fp & kFpPr) != 0) != (pr == 1)) f.fp_wrong.push_back(pc);
+        }
+        s.forget(sh4::gpr_writes(in));
+        const unsigned n = in.n(), m = in.m();
+        // Bitwise operations keep what is known bit by bit: this is what
+        // follows FPSCR through "sts fpscr,rN ; or/and mask,rN ; lds rN,fpscr".
+        const auto bitwise = [&](unsigned dest, uint32_t va, uint32_t ka, uint32_t vb, uint32_t kb) {
+            const uint32_t a1 = va & ka, a0 = ~va & ka, b1 = vb & kb, b0 = ~vb & kb;
+            uint32_t one = 0, zero = 0;
+            if (in.op == Op::and_ || in.op == Op::and_imm) one = a1 & b1, zero = a0 | b0;
+            else if (in.op == Op::or_ || in.op == Op::or_imm) one = a1 | b1, zero = a0 & b0;
+            else one = (a1 & b0) | (a0 & b1), zero = (a1 & b1) | (a0 & b0);  // xor
+            s.set_bits(dest, one, one | zero);
+        };
+        switch (in.op) {
+        case Op::mov_l_pc: {
+            const uint32_t lit = in.pc_address(pc);
+            if (record) f.literals[lit] = 4;
+            if (boot_.mapped(lit, 4)) s.set(n, boot_.u32(lit));
+            else if (record) f.bad.push_back(pc);
+            break;
+        }
+        case Op::mov_w_pc: {
+            const uint32_t lit = in.pc_address(pc);
+            if (record) f.literals[lit] = 2;
+            if (boot_.mapped(lit, 2)) s.set(n, static_cast<uint32_t>(static_cast<int16_t>(boot_.u16(lit))));
+            else if (record) f.bad.push_back(pc);
+            break;
+        }
+        case Op::mova:
+            if (record) f.movas.insert(in.pc_address(pc));
+            s.set(0, in.pc_address(pc));
+            break;
+        case Op::mov_imm: s.set(n, static_cast<uint32_t>(in.simm8())); break;
+        case Op::mov: s.set_bits(n, st.value[m], st.bits[m]); break;
+        case Op::add_imm:
+            if (st.has(n)) s.set(n, st.value[n] + static_cast<uint32_t>(in.simm8()));
+            break;
+        case Op::and_: case Op::or_: case Op::xor_:
+            bitwise(n, st.value[n], st.bits[n], st.value[m], st.bits[m]);
+            break;
+        case Op::and_imm: case Op::or_imm: case Op::xor_imm:
+            bitwise(0, st.value[0], st.bits[0], in.imm8(), ~0u);
+            break;
+        case Op::sts_fpscr:
+            s.set_bits(n, static_cast<uint32_t>(st.fp) << kFpscrShift, static_cast<uint32_t>(st.fp_known) << kFpscrShift);
+            break;
+        case Op::lds_fpscr:
+            s.fp_known = static_cast<uint8_t>(st.bits[n] >> kFpscrShift & 7);
+            s.fp = static_cast<uint8_t>(st.value[n] >> kFpscrShift & s.fp_known);
+            if (record) f.changes_fp_mode = true;
+            break;
+        case Op::sts_l_fpscr:
+            if (n == 15) s.saved = st.fp, s.saved_known = st.fp_known, s.saved_valid = true;
+            break;
+        case Op::lds_l_fpscr:
+            // The value popped is taken to be the one this function pushed
+            // (the compiler's save and restore around a change of mode).
+            if (n == 15 && st.saved_valid) s.fp = st.saved, s.fp_known = st.saved_known;
+            else s.fp = 0, s.fp_known = 0;
+            if (record) f.changes_fp_mode = true;
+            break;
+        case Op::fschg:
+            s.fp ^= kFpSz;
+            if (record) f.changes_fp_mode = true;
+            break;
+        case Op::frchg:
+            s.fp ^= kFpFr;
+            if (record) f.changes_fp_mode = true;
+            break;
+        default: break;
+        }
+        return s;
+    };
+    // Leaving the function, or calling out of it: the mode must be the one
+    // every function is entered with, or the proof for the others breaks.
+    const auto leaves = [&](uint32_t pc, const State& s, bool record) {
+        if (record && (s.fp_known != kFpAll || s.fp != entry_mode_)) f.fp_leaks.push_back(pc);
+    };
+
     const auto step = [&](uint32_t pc, const State& st, std::vector<Edge>& out, bool record) {
         const Insn in = insn(pc);
         if (!in.valid()) {
@@ -178,43 +313,14 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
             } else if (t >= start && t < bound) {
                 out.push_back({t, s});
                 if (record) f.leaders.insert(t);
-            } else if (record) {
-                f.tails[pc] = t;
+            } else {
+                if (record) f.tails[pc] = t;
+                leaves(pc, s, record);
             }
         };
 
         if (!(flags & sh4::kBranch)) {
-            State s = st;
-            s.forget(sh4::gpr_writes(in));
-            switch (in.op) {
-            case Op::mov_l_pc: {
-                const uint32_t lit = in.pc_address(pc);
-                if (record) f.literals[lit] = 4;
-                if (boot_.mapped(lit, 4)) s.set(in.n(), boot_.u32(lit));
-                else if (record) f.bad.push_back(pc);
-                break;
-            }
-            case Op::mov_w_pc: {
-                const uint32_t lit = in.pc_address(pc);
-                if (record) f.literals[lit] = 2;
-                if (boot_.mapped(lit, 2)) s.set(in.n(), static_cast<uint32_t>(static_cast<int16_t>(boot_.u16(lit))));
-                else if (record) f.bad.push_back(pc);
-                break;
-            }
-            case Op::mova:
-                if (record) f.movas.insert(in.pc_address(pc));
-                s.set(0, in.pc_address(pc));
-                break;
-            case Op::mov_imm: s.set(in.n(), static_cast<uint32_t>(in.simm8())); break;
-            case Op::mov:
-                if (st.has(in.m())) s.set(in.n(), st.value[in.m()]);
-                break;
-            case Op::add_imm:
-                if (st.has(in.n())) s.set(in.n(), st.value[in.n()] + static_cast<uint32_t>(in.simm8()));
-                break;
-            default: break;
-            }
-            fall(pc + 2, s);
+            fall(pc + 2, transfer(in, pc, st, record));
             return;
         }
 
@@ -230,11 +336,14 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
                 return;
             }
             if (record) f.slots.insert(slot);
-            after.forget(sh4::gpr_writes(s));
-            if (s.op == Op::mov_imm) after.set(s.n(), static_cast<uint32_t>(s.simm8()));
+            after = transfer(s, slot, st, record);
             next = pc + 4;
         }
-        const State nothing{};  // after a call: the callee may have changed any register
+        // After a call the callee may have changed any register. The mode is
+        // the entry mode again: every function is checked to leave it so.
+        State nothing{};
+        nothing.fp = entry_mode_, nothing.fp_known = kFpAll;
+        nothing.saved = after.saved, nothing.saved_known = after.saved_known, nothing.saved_valid = after.saved_valid;
         const auto constant = [&](unsigned r) { return st.has(r); };
         switch (in.op) {
         case Op::bt: case Op::bf: case Op::bt_s: case Op::bf_s:
@@ -250,6 +359,7 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
             const uint32_t target = in.branch_target(pc);
             if (target > pc && in_image(target) && (restores_pr(pc + 2) || restores_pr(pc - 2))) {
                 if (record) f.tails[pc] = target;
+                leaves(pc, after, record);
             } else {
                 edge(target, after);
             }
@@ -261,6 +371,7 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
                 break;
             }
             if (record) f.calls[pc] = in.branch_target(pc);
+            leaves(pc, after, record);
             fall(next, nothing);
             break;
         case Op::jsr: case Op::bsrf: {
@@ -269,6 +380,7 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
                 if (constant(in.n()) && in_image(target)) f.calls[pc] = target;
                 else f.icalls.push_back(pc);
             }
+            leaves(pc, after, record);
             fall(next, nothing);
             break;
         }
@@ -280,18 +392,26 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
                 // a jump through a constant is a tail call, unless it goes
                 // back into code this function has already been through.
                 if (target >= start && target < pc) edge(target, after);
-                else if (record) f.tails[pc] = target;
+                else {
+                    if (record) f.tails[pc] = target;
+                    leaves(pc, after, record);
+                }
             } else if (in.op == Op::braf && !constant(in.n()) && resolve_table(pc, table)) {
                 State s = after;
                 s.forget(static_cast<uint16_t>(1u | 1u << insn(pc - 2).m()));
                 for (const uint32_t t : table.targets) edge(t, s);
                 if (record) f.jtabs.push_back(std::move(table));
-            } else if (record) {
-                f.itails.push_back(pc);
+            } else {
+                if (record) f.itails.push_back(pc);
+                leaves(pc, after, record);
             }
             break;
         }
-        case Op::rts: case Op::rte:
+        case Op::rts:
+            if (record) f.returns = true;
+            leaves(pc, after, record);
+            break;
+        case Op::rte:  // an interrupt returns to whatever mode it interrupted
             if (record) f.returns = true;
             break;
         default:
@@ -302,7 +422,9 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
 
     // Constants to a fixed point. States only ever lose registers, so this ends.
     std::unordered_map<uint32_t, State> in;
-    std::vector<Edge> work{{start, State{}}}, out;
+    State entry{};
+    entry.fp = entry_mode_, entry.fp_known = kFpAll;
+    std::vector<Edge> work{{start, entry}}, out;
     while (!work.empty()) {
         const Edge e = work.back();
         work.pop_back();
@@ -339,7 +461,8 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
     }
     std::ranges::sort(f.insns);
     for (const JumpTable& t : f.jtabs) f.movas.erase(t.table);
-    for (auto* v : {&f.bad, &f.bad_slots, &f.slot_targets, &f.icalls, &f.itails}) {
+    std::ranges::sort(f.fp_modes);
+    for (auto* v : {&f.bad, &f.bad_slots, &f.slot_targets, &f.icalls, &f.itails, &f.fp_unknown, &f.fp_wrong, &f.fp_leaks}) {
         std::ranges::sort(*v);
         v->erase(std::unique(v->begin(), v->end()), v->end());
     }
@@ -614,6 +737,20 @@ void Cfg::run() {
     find_suspects();
 }
 
+FpSummary Cfg::fp_summary() const {
+    FpSummary t;
+    for (const auto& [start, f] : funcs_) {
+        if (!f.fp_modes.empty()) ++t.functions;
+        if (f.changes_fp_mode) ++t.changers;
+        t.instructions += f.fp_modes.size();
+        t.unknown += f.fp_unknown.size();
+        t.wrong += f.fp_wrong.size();
+        t.leaks += f.fp_leaks.size();
+        if (!f.fp_unknown.empty() || !f.fp_wrong.empty() || !f.fp_leaks.empty()) ++t.unproven_functions;
+    }
+    return t;
+}
+
 Coverage Cfg::coverage() const {
     Coverage c;
     if (funcs_.empty()) return c;
@@ -689,6 +826,10 @@ std::string Cfg::summary() const {
                      tails, itails);
     s += std::format("{} jump tables, {} entries\n", tables, entries);
     s += std::format("{} suspects; {} weak candidates rejected\n", suspects_.size(), rejected_.size());
+    const FpSummary fp = fp_summary();
+    s += std::format("floating point: {} functions use it, {} change the mode; {} mode-dependent instructions, "
+                     "{} with the mode unproven, {} in the wrong precision; {} places leave a function in another mode\n",
+                     fp.functions, fp.changers, fp.instructions, fp.unknown, fp.wrong, fp.leaks);
     const Coverage c = coverage();
     const uint64_t extent = c.hi - c.lo;
     s += std::format("code extent {:08x}-{:08x} ({} bytes): code {} ({}), literal {}, table {}, padding {}, "

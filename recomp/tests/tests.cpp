@@ -10,6 +10,7 @@
 #include <print>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "bootfile.hpp"
@@ -438,6 +439,59 @@ void test_cfg() {
         cfg3.run();
         const Coverage c3 = cfg3.coverage();
         CHECK(cfg3.functions().size() == 1 && c3.code == 8 && c3.dead == 6 && c3.unknown == 0);
+    }
+
+    // Floating-point mode: FPSCR's PR, SZ and FR followed through the function.
+    {
+        using Modes = std::vector<std::pair<uint32_t, uint8_t>>;
+        const auto fp = [](std::initializer_list<unsigned> words) {
+            const BootFile image = program(words);
+            return Cfg(image).explore(0x8C010000u, image.end());
+        };
+        // The compiler's change of precision: sts fpscr ; or/and mask ; lds fpscr.
+        const auto precision = [&](unsigned in_double) {
+            return fp({
+                /* 00 */ 0x006A,  // sts fpscr,r0
+                /* 02 */ 0xD105,  // mov.l 0x18,r1      (0x00080000: PR)
+                /* 04 */ 0x201B,  // or r1,r0
+                /* 06 */ 0x406A,  // lds r0,fpscr
+                /* 08 */ in_double,
+                /* 0a */ 0x006A,  // sts fpscr,r0
+                /* 0c */ 0xD103,  // mov.l 0x1c,r1      (0xFFF7FFFF)
+                /* 0e */ 0x2019,  // and r1,r0
+                /* 10 */ 0x406A,  // lds r0,fpscr
+                /* 12 */ 0xF210,  // fadd fr1,fr2       (single again)
+                /* 14 */ 0x000B, 0x0009, 0x0000, 0x0008, 0xFFFF, 0xFFF7,
+            });
+        };
+        const Function f = precision(0xF210);  // fadd fr1,fr2
+        CHECK(f.fp_modes == Modes({{B + 0x08, kFpPr | kFpAll << 4}, {B + 0x12, kFpAll << 4}}));
+        CHECK(f.fp_unknown.empty() && f.fp_wrong.empty() && f.fp_leaks.empty() && f.changes_fp_mode);
+        // fipr is single precision only: reached with PR set, it is wrong.
+        const Function g = precision(0xF0ED);
+        CHECK(g.fp_wrong == std::vector<uint32_t>({B + 0x08}) && g.fp_unknown.empty());
+        // fcnvsd is double precision only: with PR set it is right.
+        const Function g2 = precision(0xF0AD);
+        CHECK(g2.fp_wrong.empty() && g2.fp_unknown.empty());
+
+        // fschg ; fmov fr0,fr1 ; fschg ; rts ; nop
+        const Function h = fp({0xF3FD, 0xF10C, 0xF3FD, 0x000B, 0x0009});
+        CHECK(h.fp_modes == Modes({{B + 0x02, kFpSz | kFpAll << 4}}) && h.fp_leaks.empty() && h.changes_fp_mode);
+        // Returning with the mode changed breaks the proof for every caller.
+        CHECK(fp({0xF3FD, 0x000B, 0x0009}).fp_leaks == std::vector<uint32_t>({B + 0x02}));
+        // So does calling out in a changed mode; after the call the mode is the entry mode again.
+        const Function call = fp({0xFBFD, 0xB002, 0x0009, 0xF10C, 0x000B, 0x0009});  // frchg ; bsr ; nop ; fmov ; rts ; nop
+        CHECK(call.fp_leaks == std::vector<uint32_t>({B + 0x02}));
+        CHECK(call.fp_modes == Modes({{B + 0x06, kFpAll << 4}}));
+        // A mode loaded from a register nothing is known about: unproven.
+        const Function u = fp({0x446A, 0xF210, 0x000B, 0x0009});  // lds r4,fpscr ; fadd ; rts ; nop
+        CHECK(u.fp_unknown == std::vector<uint32_t>({B + 0x02}) && u.fp_leaks == std::vector<uint32_t>({B + 0x04}));
+        // Saved and restored around a change: sts.l fpscr,@-r15 ; fschg ; lds.l @r15+,fpscr ; fmov ; rts ; nop
+        const Function sv = fp({0x4F62, 0xF3FD, 0x4F66, 0xF10C, 0x000B, 0x0009});
+        CHECK(sv.fp_modes == Modes({{B + 0x06, kFpAll << 4}}) && sv.fp_leaks.empty() && sv.fp_unknown.empty());
+        // A function with no floating point has nothing to prove.
+        const Function none = fp({0xE000, 0x000B, 0x0009});
+        CHECK(none.fp_modes.empty() && !none.changes_fp_mode && none.fp_leaks.empty());
     }
 
     // What an instruction writes.

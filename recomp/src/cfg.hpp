@@ -74,6 +74,14 @@ enum class Origin : uint8_t { Entry, Call, TailCall, Literal, DataPointer, Gap }
 const char* origin_name(Origin o);
 inline bool strong(Origin o) { return o <= Origin::TailCall; }
 
+// The FPSCR bits that change what floating-point instructions mean.
+enum : uint8_t {
+    kFpPr = 1,  // PR: double precision
+    kFpSz = 2,  // SZ: fmov moves 64 bits
+    kFpFr = 4,  // FR: the register banks are swapped
+    kFpAll = 7,
+};
+
 struct Function {
     uint32_t start = 0;
     uint32_t bound = 0;             // next known start (or the image's end) when explored
@@ -93,6 +101,13 @@ struct Function {
     std::vector<uint32_t> bad;      // reached a word that isn't an instruction, or left the image
     std::vector<uint32_t> bad_slots;      // delayed branches whose slot is missing or illegal there
     std::vector<uint32_t> slot_targets;   // delay slots that something branches to
+    // Floating-point mode. Every function is taken to be entered with the
+    // program's mode (PR, SZ and FR clear); each is checked to leave in it.
+    std::vector<std::pair<uint32_t, uint8_t>> fp_modes;  // mode-dependent instruction -> bits | known bits << 4
+    std::vector<uint32_t> fp_unknown;  // ... where a bit its meaning depends on isn't proven
+    std::vector<uint32_t> fp_wrong;    // ... defined in one precision only, reached in the other
+    std::vector<uint32_t> fp_leaks;    // calls, tail calls and returns made in a mode other than the entry mode
+    bool changes_fp_mode = false;      // writes FPSCR, or has fschg or frchg
     bool returns = false;           // some path ends in rts or rte
     uint32_t bytes() const { return 2 * static_cast<uint32_t>(insns.size()); }
     bool clean() const { return bad.empty() && bad_slots.empty() && slot_targets.empty(); }
@@ -124,6 +139,11 @@ struct Coverage {
     std::vector<std::pair<uint32_t, uint32_t>> unknown_spans;  // [lo, hi)
 };
 
+struct FpSummary {
+    uint64_t functions = 0, changers = 0, instructions = 0, unknown = 0, wrong = 0, leaks = 0;
+    uint64_t unproven_functions = 0;  // functions with any of the last three
+};
+
 // part / whole as a percentage with `decimals` places, in integer arithmetic,
 // so reports are identical on every host.
 std::string percent(uint64_t part, uint64_t whole, int decimals);
@@ -137,6 +157,7 @@ public:
     const std::vector<Suspect>& suspects() const { return suspects_; }
     const std::vector<uint32_t>& rejected() const { return rejected_; }  // weak candidates that weren't clean
     Coverage coverage() const;
+    FpSummary fp_summary() const;
     std::string summary() const;
     std::string to_json() const;
 
@@ -168,6 +189,7 @@ private:
     bool resolve_table(uint32_t at, JumpTable& out) const;
 
     const BootFile& boot_;
+    uint8_t entry_mode_ = 0;             // FPSCR.PR, SZ, FR every function is entered with
     std::vector<sh4::Insn> decoded_;     // one per word of the image
     std::map<uint32_t, Origin> starts_;  // every known function start
     std::map<uint32_t, Function> funcs_;

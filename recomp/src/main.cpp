@@ -13,6 +13,8 @@
 //   qilin coverage <1ST_READ.BIN> [--list]              byte accounting of the code: code / literal / table /
 //                                                       padding / unknown (exit 3 if any unknown)
 //   qilin suspects <1ST_READ.BIN>                       functions with problems, for review
+//   qilin fpmode  <1ST_READ.BIN> [--list]               floating-point mode (FPSCR.PR/SZ/FR) proof: what is
+//                                                       unproven (exit 3 if anything is)
 //   qilin trial   <1ST_READ.BIN> --base addr            what exploring addr as a function finds, and
 //                                                       whether weak evidence would be enough for it
 //
@@ -68,6 +70,7 @@ int usage() {
                "  qilin coverage <1ST_READ.BIN> [--list]\n"
                "  qilin suspects <1ST_READ.BIN>\n"
                "  qilin trial   <1ST_READ.BIN> --base addr\n"
+               "  qilin fpmode  <1ST_READ.BIN> [--list]\n"
                "  qilin --version\n");
     return 2;
 }
@@ -326,6 +329,28 @@ int cmd_trial(const Args& a) {
     return 0;
 }
 
+int cmd_fpmode(const Args& a) {
+    const BootFile boot = must(BootFile::load(a.input), a.input);
+    Cfg cfg(boot);
+    cfg.run();
+    const FpSummary t = cfg.fp_summary();
+    std::println("{} functions use floating point; {} change the mode", t.functions, t.changers);
+    std::println("{} mode-dependent instructions: {} with the mode unproven, {} in the wrong precision", t.instructions,
+                 t.unknown, t.wrong);
+    std::println("{} calls, jumps and returns made in a mode other than the entry mode", t.leaks);
+    std::println("{} functions with any of these", t.unproven_functions);
+    if (a.list)
+        for (const auto& [start, f] : cfg.functions()) {
+            for (const uint32_t pc : f.fp_unknown)
+                std::println("{:08x} mode unproven at {:08x}: {}", start, pc, sh4::disasm(cfg.insn(pc), pc));
+            for (const uint32_t pc : f.fp_wrong)
+                std::println("{:08x} wrong precision at {:08x}: {}", start, pc, sh4::disasm(cfg.insn(pc), pc));
+            for (const uint32_t pc : f.fp_leaks)
+                std::println("{:08x} leaves in another mode at {:08x}: {}", start, pc, sh4::disasm(cfg.insn(pc), pc));
+        }
+    return t.unproven_functions ? 3 : 0;
+}
+
 int cmd_suspects(const Args& a) {
     const BootFile boot = must(BootFile::load(a.input), a.input);
     Cfg cfg(boot);
@@ -355,6 +380,7 @@ int main(int argc, char** argv) {
         if (a.command == "coverage") return cmd_coverage(a);
         if (a.command == "suspects") return cmd_suspects(a);
         if (a.command == "trial") return cmd_trial(a);
+        if (a.command == "fpmode") return cmd_fpmode(a);
         return usage();
     } catch (const Failure& f) {
         std::println(stderr, "qilin: {}", f.message);

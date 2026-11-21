@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-21
+The floating-point mode analysis: what the lifter needs to know before it can emit any floating-point code. Proven for 1,498 of the game's 1,507 functions that use floating point.
+
+### Added
+- **FPSCR's PR, SZ and FR followed through every function** (`recomp/src/cfg.*`), assuming each is entered with all three clear and checking that it calls, tail-calls and returns that way, so the proof is an induction over the program. Each mode-dependent instruction records the mode it runs in; unproven modes, instructions reached in a precision they aren't defined in, and leaks are listed.
+- **The dataflow tracks registers bit by bit** (known bits and their values) instead of whole constants, which is what follows the compiler's `sts fpscr,rN; or/and mask,rN; lds rN,fpscr`. Delay-slot instructions go through the same transfer as any other, since the compiler puts `lds rN,fpscr` in call slots.
+- **`qilin fpmode [--list]`** (exit 3 while anything is unproven), and a floating-point line in `qilin cfg`'s summary.
+- **Results on the game** (`docs/recompiler-core.md`): 66,561 mode-dependent instructions, 128 unproven, 0 in the wrong precision, 10 leaks; nine functions left, which are double-precision runtime helpers, three bank-swapping library routines and the libraries' context switch.
+- **Tests:** the compiler's change of precision, `fschg` pairs, single- and double-only instructions in the right and wrong mode, leaks at returns and calls, an unknown load of FPSCR, save and restore.
+
 ## [0.4.0] - 2026-11-21
 Function discovery accounts for 99.2% of the game's bytes, up from 83%; and the launcher is to be replaced natively, so only the game is lifted.
 

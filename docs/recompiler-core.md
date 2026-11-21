@@ -1,6 +1,6 @@
 # Recompiler core
 
-Design and results of the recompiler's pieces, in the order they are built. So far: the decoder, and function discovery with control flow.
+Design and results of the recompiler's pieces, in the order they are built. So far: the decoder, function discovery with control flow, and the floating-point mode analysis.
 
 ## SH-4 decoder (v0.1.0)
 
@@ -130,4 +130,47 @@ How the image is laid out, as this shows it: the game's own code from `0x8C01000
 - The 43 unknown spans of the game, one kind at a time (above).
 - A constant `jmp` into the function's own extent (a far switch default) as a branch, not a tail call.
 - Branches into delay slots, and routines with several entry points: decide how the lifter treats each.
-- The FPSCR mode analysis, on top of this dataflow.
+
+## Floating-point mode analysis (v0.5.0)
+
+In `recomp/src/cfg.*`, as part of the same dataflow. `qilin fpmode [--list]`; a line in `qilin cfg`'s summary.
+
+### The problem
+
+The same floating-point encoding means different things depending on three bits of FPSCR: **PR** (`fadd fr2,fr4` adds singles or the doubles DR2 and DR4), **SZ** (`fmov` moves 32 or 64 bits) and **FR** (which of the two banks of sixteen registers `fr0`–`fr15` are). The lifter emits different C++ for each, so it has to know the mode at every such instruction when it generates code. The roadmap rules out the alternative, a run-time check of the mode in front of every floating-point instruction.
+
+### Method
+
+- **Every function is taken to be entered with the program's mode: PR, SZ and FR all clear.** That is single precision, 32-bit moves, the first bank: what Hitachi's compiler assumes and what the code is written for. It is an assumption about the state the game starts in (what the boot ROM and IP.BIN leave in FPSCR), to be confirmed against the original running; everything else here is proved from it.
+- **The three bits are followed through each function** by the dataflow that tracks constants, with the same rule where paths join.
+- **The general registers are tracked bit by bit** (which bits are known, and their values), not just as whole constants. That is what follows the compiler's way of changing precision: `sts fpscr,rN`, then `or` with a mask or `and` with its complement, then `lds rN,fpscr`. The other FPSCR bits stay unknown and don't matter.
+- `fschg` and `frchg` flip their bit. `sts.l fpscr,@-r15` … `lds.l @r15+,fpscr` restores the mode that was pushed, taking the value popped to be the one this function pushed.
+- **Each mode-dependent instruction** (anything whose meaning depends on PR or SZ, or that names a floating-point register) records the mode it runs in. If a bit it depends on isn't proven, the instruction is listed as **unproven**. If it is one defined in a single precision only (`fipr`, `ftrv`, `fsca`, `fsrra`, `fmac`, `fldi0`/`fldi1` in single; `fcnvsd`, `fcnvds` in double) and is reached in the other, it is listed as **wrong**.
+- **Every call, tail call and return must happen in the entry mode**, the delay slot included (the compiler does put `lds rN,fpscr` in a call's slot). Otherwise it is listed as a **leak**. After a call the mode is the entry mode again. That makes the whole thing an induction: if no function leaks, every function really is entered in the entry mode, and the assumption each was analysed under holds.
+
+`qilin fpmode` exits 3 while anything is unproven, wrong or leaking. The lifter refuses a function that has any of them.
+
+### On this game
+
+| | `MSR.BIN` |
+|---|---|
+| Functions that use floating point | 1,507 of 5,247 |
+| Functions that change the mode | 23 |
+| Mode-dependent instructions | 66,561 |
+| … with the mode unproven | 128, in 2 functions |
+| … in the wrong precision | **0** |
+| Leaks | 10, in 9 functions |
+| Functions with any of these | 9 |
+
+- **1,498 of the 1,507 functions are proven**, and so are 66,433 of the 66,561 instructions.
+- **Nothing runs in the wrong precision.** Every reached instruction that is only defined in one precision is reached in the right one. That is strong evidence that the entry mode is what was assumed: a wrong assumption would show up here first.
+- **The nine that aren't proven:**
+  - **Four C runtime helpers** for doubles (`0x8C0EDE64`, `0x8C0EDEAE`, `0x8C0EE02C`, `0x8C0EE548`) that return with PR set. They are written to be called from double-precision code and to stay in it: their entry mode is PR = 1, not the program's. No reached code calls them in the entry mode (that would be a leak at the call, and there is none). Next step: an entry mode per function, taken from its call sites.
+  - **Three library routines** (`0x8C122F1C`, `0x8C130BB4`, `0x8C130D1C`) that swap the register banks with `frchg` and call through a register with them swapped; two of them also hold all 128 unproven instructions, after a `lds` of a value the analysis can't see. To read.
+  - **Two that load FPSCR from a saved context** (`0x8C139FE8`, `0x8C147D78`): the libraries' context switch, part of the system layer the runtime replaces.
+
+### Next
+
+- An entry mode per function, from its call sites, for the double-precision helpers.
+- Read the three bank-swapping library routines; decide whether they are lifted or belong to a replaced library.
+- Confirm the program's entry mode against the original running.
