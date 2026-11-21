@@ -1,0 +1,81 @@
+# Metropolis Street Racer — Recomp Roadmap & Design Targets
+
+**Guiding principle: efficiency and reliability come first.** Every design choice is judged on whether it makes the game cheaper to run on low-end hardware and whether it fails loudly and predictably instead of silently misbehaving.
+
+The requirements and scope are the same as GBTGhoulies-Qilincomp's (Grabbed by the Ghoulies) and BeatTheBeat-QilinComp's. Where the Dreamcast differs from the Xbox and the Wii, this document says how the same rule applies. Anything marked *to confirm* is a starting position that the analysis of the real disc must prove or replace; nothing here is assumed silently.
+
+## Targets
+- **Game:** *Metropolis Street Racer* (Bizarre Creations, Sega, 2000–2001), the North American Dreamcast release. The build is recognised by the SHA-256 of its boot file; the hash, product number and version are recorded when the disc is first read (`disc-and-boot-analysis.md`). The three European pressings are other binaries and out of scope for now.
+- **Platforms:** 64-bit Windows, Linux and macOS (Intel and Apple Silicon), on x86-64 or ARM64, with Vulkan. See *Hardware scope* below.
+- **Language:** **C++23** throughout (recompiler, generated code and runtime). Minimum compilers: GCC 14, Clang 19, Xcode 16, Visual Studio 2022 17.10.
+- **Graphics API:** **Vulkan 1.3, and only Vulkan.** We require the 1.3 core API, and only the optional features and limits that Mesa's v3dv driver on a Pi 4 provides, so one render path works everywhere (MoltenVK on macOS). See *Vulkan baseline* below.
+- **Reference:** Flycast running the original game is ground truth for behaviour, visuals and audio; a real console where one is to hand. Flycast is GPL: it is a reference to run and compare against, and none of its code is copied (see `prior-art.md`).
+- **Enhancement example target:** 3440×1440 (21:9) at 144 Hz.
+
+## Architecture
+- **Game code:** static recompilation, SH-4 → **generated C++**, compiled AOT by clang/GCC/MSVC for each target. No interpreter, no JIT, and no emulator underneath. Hand-written C++ replaces lifted functions over time (hot paths, bugs, enhancement hooks) through a function override table.
+- **Decoder:** **our own, table-driven** (`recomp/src/decoder.*`, done in v0.1.0). SH-4's encoding is fixed-width and tiny: 16-bit words, 209 instruction forms. It is **verified against GNU binutils on all 65,536 words**, at both PC alignments, in CI; with 16-bit instructions that is the whole encoding space, not a sample. Words that aren't SH7091 instructions decode as invalid.
+- **Code and data are mixed.** The boot file is a flat image with no section table, and SH-4 code keeps its constants in literal pools between and inside functions. Function discovery therefore decides what is code: recursive descent from the entry point and every proven code pointer, with each literal a `mov.w`/`mov.l @(disp,PC)` or `mova` reads marked as data. `qilin coverage` must account for every byte (code, literal, table, padding, data or unknown) before anything is lifted.
+- **Delay slots:** a delayed branch and the instruction after it are lifted as one unit: the slot instruction runs, then the branch takes effect, with the branch's own operands read first where the slot changes them. A branch into a delay slot, or an instruction in a slot that raises an illegal slot exception on the console, is a build error.
+- **Floating-point modes:** the meaning of a floating-point instruction depends on FPSCR's PR bit (single or double precision) and SZ bit (`fmov` of 32 or 64 bits), and `frchg` swaps the register banks. The analysis tracks these bits through each function (`lds`/`lds.l` to FPSCR, `fschg`, `frchg`) and across calls. A function whose mode can't be proven doesn't lift; there is no run-time mode check as a fallback.
+- **Floating-point results:** native `float`/`double`, bit-exact, with `-ffp-contract=off` so the host compiler fuses nothing by itself. Whether `fmac` rounds once or twice, and what the approximate instructions (`fsca`, `fsrra`, `fipr`, `ftrv`) return, is defined by the console: each is reproduced from a reference model, proven by the differential test, and the same on every host.
+- **Symbol naming:** *to confirm.* No decompilation of this game is known (`prior-art.md`). Sega's libraries are named by signature where a permissively licensed source of names exists; game functions are `fn_<address>` until analysis names them.
+- **Register model:** guest registers held in host locals inside each lifted function and synced to a context struct only at call/indirect boundaries: R0–R15, the T bit kept apart from SR, MACH/MACL, PR, GBR, FPUL, FPSCR, and the two banks of sixteen floating-point registers. No global or thread-local register variables (that model blocks host register allocation).
+- **Calling conventions:** the SH-4 C convention (arguments in R4–R7 and FR4–FR11, results in R0 and FR0, R8–R14 and FR12–FR15 preserved). Lifted code still keeps full register state across calls; ABI recovery only where hand-written C++ replaces a function.
+- **Fail loudly:** an undecodable or unsupported instruction is a build error, never a comment; an unknown indirect-call target at runtime traps with its address logged.
+- **Control flow:** recursive-descent CFG with resolved jump tables (the compiler's `mova`/`mov.w @(r0,rN)`/`braf` and `jmp @rN` table patterns), sized by analysis. Indirect calls (`jsr @rN` through function pointers) dispatch through a generated sorted function table; an unknown target traps with the address logged (never silently continues), and the address is added as a seed.
+- **Endianness:** the Dreamcast runs its SH-4 little-endian, as every host is. Loads and stores need no byte swapping.
+- **Lifter efficiency:** the T bit is computed only where it is read; flat memory (4 GB host reservation, `base + addr`, no bounds checks).
+- **Memory map and mirrors:** the game sees 16 MiB of RAM at `0x8C000000`, with the same memory at the uncached and user-space views of the SH-4's address space (`0xAC000000`, `0x0C000000`), plus video RAM, sound RAM and hardware registers. Because the hardware-facing libraries are replaced, during bring-up any access to a mirror or a hardware register traps, so we learn exactly which ones lifted code uses. Only those get aliased mappings (file mapping / memfd / Windows placeholder views) or native handling. Known case: the store queues (see *Graphics*).
+- **Exceptions and interrupts:** the game's interrupt and exception handlers (reached through VBR) are part of the system layer that is replaced. Lifted code never runs in an interrupt; the runtime calls the game's callbacks (vertical blank, end of render, sound, peripherals) at the points the console would.
+- **System software (the Dreamcast's "kernel and XDK"):** there is no kernel. The game links Sega's libraries and drives the hardware directly, with a handful of calls into the boot ROM (GD-ROM, flash memory, the ROM font) through vectors in low RAM. *To confirm from IP.BIN:* that this game uses Sega's own libraries (the "Katana" SDK) and not Windows CE, which a Dreamcast game can ship instead and which would be a different system layer. The hardware-facing libraries are **replaced natively at their API**, not recompiled: the system and interrupt layer, the GD-ROM file system (files over the extracted disc), the graphics library (Vulkan), the sound library (native mixer), the Maple bus (controllers, memory cards, vibration), flash settings and the real-time clock. Libraries whose exact behaviour matters more than native speed are **lifted** with the game: the C runtime, maths and any pure-software middleware. This is the starting boundary; analysis confirms it library by library, as Ghoulies moved the CRT and XAPI to the lifted side. Hot, simple lifted functions can still get native versions, each checked against the lifted original.
+- **Graphics:** API-level translation of Sega's graphics library to Vulkan, not PowerVR2 emulation. **Plus a decoder for the Tile Accelerator's parameter stream**, for whatever game code writes to it directly through the SH-4's store queues (`pref` flushes a queue; the lifter turns a flush to the Tile Accelerator's address into a call). Polygons and their list types (opaque, punch-through, translucent, modifier volumes) become draws; unknown parameters stop the runtime. The PowerVR2 sorts translucent polygons per pixel when a scene asks it to: which lists and sort modes this game uses is measured in analysis, and how they are drawn on the v3dv feature set is decided and recorded here then. Texture formats (twiddled, VQ-compressed, paletted) are decoded on upload. Shading configurations are collected in analysis and converted to SPIR-V offline; prebuilt pipeline cache (no runtime compile stutter).
+- **Audio:** the console's sound chip (AICA) has its own ARM7 processor running a driver the game uploads. The driver is not recompiled or emulated: the sound library is replaced at the API the game calls, over a native mixer (ADPCM and PCM voices) on SDL3. Streamed music and speech are decoded natively. *To confirm:* which sound library and stream formats the game uses.
+- **Input and saves:** Maple bus devices → SDL3: gamepad (analogue stick and triggers), a wheel for the Race Controller, vibration for the Jump Pack, keyboard. Memory-card saves go to a file in the game's data folder, in the card's own format.
+- **Clock:** the game reads the console's real-time clock (time of day in its cities follows it). The replacement returns the host's clock.
+- **Online features:** the game's modem features have no service to talk to. The modem is reported absent, as on a console without one.
+- **Threads:** audio mixing and Vulkan submission off the game thread.
+- **Portability rules:** no inline asm or host intrinsics in the runtime; ARM64 Linux builds from day one.
+
+## Hardware scope
+**Supported: 64-bit hosts with a Vulkan 1.3 driver.** In practice that means:
+- **Windows and Linux** on x86-64 or ARM64 with a Vulkan-capable GPU and driver;
+- **macOS on Intel and Apple Silicon Macs**, through MoltenVK (Vulkan on top of Metal): any 64-bit Mac with a Metal GPU running macOS 10.15 (Catalina) or later: officially the 2012 and later Intel models, and every Apple Silicon Mac. MoltenVK has Vulkan 1.3 from v1.3.0, and its releases up to v1.4.1 still run on 10.15 (v1.4.2 raised the floor to 12), so Macs on 10.15–11 get one of those. The runtime (what players run) is built for macOS 10.15, and CI builds both architectures. It doesn't use `std::format`, which Apple's libc++ only has from macOS 13.3. The developer tools (`qilin`, the tests) use `std::format` and need macOS 13.3;
+- **ARM boards** with Vulkan 1.3 drivers, e.g. Raspberry Pi 4 and newer (Mesa v3dv, Mesa 24.3 or later).
+
+**Out of scope:** anything without Vulkan 1.3 (or, on Apple, a Vulkan translation layer that provides it), 32-bit hosts, and phones and tablets (iOS, iPadOS, Android). That rules out the Raspberry Pi 1–3 and Zero (OpenGL ES 2 only), the first Intel Macs (32-bit Core Duo, 2006), and Macs without a Metal GPU or that can't run macOS 10.15. Because of this there is one renderer (Vulkan) and one memory model: the Dreamcast's 32-bit address space mapped flat into a 64-bit host's address space, with no windowing cost on memory accesses.
+
+### Vulkan baseline: 1.3
+The renderer targets **Vulkan 1.3** as its minimum API version, chosen for how widely it's supported:
+- **Raspberry Pi 4 and 5:** Mesa's v3dv driver is Vulkan 1.3 conformant from Mesa 24.3.
+- **macOS:** MoltenVK supports Vulkan 1.3 from v1.3.0, on Intel and Apple GPUs alike. Older Intel GPUs may lack some of the v3dv feature set; the start-up check names what's missing.
+- **Windows and Linux:** current desktop GPU drivers (AMD, Intel, NVIDIA, Mesa) all ship 1.3.
+
+1.3 makes several things core that would otherwise be extensions to probe for, and the renderer is designed around them:
+- **Dynamic rendering:** no render pass or framebuffer objects. That suits render-to-texture and the PowerVR2's list-by-list rendering.
+- **Synchronization2:** simpler, less error-prone barriers.
+- **Extended dynamic state:** cull mode, depth test and write, compare op, topology and stencil can be set per draw. That cuts down how many pipelines the PowerVR2's per-polygon state needs, which matters for the prebuilt pipeline cache.
+- **Timeline semaphores** (core since 1.2): CPU–GPU pacing for frame timing.
+- **Others:** `maintenance4`, inline uniform blocks, and pipeline creation cache control.
+
+1.3 core is the floor, but optional features and device limits aren't: v3dv is the reference for those. The renderer checks the features it uses at startup and fails with a clear message if one is missing, rather than taking a fallback path. Nothing beyond 1.3 core and the v3dv feature set is used without a decision recorded here. Vulkan 1.4 is out of scope for the baseline.
+
+**Low-end reference:** a Raspberry Pi 4–class board is our reference for typical low-end hardware. It's what we measure efficiency against and test on. It is not a floor: anything with Vulkan 1.3 that's slower is fair game if the efficiency work gets us there. The Vulkan feature set we use is kept small (1.3 core, plus what v3dv on a Pi 4 supports) so the one render path runs on all of it.
+
+## Settings, not platform branches
+All enhancements live behind a settings file with presets, e.g.:
+- *Low-end:* 1× resolution, no AF, no MSAA, original aspect and frame rate.
+- *Desktop:* scaled resolution, 16× AF, MSAA, widescreen, high refresh rate.
+
+The enhancements menu is the sister projects' menu, with the same entries and layout. Its specification is copied here when roadmap step 6 starts; as of v0.1.0 none of the sister repositories has written it down yet.
+
+## Roadmap
+1. **Analysis:** 🔨 in progress (`disc-and-boot-analysis.md`, `recompiler-core.md`). ✅ GD-ROM image reader (Redump CUE and GDI, raw and cooked sectors, the high-density area's ISO 9660 file system; every raw sector's own address checked against the track layout); ✅ IP.BIN's fields; ✅ boot-file loader; ✅ `qilin disc`, `extract`, `info`, `insns`, `disasm`, `profile`; ✅ SH-4 decoder, 209 forms, 0 unexplained disagreements with binutils on all 65,536 words; ✅ CI on six configurations, warnings as errors, plus the decoder sweep (v0.1.0). To do, on the real disc: record the build (boot-file SHA-256, IP.BIN fields, file list); confirm the system layer (Sega's libraries, not Windows CE) and identify each library; function discovery and CFG (literal pools, delay slots, jump tables), with every byte accounted for; the floating-point mode analysis; the hardware-access profile (store queues, Tile Accelerator, other registers, mirrors, boot ROM calls); asset, sound and video formats; the frame and audio timing model.
+2. **Recompiler core (C++23):** lifter slices (integer, loads and stores, branches with delay slots, calls and jump tables; then floating point with the mode analysis; then `fipr`/`ftrv`/`fsca`/`fsrra`); a differential test of every lifted function against the original code under a reference SH-4, whole call trees included, also under UBSan.
+3. **Runtime skeleton:** `qilin_run` loads the boot file into guest RAM, sets up the state the boot ROM and IP.BIN leave, and runs start-up as the game's libraries run it; a replacement registry that stops on anything unregistered, naming it and its caller; the system, file-system, flash and clock replacements.
+4. **Boot to first frame:** the graphics library on Vulkan, the first frame presented.
+5. **Playable at original spec:** 640×480, 4:3, original frame rate; matches Flycast; tested on low-end reference hardware at every milestone.
+6. **Resolution / AF / MSAA:** scaled render targets (decided per render-to-texture target), 2D half-pixel fixups, framebuffer readback handling. The enhancements menu.
+7. **Widescreen 16:9 → 21:9:** Hor+ projection, wider culling, HUD re-anchored, pillarboxing where a scene can't widen.
+8. **High refresh rate:** investigate the game's tick model first; it decides whether higher refresh rates need interpolation or just pacing.
+9. **Extras:** texture replacement packs (hash on upload), etc.

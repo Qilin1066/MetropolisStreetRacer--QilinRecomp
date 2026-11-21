@@ -1,0 +1,91 @@
+# MetropolisStreetRacer--QillinRecomp
+
+A static recompilation of **Metropolis Street Racer** (Bizarre Creations, Sega Dreamcast, 2000–2001) into portable C++23 with a Vulkan 1.3 renderer, aimed at 64-bit Windows, Linux and macOS, on x86-64 or ARM64. Anything with a Vulkan 1.3 driver is in scope, including the Raspberry Pi 4 (Mesa 24.3+); every 64-bit Mac with a Metal GPU that runs macOS 10.15 (Catalina) or later, Intel or Apple Silicon, is covered through MoltenVK. Efficiency is the first priority: a Raspberry Pi 4–class board is our reference for typical low-end hardware, not a floor. The requirements and scope are the same as [GBTG-Qilincomp](https://github.com/Qilin1066/GBTGhoulies-Qilincomp)'s and BeatTheBeat-QilinComp's.
+
+> **No game data is included, and none ever will be.** You need your own copy of the game: the North American release. The tools read the disc image, `1ST_READ.BIN` and the disc files from a path you give them. `.gitignore` keeps game files, and anything generated from them, out of the repo.
+
+## Status
+
+Roadmap step 1, **analysis**, has started: the tools that read the disc and decode the CPU's instructions are written and checked. The game's own disc has not been read with them yet; that is the next step (`docs/disc-and-boot-analysis.md`).
+
+| Piece | State |
+|---|---|
+| GD-ROM image reader (Redump CUE + BIN, GDI; raw and cooked sectors; the high-density area's ISO 9660 file system) | ✅ every raw sector's own address checked against the track layout; run on a synthetic disc in the tests and on one retail image (15 tracks, 81 files) |
+| IP.BIN (the disc's meta information: product, version, boot file, Windows CE flag) | ✅ |
+| Boot-file loader (the flat image at `0x8C010000`; the build recognised by SHA-256) | ✅ loader; the build's hash is recorded when the disc is first read |
+| SH-4 decoder (all 209 instruction forms of the SH7091, `fsca` and `fsrra` included) | ✅ 0 unexplained disagreements with GNU binutils on all 65,536 words, at both PC alignments |
+| CI: Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, Windows x64, warnings as errors, plus the decoder sweep | ✅ |
+| This game's disc: build hash, system layer (Sega's libraries or Windows CE), file and asset formats | next |
+| Function discovery + CFG (literal pools, delay slots, jump tables), every byte accounted for | next |
+| Lifter → C++, differential test against the original code | later |
+| Runtime: system layer, GD-ROM files, graphics on Vulkan, audio, input, saves | later (see roadmap) |
+
+## Versions and changes
+
+Releases are tagged `vX.Y.Z` on GitHub, and every release is recorded in [`CHANGELOG.md`](CHANGELOG.md). Past entries are kept, never rewritten. The version lives in one place, `project(... VERSION ...)` in `CMakeLists.txt`, and `qilin --version` prints it. While the recompiler is being built, a minor bump (0.**x**) marks a milestone and a patch bump (0.x.**y**) a fix. 1.0.0 will be the first build that plays the game.
+
+## Building
+
+The whole project (recompiler, runtime and generated code) is **C++23**. You need CMake ≥ 3.25 and one of:
+
+| Compiler | Minimum | Notes |
+|---|---|---|
+| GCC | 14 | Debian 13 / Raspberry Pi OS (Trixie) and Ubuntu 24.04 (`g++-14`) have it |
+| Clang | 19 | Older Clang can't use libstdc++'s `std::expected` |
+| Apple Clang | Xcode 16 | |
+| MSVC | Visual Studio 2022 17.10 | |
+
+CMake stops with a clear message if the compiler is older, or if the target is 32-bit. There are no other dependencies.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
+
+On Windows, CI also uploads the built `qilin.exe` as an artifact of each run (Actions → the run → `qilin-windows-x64`), so a disc can be read without setting up a compiler.
+
+## Using it
+
+Unpack your disc image first, so the `.cue` (or `.gdi`) and its track files are in one folder.
+
+```sh
+build/qilin disc    path/to/game.cue [--json disc.json]       # tracks, IP.BIN's fields, the file list (JSON)
+build/qilin extract path/to/game.cue --out disc               # IP.BIN and every file of the disc, into disc/
+build/qilin info    disc/1ST_READ.BIN [--ip disc/IP.BIN] [--json info.json]
+                                                               # SHA-256, supported build, load address (JSON)
+build/qilin profile disc/1ST_READ.BIN                         # instruction profile of the boot file
+build/qilin insns   disc/1ST_READ.BIN [-o listing.txt]        # every word of the boot file, decoded
+build/qilin disasm  words.bin [--base 0x8c010000]             # a file of little-endian words, decoded
+```
+
+`disc/` is gitignored: never commit it. The boot file is a flat image of code and data mixed, so `insns` and `profile` cover both until function discovery tells them apart.
+
+### Decoder check
+
+```sh
+python3 tools/check/verify_decoder.py --qilin build/qilin --sweep                    # all 65,536 words (CI runs this)
+python3 tools/check/verify_decoder.py --qilin build/qilin --bin disc/1ST_READ.BIN    # every word of the game's boot file
+```
+
+This compares the decoder with GNU objdump (`-m sh4 -EL`): mnemonic and every operand must match, and a word must be valid for both or neither. It needs Python 3 and an SH-4 objdump: `apt install binutils-sh4-linux-gnu`, or a Dreamcast toolchain's `sh-elf-objdump` with `OBJDUMP` set. The one reviewed difference (binutils accepts the SH-4A's two loads of SGR) is counted; anything else fails.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `recomp/src/` | Recompiler core: `gdrom` (disc images), `bootfile` (IP.BIN and the boot file), `sha256`, `decoder` (SH-4), `report` (JSON), `main` (CLI) |
+| `recomp/tests/` | Unit tests on a synthetic disc image and the decoder, so they need no game files |
+| `tools/check/` | The decoder cross-check against GNU objdump |
+| `docs/` | Roadmap and design targets, prior art, analysis and status notes |
+
+## Design targets (short version)
+
+- **Efficiency and reliability come first.** Every choice is judged by whether it makes the game cheaper to run on low-end hardware, and whether it fails loudly instead of misbehaving quietly.
+- **Static recompilation, SH-4 → C++, compiled ahead of time.** No interpreter, no JIT, no emulator underneath. Hand-written C++ can override any lifted function.
+- **Vulkan 1.3 only.** Sega's graphics library is translated at API level to Vulkan, with a deliberately small baseline feature set (1.3 core plus what the Pi 4's driver offers) so one render path runs on everything from low-end ARM GPUs upwards. macOS runs through MoltenVK.
+- **The hardware-facing libraries are replaced natively**, not recompiled: the system layer, GD-ROM files, graphics, sound, controllers and memory cards. The C runtime and pure-software libraries are lifted with the game, for exact behaviour.
+- **Ground truth is Flycast** running the original game.
+- **Enhancements behind settings**, the same set and the same menu as the sister projects: resolution, anisotropic filtering, MSAA, widescreen up to 21:9, high refresh rates.
+
+See `docs/` for the full roadmap and the analysis notes.
