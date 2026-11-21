@@ -11,6 +11,19 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-21
+The game's disc is read. It boots a launcher that loads the game over itself; both are built on Sega's own libraries, the decoder agrees with binutils on every word of both, and function discovery finds 5,209 functions in the game.
+
+### Added
+- **The build, recorded** (`docs/disc-and-boot-analysis.md`): `MK-51012`, `V1.010`, 2000-11-30; three tracks, no CD audio; 777 files. Not Windows CE: Shinobi 1.68, Kamui 2, CRI's ADX and Sofdec.
+- **Two programs, both recognised by `qilin info`:** `1ST_READ.BIN` (the launcher) and `MSR.BIN` (the game), with their SHA-256 in `bootfile.cpp`. `KnownBuild` now carries the program's file name.
+- **A third shape of the Hitachi compiler's switch** in function discovery: a bound check whose default is out of `bra`'s reach (`bf L; mov.l default,r0; jmp @r0`). Found in the game; with it every reachable `braf` in both programs is a proven jump table.
+- **Results on the game** (`docs/recompiler-core.md`): 5,209 functions, 21 jump tables, 467,382 instructions, 83% of the bytes accounted for, 10 suspects; the launcher: 2,676 functions, 0 suspects. Decoder cross-check on every word of both: 0 unexplained.
+
+### Changed
+- **Scope:** both programs go through the analysis. Whether the launcher is lifted or replaced natively is decided once the hand-over between the two is understood (roadmap). The web browser on the disc is out of scope.
+- The docs and examples name `MSR.BIN` where they used to assume the boot file was the game.
+
 ## [0.2.0] - 2026-11-21
 Function discovery and control flow for a flat SH-4 boot file. Tested on synthetic programs and on another retail Dreamcast game's boot file; this game's disc still hasn't been read, so nothing here has run on it.
 

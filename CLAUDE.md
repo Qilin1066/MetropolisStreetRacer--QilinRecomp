@@ -44,20 +44,22 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - binutils' `sh4` set accepts `ldc rN,sgr` and `ldc.l @rN+,sgr`, which are SH-4A only (known difference).
 - Hitachi's compiler: calls are `mov.l L,rN` + `jsr @rN`; pools follow the function, 4-aligned with a zero word of padding; switches are `mova table,r0; mov.w @(r0,rM),r0; braf r0` with 16-bit offsets from the braf's PC + 4. Hand-written library code branches into delay slots and has routines with several entry points.
 - A constant `jmp @rN` forward is a tail call. The CFG forgets every register at a call (no ABI assumption).
-- The cloud workspace's file bridge has a 400 MB per-file limit: the disc image can't be staged, so the game's files come from `qilin extract` run on the author's PC.
+- The cloud workspace's file bridge has a 400 MB per-file limit: the disc image can't be staged. The extracted disc is at `D:\Recompilation Projects\MSR Project\disc` on the author's PC (with `qilin.exe` and `read-disc.cmd` beside it); stage `disc\MSR.BIN`, `1ST_READ.BIN`, `IP.BIN` and other small files from there. There is no shell on that PC from the cloud session: programs there are run by the author, or through computer use (File Explorer, double-click).
+- The enhancements menu: the author says it is the same across all the recomp projects. It isn't in the Ghoulies, Beat the Beat or APB repos; the other project folders haven't been read.
 
-## Status (v0.2.0)
+## Status (v0.3.0)
 
 - Disc reader, IP.BIN and boot-file loaders, SH-4 decoder, function discovery + CFG, CLI, tests, CI.
 - Decoder: 59,001 of 65,536 words are instructions; 0 unexplained differences with binutils 2.42.
 - CFG: tested on synthetic programs and on another retail Dreamcast game's boot file (Hitachi compiler): 4,243 functions, 14 of 14 jump tables, 87% of bytes accounted for, 12 suspects, all in hand-written library code. Numbers and limits in `docs/recompiler-core.md`.
-- **Not done yet: the game's own disc has not been read.** No build hash is recorded; `known_build` matches nothing. Nothing in the CFG has been run on this game.
+- **The disc is read** (MK-51012 V1.010, 2000-11-30, not Windows CE). It boots a launcher, `1ST_READ.BIN` (SHA-256 `b5515a96…`), which loads the game, `MSR.BIN` (`7780f031…`), over itself at `0x8C010000`. Both are in `known_build`. Libraries: Shinobi 1.68, Kamui 2, CRI ADX/Sofdec; sound files are for the Manatee driver.
+- On `MSR.BIN`: decoder 0 unexplained over 660,510 words; 5,209 functions, 21 of 21 jump tables, 83% of bytes accounted for (17% unknown, mostly data), 10 suspects.
 
 ## Next steps, in order
 
-1. **Read the disc** (`docs/disc-and-boot-analysis.md`, *What to record first*): extract it, record the boot file's SHA-256 and IP.BIN's fields in `bootfile.cpp` and the docs, confirm the game doesn't use Windows CE, run the decoder check and the profile on the boot file, survey the file formats.
+1. **The launcher and the hand-over** (`docs/disc-and-boot-analysis.md`, *Still to find out*): what `1ST_READ.BIN` does, how `GINXFER.BIN` swaps programs, what state `MSR.BIN` expects; then decide lift-or-replace for the launcher and record it in the roadmap.
 2. **Review the prior art** (`docs/prior-art.md`): the two Dreamcast static recompilations, and the Sonic Adventure decomp as a naming source for Sega's libraries (licence first).
-3. **Finish function discovery** (`docs/recompiler-core.md`, *Next*): run it on this game; data regions, so `coverage` can reach zero unknown; pointer tables in data as evidence; whatever switch shapes this game's compiler uses.
+3. **Finish function discovery** (`docs/recompiler-core.md`, *Next*): data regions, so `coverage` can reach zero unknown; pointer tables in data as evidence; a constant `jmp` into the function's own extent as a branch.
 4. **FPSCR mode analysis**, then the lifter's slices and the differential test, as in the sister projects.
 5. Hardware-access profile, library boundaries, timing model; then the runtime.
 

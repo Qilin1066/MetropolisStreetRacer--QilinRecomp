@@ -221,6 +221,10 @@ void test_boot_file() {
         }
         CHECK(threw);
         CHECK(known_build(boot->sha256) == nullptr);
+        const KnownBuild* game = known_build("7780f031bc7124dd68e2b411daf5e6fb636589ab4ea9b36427531d95517d9888");
+        CHECK(game && game->file == "MSR.BIN" && game->version == "V1.010");
+        const KnownBuild* launcher = known_build("b5515a96ba7e67dc2dfe08b6adf7d99a4d6c95e7e9fb015fe1f70dffa59af0e9");
+        CHECK(launcher && launcher->file == "1ST_READ.BIN" && launcher->product_number == "MK-51012");
         const std::string json = to_json(*boot, nullptr);
         CHECK(json.contains("\"build\": null"));
         CHECK(json.contains("\"load_address\": \"0x8C010000\""));

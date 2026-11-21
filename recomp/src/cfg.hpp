@@ -40,7 +40,8 @@
 // silently.
 //
 // Jump tables: the one form recognised so far is the Hitachi compiler's
-//     mov #N,r1 ; cmp/hs r1,r0 ; bf L ; bra default ; <slot>     (or: bt default)
+//     mov #N,r1 ; cmp/hs r1,r0 ; bf L ; bra default ; <slot>
+//       (or: bt default; or: bf L ; mov.l D,r0 ; jmp @r0 ; <slot>)
 //  L: shll r0 ; mov r0,r1 ; mova table,r0 ; mov.w @(r0,r1),r0 ; braf r0 ; <slot>
 // with N word offsets from the braf's PC + 4. Its size is proven by the
 // bound check. Any other indirect jump is recorded as unresolved.

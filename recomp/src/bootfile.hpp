@@ -57,12 +57,15 @@ struct IpBin {
     static std::expected<IpBin, std::string> parse(std::span<const uint8_t> data);
 };
 
-// Boot files this port supports, recognised by SHA-256.
+// Programs this port supports, recognised by SHA-256. The disc holds more
+// than one: the boot file is a launcher, and the game is a second flat image
+// it loads over itself at the same address (docs/disc-and-boot-analysis.md).
 struct KnownBuild {
     std::string_view sha256;
+    std::string_view file;            // its name on the disc
     std::string_view product_number;
     std::string_view version;
-    std::string_view title;
+    std::string_view title;           // the disc's title and what this program is
 };
 const KnownBuild* known_build(std::string_view sha256_hex);
 

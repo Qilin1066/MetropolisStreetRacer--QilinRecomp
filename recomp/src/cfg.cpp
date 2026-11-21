@@ -92,7 +92,7 @@ bool Cfg::add_start(uint32_t a, Origin o) {
 
 // The Hitachi compiler's switch: see the header.
 bool Cfg::resolve_table(uint32_t at, JumpTable& out) const {
-    if (at < boot_.base() + 18) return false;
+    if (at < boot_.base() + 20) return false;
     const Insn load = insn(at - 2), mova = insn(at - 4), copy = insn(at - 6), shift = insn(at - 8);
     if (insn(at).op != Op::braf || insn(at).n() != 0) return false;
     if (load.op != Op::mov_w_load_r0 || load.n() != 0) return false;
@@ -104,12 +104,15 @@ bool Cfg::resolve_table(uint32_t at, JumpTable& out) const {
     // The bound check before it, in one of two shapes:
     //   cmp/hs rB,r0 ; bf L ; bra default ; <slot> ; L:     (default far away)
     //   cmp/hs rB,r0 ; bt default ; L:                      (default near)
+    //   cmp/hs rB,r0 ; bf L ; mov.l D,r0 ; jmp @r0 ; <slot> ; L:   (default out of bra's reach)
     uint32_t cmp_at = 0;
+    const auto bf_over = [&](uint32_t a) { return insn(a).op == Op::bf && insn(a).branch_target(a) == at - 8; };
     if (insn(at - 10).op == Op::bt) {
         cmp_at = at - 12;
-    } else if (insn(at - 12).op == Op::bra && insn(at - 14).op == Op::bf &&
-               insn(at - 14).branch_target(at - 14) == at - 8) {
+    } else if (insn(at - 12).op == Op::bra && bf_over(at - 14)) {
         cmp_at = at - 16;
+    } else if (insn(at - 12).op == Op::jmp && insn(at - 14).op == Op::mov_l_pc && bf_over(at - 16)) {
+        cmp_at = at - 18;
     } else {
         return false;
     }

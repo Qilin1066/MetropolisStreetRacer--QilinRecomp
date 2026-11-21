@@ -70,8 +70,9 @@ std::string to_json(const BootFile& boot, const IpBin* ip) {
     std::string j = "{\n";
     j += std::format("  \"sha256\": \"{}\",\n", boot.sha256);
     if (build)
-        j += std::format("  \"build\": {{\"product_number\": {}, \"version\": {}, \"title\": {}}},\n",
-                         json_string(build->product_number), json_string(build->version), json_string(build->title));
+        j += std::format("  \"build\": {{\"file\": {}, \"product_number\": {}, \"version\": {}, \"title\": {}}},\n",
+                         json_string(build->file), json_string(build->product_number), json_string(build->version),
+                         json_string(build->title));
     else
         j += "  \"build\": null,\n";
     j += std::format("  \"file_size\": {},\n", boot.image().size());
