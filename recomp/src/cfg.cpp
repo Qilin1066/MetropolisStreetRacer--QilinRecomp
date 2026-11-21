@@ -41,7 +41,7 @@ State meet(const State& a, const State& b) {
     return m;
 }
 
-constexpr uint32_t kMaxPadding = 16;
+constexpr uint32_t kMaxPadding = 32;  // hand-written library routines are aligned to 32 bytes with nops
 
 bool is_padding_word(uint16_t w) { return w == 0x0000 || w == 0x0009; }
 
@@ -53,6 +53,7 @@ const char* origin_name(Origin o) {
     case Origin::Call: return "call";
     case Origin::TailCall: return "tail call";
     case Origin::Literal: return "literal pointer";
+    case Origin::DataPointer: return "pointer in data";
     case Origin::Gap: return "gap";
     }
     return "?";
@@ -241,9 +242,19 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
             if (record && next < bound) f.leaders.insert(next);
             fall(next, after);
             break;
-        case Op::bra:
-            edge(in.branch_target(pc), after);
+        case Op::bra: {
+            // Once PR has been restored the function is leaving: a forward
+            // bra then is a tail call to a function placed after this one,
+            // even when nothing else has shown that function to exist yet.
+            const auto restores_pr = [&](uint32_t a) { return insn(a).op == Op::lds_l_pr && insn(a).n() == 15; };
+            const uint32_t target = in.branch_target(pc);
+            if (target > pc && in_image(target) && (restores_pr(pc + 2) || restores_pr(pc - 2))) {
+                if (record) f.tails[pc] = target;
+            } else {
+                edge(target, after);
+            }
             break;
+        }
         case Op::bsr:
             if (!in_image(in.branch_target(pc))) {
                 if (record) f.bad.push_back(pc);
@@ -485,6 +496,83 @@ bool Cfg::seed_gaps() {
     return changed;
 }
 
+// Longwords in unclaimed bytes that point at the first unclaimed word after
+// claimed ones: tables of function pointers. The boundary matters: a pointer
+// into the middle of unclaimed bytes could as well be a pointer to data.
+bool Cfg::seed_data_pointers() {
+    std::vector<Kind> kinds = claims();
+    const uint32_t base = boot_.base(), end = boot_.end();
+    // The first word of each unclaimed run that isn't padding.
+    std::set<uint32_t> boundaries;
+    for (uint32_t a = base; a < end;) {
+        if (kinds[a - base] != Kind::Unknown) {
+            ++a;
+            continue;
+        }
+        uint32_t e = a;
+        while (e < end && kinds[e - base] == Kind::Unknown) ++e;
+        uint32_t first = (a + 1) & ~1u, padding = 0;
+        while (first + 2 <= e && is_padding_word(boot_.u16(first)) && padding < kMaxPadding) first += 2, padding += 2;
+        if (first + 2 <= e && a > base) boundaries.insert(first);
+        a = e;
+    }
+    std::vector<uint32_t> candidates;
+    for (uint32_t a = base; a + 4 <= end; a += 4) {
+        bool unclaimed = true;
+        for (uint32_t i = 0; i < 4; ++i) unclaimed &= kinds[a + i - base] == Kind::Unknown;
+        if (!unclaimed) continue;
+        const uint32_t v = boot_.u32(a);
+        if (boundaries.contains(v)) candidates.push_back(v);
+    }
+    std::ranges::sort(candidates);
+    candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+    bool changed = false;
+    for (const uint32_t c : candidates) {
+        if (starts_.contains(c) || kinds[c - base] != Kind::Unknown) continue;
+        if (!tried_.insert(c).second) continue;
+        const Function trial = explore(c, bound_of(c));
+        if (!acceptable(trial, kinds) || !targets_acceptable(trial, kinds)) {
+            rejected_.push_back(c);
+            continue;
+        }
+        add_start(c, Origin::DataPointer);
+        claim(trial, kinds);
+        changed = true;
+    }
+    return changed;
+}
+
+std::string Cfg::trial(uint32_t a) const {
+    if (!in_image(a)) return "not an address of a word in the image\n";
+    const std::vector<Kind> kinds = claims();
+    const Function f = explore(a, bound_of(a));
+    std::string s = std::format("{:08x}-{:08x} (bound {:08x}): {} instructions, {} literals, {} calls, {} tail calls, "
+                                "{} indirect calls, {} indirect jumps, {} jump tables, returns: {}\n",
+                                f.start, f.end, f.bound, f.insns.size(), f.literals.size(), f.calls.size(),
+                                f.tails.size(), f.icalls.size(), f.itails.size(), f.jtabs.size(), f.returns);
+    static constexpr const char* kKinds[] = {"unclaimed", "code", "a literal", "a jump table"};
+    const auto kind = [&](uint32_t x) { return kKinds[static_cast<size_t>(kinds[x - boot_.base()])]; };
+    if (starts_.contains(a)) s += "already a function\n";
+    for (const uint32_t x : f.bad) s += std::format("reaches {:08x}: not an instruction, or outside the image\n", x);
+    for (const uint32_t x : f.bad_slots) s += std::format("delayed branch at {:08x} has no legal delay slot\n", x);
+    for (const uint32_t x : f.slot_targets) s += std::format("branches to the delay slot at {:08x}\n", x);
+    if (f.falls_into) s += std::format("runs into the function at {:08x}\n", f.falls_into);
+    for (const uint32_t pc : f.insns)
+        if (kinds[pc - boot_.base()] != Kind::Unknown && !starts_.contains(a)) {
+            s += std::format("its instruction at {:08x} is already {}\n", pc, kind(pc));
+            break;
+        }
+    for (const auto& [x, size] : f.literals)
+        if (boot_.mapped(x) && kinds[x - boot_.base()] == Kind::Code) s += std::format("its literal at {:08x} is code\n", x);
+    for (const auto& [site, t] : f.calls)
+        if (!starts_.contains(t)) s += std::format("calls {:08x} (from {:08x}), which is {} and not a function\n", t, site, kind(t));
+    for (const auto& [site, t] : f.tails)
+        if (!starts_.contains(t)) s += std::format("jumps to {:08x} (from {:08x}), which is {} and not a function\n", t, site, kind(t));
+    if (!starts_.contains(a))
+        s += acceptable(f, kinds) && targets_acceptable(f, kinds) ? "would be accepted\n" : "would be rejected\n";
+    return s;
+}
+
 void Cfg::find_suspects() {
     suspects_.clear();
     std::vector<Kind> code(boot_.image().size(), Kind::Unknown);
@@ -517,6 +605,7 @@ void Cfg::run() {
     for (;;) {
         explore_all();
         if (seed_literals()) continue;
+        if (seed_data_pointers()) continue;
         if (!seed_gaps()) break;
     }
     // A start that later evidence put inside this function's old range moved
@@ -538,6 +627,13 @@ Coverage Cfg::coverage() const {
     c.hi = std::min(c.hi, boot_.end());
     c.before = c.lo - base;
     c.after = boot_.end() - c.hi;
+    // Addresses in the image that reached code holds in its literal pools.
+    std::vector<uint32_t> references;
+    for (const auto& [start, f] : funcs_)
+        for (const auto& [a, size] : f.literals)
+            if (size == 4 && boot_.mapped(a, 4) && boot_.mapped(boot_.u32(a))) references.push_back(boot_.u32(a));
+    std::ranges::sort(references);
+    references.erase(std::unique(references.begin(), references.end()), references.end());
     for (uint32_t a = c.lo; a < c.hi;) {
         const Kind k = kinds[a - base];
         if (k == Kind::Code) ++c.code, ++a;
@@ -550,8 +646,17 @@ Coverage Cfg::coverage() const {
             bool padding = e - a <= kMaxPadding;
             for (uint32_t w = a & ~1u; padding && w < e; w += 2)
                 if (!boot_.mapped(w, 2) || !is_padding_word(boot_.u16(w))) padding = false;
+            const auto referenced = std::ranges::upper_bound(references, e - 1) - std::ranges::lower_bound(references, a);
+            // Inside a function's extent: bytes its code jumps over and never reaches.
+            const auto owner = funcs_.upper_bound(a);
+            const bool inside = owner != funcs_.begin() && e <= std::prev(owner)->second.end;
             if (padding) c.padding += e - a;
-            else {
+            else if (referenced == 0 && inside) c.dead += e - a;
+            else if (referenced > 0) {
+                c.data += e - a;
+                ++c.data_runs;
+                c.data_references += static_cast<uint64_t>(referenced);
+            } else {
                 c.unknown += e - a;
                 c.unknown_spans.emplace_back(a, e);
             }
@@ -562,7 +667,7 @@ Coverage Cfg::coverage() const {
 }
 
 std::string Cfg::summary() const {
-    std::array<size_t, 5> by_origin{};
+    std::array<size_t, 6> by_origin{};
     size_t insns = 0, slots = 0, literals = 0, calls = 0, icalls = 0, tails = 0, itails = 0, tables = 0, entries = 0;
     for (const auto& [start, f] : funcs_) {
         ++by_origin[static_cast<size_t>(f.origin)];
@@ -586,9 +691,10 @@ std::string Cfg::summary() const {
     s += std::format("{} suspects; {} weak candidates rejected\n", suspects_.size(), rejected_.size());
     const Coverage c = coverage();
     const uint64_t extent = c.hi - c.lo;
-    s += std::format("code extent {:08x}-{:08x} ({} bytes): code {} ({}), literal {}, table {}, padding {}, unknown {} ({})\n",
-                     c.lo, c.hi, extent, c.code, percent(c.code, extent, 2), c.literal, c.table, c.padding, c.unknown,
-                     percent(c.unknown, extent, 2));
+    s += std::format("code extent {:08x}-{:08x} ({} bytes): code {} ({}), literal {}, table {}, padding {}, "
+                     "data {} in {} runs ({} references), dead {}, unknown {} ({})\n",
+                     c.lo, c.hi, extent, c.code, percent(c.code, extent, 2), c.literal, c.table, c.padding, c.data,
+                     c.data_runs, c.data_references, c.dead, c.unknown, percent(c.unknown, extent, 2));
     s += std::format("outside it: {} bytes before, {} after (not classified)\n", c.before, c.after);
     return s;
 }

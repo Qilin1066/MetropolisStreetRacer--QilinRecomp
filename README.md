@@ -6,7 +6,7 @@ A static recompilation of **Metropolis Street Racer** (Bizarre Creations, Sega D
 
 ## Status
 
-Roadmap step 1, **analysis**, is under way. The disc has been read: it boots a launcher (`1ST_READ.BIN`) that loads the game (`MSR.BIN`) over itself, both built on Sega's own libraries. The decoder agrees with GNU binutils on every word of both, and function discovery finds 5,209 functions in the game (`docs/disc-and-boot-analysis.md`, `docs/recompiler-core.md`).
+Roadmap step 1, **analysis**, is under way. The disc has been read: it boots a launcher (`1ST_READ.BIN`) that loads the game (`MSR.BIN`) over itself, both built on Sega's own libraries. The decoder agrees with GNU binutils on every word of both, and function discovery finds 5,247 functions in the game (`docs/disc-and-boot-analysis.md`, `docs/recompiler-core.md`).
 
 | Piece | State |
 |---|---|
@@ -16,7 +16,7 @@ Roadmap step 1, **analysis**, is under way. The disc has been read: it boots a l
 | SH-4 decoder (all 209 instruction forms of the SH7091, `fsca` and `fsrra` included) | ✅ 0 unexplained disagreements with GNU binutils on all 65,536 words, at both PC alignments, and on every word of the launcher and the game |
 | CI: Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, Windows x64, warnings as errors, plus the decoder sweep | ✅ |
 | This game's disc: build, programs, system layer, file list | ✅ recorded (not Windows CE; Shinobi 1.68, Kamui 2, CRI ADX and Sofdec). The game's own file formats and the hand-over between launcher and game are next |
-| Function discovery + CFG (constant propagation for calls through the literal pool, delay slots, literal pools, the Hitachi compiler's jump tables) | 🔨 on the game: 5,209 functions, all 21 jump tables resolved, 83% of the bytes accounted for, 10 suspects. The rest is mostly data, which the accounting doesn't classify yet: data regions are next (`docs/recompiler-core.md`) |
+| Function discovery + CFG (constant propagation for calls through the literal pool, delay slots, literal pools, the Hitachi compiler's jump tables) | 🔨 on the game: 5,247 functions, all 22 jump tables resolved, **99.2% of the bytes accounted for** (code, literals, tables, padding, referenced data, dead code), 10 suspects. 43 spans (10,024 bytes) are still unexplained (`docs/recompiler-core.md`) |
 | Lifter → C++, differential test against the original code | later |
 | Runtime: system layer, GD-ROM files, graphics on Vulkan, audio, input, saves | later (see roadmap) |
 
@@ -57,8 +57,9 @@ build/qilin info    disc/MSR.BIN [--ip disc/IP.BIN] [--json info.json]
 build/qilin profile disc/MSR.BIN                              # instruction profile of a program
 build/qilin insns   disc/MSR.BIN [-o listing.txt]             # every word of a program, decoded
 build/qilin cfg     disc/MSR.BIN [--json cfg.json]            # function discovery + control flow, summary
-build/qilin coverage disc/MSR.BIN [--list]                    # every byte: code, literal, table, padding or unknown (exit 3 if any unknown)
+build/qilin coverage disc/MSR.BIN [--list]                    # every byte: code, literal, table, padding, data, dead or unknown (exit 3 if any unknown)
 build/qilin suspects disc/MSR.BIN                             # functions with problems, for review
+build/qilin trial   disc/MSR.BIN --base 0x8c0664cc            # explore one address as a function; why it would or wouldn't be accepted
 build/qilin disasm  words.bin [--base 0x8c010000]             # a file of little-endian words, decoded
 ```
 

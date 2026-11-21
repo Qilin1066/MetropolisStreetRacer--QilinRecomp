@@ -13,6 +13,8 @@
 //   qilin coverage <1ST_READ.BIN> [--list]              byte accounting of the code: code / literal / table /
 //                                                       padding / unknown (exit 3 if any unknown)
 //   qilin suspects <1ST_READ.BIN>                       functions with problems, for review
+//   qilin trial   <1ST_READ.BIN> --base addr            what exploring addr as a function finds, and
+//                                                       whether weak evidence would be enough for it
 //
 // Listings are one line per word: address, word, text ("8c010000 d101 mov.l 0x8c010008,r1").
 // The boot file is a flat image, so `insns` and `profile` cover data as well
@@ -65,6 +67,7 @@ int usage() {
                "  qilin cfg     <1ST_READ.BIN> [--json out.json]\n"
                "  qilin coverage <1ST_READ.BIN> [--list]\n"
                "  qilin suspects <1ST_READ.BIN>\n"
+               "  qilin trial   <1ST_READ.BIN> --base addr\n"
                "  qilin --version\n");
     return 2;
 }
@@ -305,13 +308,22 @@ int cmd_coverage(const Args& a) {
     cfg.run();
     const Coverage c = cfg.coverage();
     const uint64_t bytes = c.hi - c.lo;
-    std::println("{:08x}-{:08x}: {} bytes: code {} ({}), literal {}, table {}, padding {}, unknown {} ({}) in {} spans",
-                 c.lo, c.hi, bytes, c.code, percent(c.code, bytes, 3), c.literal, c.table, c.padding, c.unknown,
-                 percent(c.unknown, bytes, 3), c.unknown_spans.size());
+    std::println("{:08x}-{:08x}: {} bytes: code {} ({}), literal {}, table {}, padding {}, data {} in {} runs, "
+                 "dead {}, unknown {} ({}) in {} spans",
+                 c.lo, c.hi, bytes, c.code, percent(c.code, bytes, 3), c.literal, c.table, c.padding, c.data,
+                 c.data_runs, c.dead, c.unknown, percent(c.unknown, bytes, 3), c.unknown_spans.size());
     std::println("outside it: {} bytes before, {} after (not classified)", c.before, c.after);
     if (a.list)
         for (const auto& [lo, hi] : c.unknown_spans) std::println("  {:08x}-{:08x} ({} bytes)", lo, hi, hi - lo);
     return c.unknown ? 3 : 0;
+}
+
+int cmd_trial(const Args& a) {
+    const BootFile boot = must(BootFile::load(a.input), a.input);
+    Cfg cfg(boot);
+    cfg.run();
+    std::print("{}", cfg.trial(a.base));
+    return 0;
 }
 
 int cmd_suspects(const Args& a) {
@@ -342,6 +354,7 @@ int main(int argc, char** argv) {
         if (a.command == "cfg") return cmd_cfg(a);
         if (a.command == "coverage") return cmd_coverage(a);
         if (a.command == "suspects") return cmd_suspects(a);
+        if (a.command == "trial") return cmd_trial(a);
         return usage();
     } catch (const Failure& f) {
         std::println(stderr, "qilin: {}", f.message);

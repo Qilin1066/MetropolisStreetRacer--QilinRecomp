@@ -384,6 +384,62 @@ void test_cfg() {
         CHECK(Cfg(off).explore(B, off.end()).bad == std::vector<uint32_t>({B + 2}));
     }
 
+    // A forward bra once PR is restored is a tail call; without that it is a branch.
+    {
+        // sts.l pr,@-r15 ; bra 0x0a ; lds.l @r15+,pr ; rts ; nop ; (0a) rts ; nop
+        const BootFile tail = program({0x4F22, 0xA002, 0x4F26, 0x000B, 0x0009, 0x000B, 0x0009});
+        const Function f = Cfg(tail).explore(B, tail.end());
+        CHECK(f.tails.size() == 1 && f.tails.at(B + 0x02) == B + 0x0A && f.insns.size() == 3);
+        const BootFile branch = program({0x4F22, 0xA002, 0x0009, 0x000B, 0x0009, 0x000B, 0x0009});
+        const Function g = Cfg(branch).explore(B, branch.end());
+        CHECK(g.tails.empty() && g.insns.size() == 5 && g.returns);
+    }
+    // A function known only from a pointer in data, a run of data that code
+    // refers to, and candidates in it that must be turned down.
+    {
+        const BootFile boot2 = program({
+            /* 00 main */ 0xD103,  // mov.l 0x10,r1     (the address of data at 0x30)
+            /* 02 */ 0xB01D,       // bsr 0x40
+            /* 04 */ 0x0009,       // nop
+            /* 06 */ 0x000B,       // rts
+            /* 08 */ 0x0009,       // nop
+            /* 0a */ 0x0000, 0x0000, 0x0000,
+            /* 10 */ 0x0030, 0x8C01,
+            /* 14 F */ 0xE000,     // mov #0,r0         (only a pointer in the data names F)
+            /* 16 */ 0x000B,       // rts
+            /* 18 */ 0x0009,       // nop
+            /* 1a */ 0x0000,
+            /* 1c */ 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+            /* 30 */ 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+            /* 38 */ 0x0014, 0x8C01,  // a pointer to F
+            /* 3c */ 0xFFFF, 0xFFFF,
+            /* 40 H */ 0x000B,     // rts
+            /* 42 */ 0x0009,       // nop
+        });
+        Cfg cfg2(boot2);
+        cfg2.run();
+        const auto& fns2 = cfg2.functions();
+        CHECK(fns2.size() == 3);
+        CHECK(fns2.contains(B + 0x14) && fns2.at(B + 0x14).origin == Origin::DataPointer);
+        CHECK(fns2.contains(B + 0x40) && fns2.at(B + 0x40).origin == Origin::Call);
+        CHECK(cfg2.rejected() == std::vector<uint32_t>({B + 0x1C, B + 0x30}));
+        const Coverage c2 = cfg2.coverage();
+        CHECK(c2.lo == B && c2.hi == B + 0x44);
+        CHECK(c2.code == 20 && c2.literal == 4 && c2.padding == 6 && c2.data == 38 && c2.data_runs == 1);
+        CHECK(c2.data_references == 1 && c2.dead == 0 && c2.unknown == 0);
+        CHECK(cfg2.trial(B + 0x1C).contains("would be rejected"));
+        CHECK(cfg2.trial(B + 0x14).contains("already a function"));
+    }
+    // Bytes a function jumps over and nothing refers to are dead, not unknown.
+    {
+        // bra 0x0a ; nop ; six bytes of junk ; (0a) rts ; nop
+        const BootFile over = program({0xA003, 0x0009, 0xFFFF, 0xFFFF, 0xFFFF, 0x000B, 0x0009});
+        Cfg cfg3(over);
+        cfg3.run();
+        const Coverage c3 = cfg3.coverage();
+        CHECK(cfg3.functions().size() == 1 && c3.code == 8 && c3.dead == 6 && c3.unknown == 0);
+    }
+
     // What an instruction writes.
     const auto writes = [](uint16_t w) { return sh4::gpr_writes(sh4::decode(w)); };
     CHECK(writes(0x6123) == 1u << 1);                // mov r2,r1

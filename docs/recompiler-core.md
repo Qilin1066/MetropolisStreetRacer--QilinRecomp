@@ -50,7 +50,7 @@ The check also ran on the boot file of one retail Dreamcast game (374,222 words)
 
 `recomp/src/cfg.*`. `qilin cfg`, `qilin coverage`, `qilin suspects`.
 
-**Status: written, tested on synthetic programs, developed against the boot file of one other retail Dreamcast game as a stand-in (v0.2.0), and since v0.3.0 run on this game's two programs.** Results for the game are in *On this game* below; the stand-in's numbers are kept as the record of how the method was checked before the disc could be read.
+**Status: written, tested on synthetic programs, developed against the boot file of one other retail Dreamcast game as a stand-in (v0.2.0), and since v0.3.0 run on this game's two programs; v0.4.0 accounts for all but 0.77% of the game.** Results for the game are in *On this game* below; the stand-in's numbers are kept as the record of how the method was checked before the disc could be read.
 
 ### The problem
 
@@ -60,20 +60,23 @@ The boot file has no sections: nothing says where code is. Each function keeps i
 
 1. **Recursive descent from the entry point**, a function at a time, bounded by the next known function start.
    - **Constants:** a forward dataflow over the function tracks which general registers hold a known constant (`mov.l`/`mov.w` from the pool, `mov #imm`, `mova`, register copies, `add #imm`). Where paths join, a register stays known only if every path agrees. After a call nothing is known: the analysis doesn't assume the callee keeps the calling convention.
-   - **Calls and jumps:** `bsr`, and `jsr @rN`/`bsrf rN` with a constant register, are direct calls; their targets become function starts. `jmp @rN`/`braf rN` with a constant register is a tail call, unless it goes back into code the function has already been through. A `bra`, `bt` or `bf` out of the function's range is a tail call too. With a register that isn't constant they are indirect calls and indirect tail calls, dispatched at run time.
+   - **Calls and jumps:** `bsr`, and `jsr @rN`/`bsrf rN` with a constant register, are direct calls; their targets become function starts. `jmp @rN`/`braf rN` with a constant register is a tail call, unless it goes back into code the function has already been through. A `bra`, `bt` or `bf` out of the function's range is a tail call too, and so is a forward `bra` right after PR has been restored (`lds.l @r15+,pr` before it or in its slot): the function is leaving, whether or not anything else has shown that the target is a function. With a register that isn't constant they are indirect calls and indirect tail calls, dispatched at run time.
    - **Delay slots:** a delayed branch and its slot are one unit. The slot's instruction runs after the branch has read its operands and before control moves, and the constants follow that order. A missing slot, or an instruction the CPU refuses in one, is recorded (`bad_slots`). So is a branch whose target is a delay slot (`slot_targets`): legal on the console, rare, and something the lifter has to be told about.
    - **Literals:** every address a PC-relative `mov.w`/`mov.l` reads is claimed as a 2- or 4-byte literal; a `mova` address as 4 bytes unless it is a jump table.
    - **Jump tables:** the Hitachi compiler's switch, in its three shapes (bound check followed by `bt default`, by `bf` over a `bra default`, or by `bf` over `mov.l default,r0; jmp @r0` when the default is out of `bra`'s reach): `shll r0; mov r0,rM; mova table,r0; mov.w @(r0,rM),r0; braf r0`, with the table's size taken from the bound check, so it is proven, not guessed. Entries are 16-bit offsets from the `braf`'s PC + 4. A `braf` that fits neither shape is a suspect.
    - Repeat until no new start appears.
 2. **Weaker evidence**, each candidate explored on trial first and kept only if it is clean; then step 1 again:
    - **Literal pointers:** a longword that reached code loads from its pool and that points into the image, at bytes nothing has claimed. These are callbacks, and call targets the dataflow lost at a call or a join.
+   - **Pointers in data:** a longword anywhere in unclaimed bytes whose value is the first unclaimed word after claimed bytes (and any padding). These are tables of function pointers. The boundary is part of the evidence: a pointer into the middle of unclaimed bytes could as well point at data.
    - **Gaps:** the first unclaimed word after a function, its pool and any alignment padding. That is where the next function starts when nothing reached calls it by a constant (functions only called through tables of pointers).
    - **Clean** means: every path ends in a return, a jump or a tail call; no word that isn't an instruction is reached; no delay-slot rule is broken; neither its code nor its literals overlap what accepted functions claim; and everything it calls or jumps to is a known function or is itself clean on trial.
-3. **Accounting** (`qilin coverage`): every byte from the first function to the last claimed byte is code, literal, jump table, padding (zero words or nops, at most 16 bytes together) or unknown. Exit status 3 if anything is unknown.
+3. **Accounting** (`qilin coverage`): every byte from the first function to the last claimed byte is one of: code; literal; jump table; padding (zero words or nops, at most 32 bytes together: hand-written library routines are aligned to 32); **data**, an unclaimed run that at least one longword in reached code's literal pools points into; **dead**, an unclaimed run inside a function's extent that nothing refers to; or unknown. Exit status 3 if anything is unknown. A data run is counted whole on the strength of the reference and of no function having been found in it; if code hides in one, the game traps on the call with the address, and the address becomes a seed.
+
+`qilin trial <file> --base <address>` explores one address as a function start and says what it finds and why weak evidence would or wouldn't be enough for it: the tool for looking at whatever `coverage` still lists.
 
 `qilin suspects` lists every function that reaches a non-instruction, breaks a delay-slot rule, has an unrecognised `braf`, has a literal that is also reached as code, or (found by strong evidence) runs into the next function.
 
-### On the stand-in boot file
+### On the stand-in boot file (as of v0.2.0)
 
 748,444 bytes, built with Hitachi's compiler; 1.5 s.
 
@@ -95,29 +98,36 @@ What that shows, and what it doesn't:
 - **Functions found on weak evidence are a third of the total.** Each passed the trial, but a trial can't prove that bytes are code. The proof comes later, from the differential test and from running the game; until then their origin is kept with them.
 - **Nothing has been checked against a reference function list**, because none exists for that game (or for this one).
 
-### On this game (v0.3.0)
+### On this game (v0.4.0)
 
-| | `MSR.BIN` (the game) | `1ST_READ.BIN` (the launcher) |
+| | `MSR.BIN` (the game) | `1ST_READ.BIN` (the launcher; not lifted, kept as a second test) |
 |---|---|---|
 | Size | 1,321,020 bytes | 500,644 bytes |
-| Functions | 5,209: 1 entry, 2,839 by call, 413 by tail call, 679 by literal pointer, 1,277 by gap | 2,676: 1 entry, 1,539 by call, 184 by tail call, 144 by literal pointer, 808 by gap |
-| Instructions | 467,382 (40,591 in delay slots) | 115,004 (12,664 in delay slots) |
-| Literals | 40,822 | 9,581 |
-| Calls | 14,229 direct, 4,266 indirect | 3,902 direct, 883 indirect |
-| Jump tables | 21 (every `braf` in reached code), 310 entries | 2, 47 entries |
-| Weak candidates rejected | 3,953 | 1,102 |
+| Functions | 5,247: 1 entry, 2,841 by call, 416 by tail call, 671 by literal pointer, 382 by pointer in data, 936 by gap | 2,733: 1 entry, 1,561 by call, 189 by tail call, 147 by literal pointer, 237 by pointer in data, 598 by gap |
+| Instructions | 470,456 (40,745 in delay slots) | 116,787 (12,891 in delay slots) |
+| Literals | 40,959 | 9,744 |
+| Calls | 14,265 direct, 4,278 indirect | 3,998 direct, 889 indirect |
+| Jump tables | 22 (every `braf` in reached code), 322 entries | 2, 47 entries |
+| Weak candidates rejected | 3,853 | 1,009 |
 | Suspects | 10 | 0 |
-| Bytes | code 934,764 (71.6%), literals 142,358, tables 620, padding 6,530, **unknown 220,688 (16.9%)** | code 230,008 (45.9%), literals 28,084, tables 94, padding 3,730, **unknown 238,728 (47.7%)** |
+| Bytes | code 940,912 (72.1%), literals 142,830, tables 644, padding 14,560, data 195,238 in 25 runs, dead 752, **unknown 10,024 (0.77%) in 43 spans** | code 233,574 (46.7%), literals 28,536, tables 94, padding 10,868, data 198,036 in 8 runs, dead 1,242, **unknown 28,294 (5.65%)** |
 
-- **The game is Hitachi-compiled code of the kind the method was built on.** Every reachable `braf` is a recognised switch. One of them needed a third shape of the bound check (a default too far for `bra`), found here and added.
-- **The game's 10 suspects:** one branch into a delay slot (`0x8C0DE1B8`), and nine functions that run into the next. Two of the nine are our own doing: the big switch at `0x8C016BAC` jumps to its far default through a constant, which the analysis treats as a tail call, so the function is split at the default. That is harmless for lifting but is the wrong boundary; it goes away when a constant jump into the same function's own extent is recognised. The other seven look like library routines with several entry points.
-- **The unknown bytes are mostly data.** In the game one block of 165,394 bytes is most of it; in the launcher one of 159,146 (it looks like embedded data, to identify). Data regions are the next piece of work, as below.
-- **Weak evidence carries a third of the functions** in both programs, as on the stand-in. The same caveat applies.
+How the image is laid out, as this shows it: the game's own code from `0x8C010000`, its strings and constant data from about `0x8C0EE744` to `0x8C119C80`, then Sega's and CRI's libraries (the start-up stub jumps to `0x8C119C80`), then 16 KiB of data at the end.
+
+- **The game is Hitachi-compiled code of the kind the method was built on.** Every reachable `braf` is a recognised switch. One needed a third shape of the bound check (a default too far for `bra`), found here and added in v0.3.0.
+- **v0.3.0 left 16.9% of the game unknown; v0.4.0 leaves 0.77%.** What changed is under *Method*: runs of data that code refers to are counted as data, pointer tables in data are evidence for functions, a `bra` after PR is restored is a tail call (which un-merged pairs of functions and gave their callers somewhere to call), bytes a function jumps over are dead, and alignment padding may be 32 bytes.
+- **What is still unknown in the game**, 43 spans:
+  - one block of 6,702 bytes at `0x8C03B48A`, inside the game's code: a table that begins with pointers and that no literal refers to directly (reached by an offset from something else, most likely);
+  - four near-identical runs of about 440 bytes in the library area whose jumps go to places that aren't functions: hand-written code with shared tails;
+  - a handful of functions that nothing found refers to and that fail the trial, most because they end by running into the next function (a call to something that doesn't return, as likely as not);
+  - small leftovers.
+  None of it blocks lifting what has been found. `coverage` still exits 3 until each is explained.
+- **The game's 10 suspects:** one branch into a delay slot (`0x8C0DE1B8`), and nine functions that run into the next. Two of the nine are our own doing: the big switch at `0x8C016BAC` jumps to its far default through a constant, which the analysis treats as a tail call, so the function is split there. That is harmless for lifting but is the wrong boundary. The other seven look like library routines with several entry points.
+- **Evidence:** 62% of the game's functions are found by strong evidence (call or tail call from reached code), 20% by a pointer (in a literal pool or in data) plus a clean trial, 18% by position plus a clean trial. The last group is the one to watch; the differential test and running the game are what prove them.
 
 ### Next
 
+- The 43 unknown spans of the game, one kind at a time (above).
 - A constant `jmp` into the function's own extent (a far switch default) as a branch, not a tail call.
-- **Data regions:** claim what code references as data (addresses loaded and then read through), and the ranges the start-up code copies or clears, so `coverage` can reach zero unknown.
-- **Pointer tables in data:** longwords in data regions that point at unclaimed clean code (function pointer tables, vtables), as a third kind of weak evidence.
 - Branches into delay slots, and routines with several entry points: decide how the lifter treats each.
 - The FPSCR mode analysis, on top of this dataflow.

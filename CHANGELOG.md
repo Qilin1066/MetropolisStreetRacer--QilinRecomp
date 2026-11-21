@@ -11,11 +11,22 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-21
+Function discovery accounts for 99.2% of the game's bytes, up from 83%; and the launcher is to be replaced natively, so only the game is lifted.
+
 ### Changed
 - **The launcher is replaced natively, not lifted** (`docs/roadmap-and-design-targets.md`). Only the game, `MSR.BIN`, is lifted.
 - **The sister projects are mentioned by their new names** (GBTGhoulies--QilinRecomp, RhythmHeavenFever--QilinRecomp for Beat the Beat, ApbArcade--QilinRecomp: renamed by the owner; GitHub redirects the old names).
 
+- **A forward `bra` right after PR is restored is a tail call.** Functions reached only that way were being merged into their caller; un-merging them also gave other callers a function to call.
+- **Alignment padding** may be 32 bytes (hand-written library routines are aligned to 32 with nops).
+
 ### Added
+- **Pointers in data as evidence for functions:** a longword in unclaimed bytes that points at the first unclaimed word after claimed ones, with a clean trial. 382 of the game's functions are found this way.
+- **`coverage` counts data and dead bytes:** an unclaimed run that reached code's literal pools point into is data; an unclaimed run inside a function's extent that nothing refers to is dead.
+- **`qilin trial <file> --base <address>`:** explores one address as a function start and says what it finds and why weak evidence would or wouldn't be enough.
+- **Results on the game:** 5,247 functions, 22 of 22 jump tables, 10,024 bytes in 43 spans still unknown (`docs/recompiler-core.md` lists what they are).
+- **Tests** for each of the above.
 - **The hand-over between launcher and game** (`docs/disc-and-boot-analysis.md`), read from both programs: the argument block, the arguments the game takes, the attract loop that crosses programs, what the native replacement has to do, and what is still to confirm against the original running.
 - **Licence: GPL-3.0** (`LICENSE`; the README's Licence section), as in all the QilinRecomp projects by the owner's choice. The project had none before, which left everyone without the right to use it.
 

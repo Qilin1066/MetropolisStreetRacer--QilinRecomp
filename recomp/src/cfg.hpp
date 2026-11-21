@@ -24,6 +24,9 @@
 //      it is clean (below), then step 1 again, until nothing changes:
 //        - a longword that reached code loads from its literal pool and that
 //          points into the image (a callback, or a call the dataflow lost);
+//        - a longword anywhere in unclaimed bytes (a table of function
+//          pointers in data) that points at the first unclaimed word after
+//          claimed bytes: the pointer and the boundary together;
 //        - the first unclaimed word after a function and its pool (the
 //          next function, when nothing reached calls it by a constant).
 //   3. Accounting: every byte from the first function to the end of the
@@ -67,7 +70,7 @@ struct JumpTable {
 };
 
 // How a function was found, strongest evidence first.
-enum class Origin : uint8_t { Entry, Call, TailCall, Literal, Gap };
+enum class Origin : uint8_t { Entry, Call, TailCall, Literal, DataPointer, Gap };
 const char* origin_name(Origin o);
 inline bool strong(Origin o) { return o <= Origin::TailCall; }
 
@@ -104,11 +107,19 @@ struct Suspect {
 //   code     an instruction some function reaches (or its delay slot);
 //   literal  read PC-relative by reached code, or addressed by its `mova`;
 //   table    a jump table;
-//   padding  unclaimed zero words or nops, at most 16 bytes in a run;
+//   padding  unclaimed zero words or nops, at most 32 bytes in a run;
+//   data     an unclaimed run that reached code points into: at least one
+//            longword in a literal pool holds an address inside it. The
+//            whole run is counted, on the strength of that reference and of
+//            no function having been found in it;
+//   dead     an unclaimed run inside a function's extent that nothing
+//            refers to: bytes the function's code jumps over and never
+//            reaches;
 //   unknown  anything else. Done means unknown == 0.
 struct Coverage {
     uint32_t lo = 0, hi = 0;
-    uint64_t code = 0, literal = 0, table = 0, padding = 0, unknown = 0;
+    uint64_t code = 0, literal = 0, table = 0, padding = 0, data = 0, dead = 0, unknown = 0;
+    uint64_t data_runs = 0, data_references = 0;  // runs counted as data, and the addresses pointing into them
     uint64_t before = 0, after = 0;  // image bytes outside [lo, hi): not classified
     std::vector<std::pair<uint32_t, uint32_t>> unknown_spans;  // [lo, hi)
 };
@@ -132,6 +143,10 @@ public:
     // Decoded word at an address (invalid outside the image or at an odd address).
     sh4::Insn insn(uint32_t a) const;
 
+    // After run(): what a trial of `a` as a function start finds, and why it
+    // would or wouldn't be accepted on weak evidence. For `qilin trial`.
+    std::string trial(uint32_t a) const;
+
     // Explores one function without changing anything: for tests and tools.
     Function explore(uint32_t start, uint32_t bound) const;
 
@@ -148,6 +163,7 @@ private:
     bool targets_acceptable(const Function& f, const std::vector<Kind>& kinds) const;
     bool seed_literals();
     bool seed_gaps();
+    bool seed_data_pointers();
     void find_suspects();
     bool resolve_table(uint32_t at, JumpTable& out) const;
 
