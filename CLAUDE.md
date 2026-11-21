@@ -17,10 +17,10 @@ Static recompilation of **Metropolis Street Racer** (Dreamcast, North American r
 
 ## Layout
 
-- `recomp/src/`: `gdrom` (Redump CUE and GDI images, sectors, ISO 9660), `bootfile` (IP.BIN's fields, the boot file, known-build SHA table), `decoder` (table-driven, 209 forms, X-macro `QILIN_SH4_OPS`), `report` (JSON), `main.cpp` (the `qilin` CLI).
+- `recomp/src/`: `gdrom` (Redump CUE and GDI images, sectors, ISO 9660), `bootfile` (IP.BIN's fields, the boot file, known-build SHA table), `decoder` (table-driven, 209 forms, X-macro `QILIN_SH4_OPS`), `cfg` (function discovery, constant propagation, jump tables, coverage), `report` (JSON), `main.cpp` (the `qilin` CLI).
 - `recomp/tests/tests.cpp`: unit tests (`ctest`), on a synthetic disc image.
 - `tools/check/verify_decoder.py`: compares the decoder with binutils objdump on all 65,536 words.
-- `docs/`: design and results. Keep them current. `roadmap-and-design-targets.md` is the roadmap; `disc-and-boot-analysis.md` covers the disc and what to record from it; `recompiler-core.md` the decoder (later the CFG, lifter and difftest).
+- `docs/`: design and results. Keep them current. `roadmap-and-design-targets.md` is the roadmap; `disc-and-boot-analysis.md` covers the disc and what to record from it; `recompiler-core.md` the decoder and the CFG (later the lifter and difftest).
 
 ## Build and check
 
@@ -42,19 +42,22 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - SH-4: 16-bit instructions, little-endian here. Delayed branches run the next instruction first. `mov.l`/`mova` PC-relative addresses use `(pc & ~3) + 4`; `mov.w` uses `pc + 4`. Code and literal pools are mixed in the boot file.
 - Floating-point encodings change meaning with FPSCR.PR and FPSCR.SZ; the lifter must know the mode statically.
 - binutils' `sh4` set accepts `ldc rN,sgr` and `ldc.l @rN+,sgr`, which are SH-4A only (known difference).
+- Hitachi's compiler: calls are `mov.l L,rN` + `jsr @rN`; pools follow the function, 4-aligned with a zero word of padding; switches are `mova table,r0; mov.w @(r0,rM),r0; braf r0` with 16-bit offsets from the braf's PC + 4. Hand-written library code branches into delay slots and has routines with several entry points.
+- A constant `jmp @rN` forward is a tail call. The CFG forgets every register at a call (no ABI assumption).
 - The cloud workspace's file bridge has a 400 MB per-file limit: the disc image can't be staged, so the game's files come from `qilin extract` run on the author's PC.
 
-## Status (v0.1.0)
+## Status (v0.2.0)
 
-- Disc reader, IP.BIN and boot-file loaders, SH-4 decoder, CLI, tests, CI.
+- Disc reader, IP.BIN and boot-file loaders, SH-4 decoder, function discovery + CFG, CLI, tests, CI.
 - Decoder: 59,001 of 65,536 words are instructions; 0 unexplained differences with binutils 2.42.
-- **Not done yet: the game's own disc has not been read.** No build hash is recorded; `known_build` matches nothing.
+- CFG: tested on synthetic programs and on another retail Dreamcast game's boot file (Hitachi compiler): 4,243 functions, 14 of 14 jump tables, 87% of bytes accounted for, 12 suspects, all in hand-written library code. Numbers and limits in `docs/recompiler-core.md`.
+- **Not done yet: the game's own disc has not been read.** No build hash is recorded; `known_build` matches nothing. Nothing in the CFG has been run on this game.
 
 ## Next steps, in order
 
 1. **Read the disc** (`docs/disc-and-boot-analysis.md`, *What to record first*): extract it, record the boot file's SHA-256 and IP.BIN's fields in `bootfile.cpp` and the docs, confirm the game doesn't use Windows CE, run the decoder check and the profile on the boot file, survey the file formats.
 2. **Review the prior art** (`docs/prior-art.md`): the two Dreamcast static recompilations, and the Sonic Adventure decomp as a naming source for Sega's libraries (licence first).
-3. **Function discovery and CFG:** recursive descent with delay slots, literal pools marked as data, jump tables sized by analysis, `qilin cfg`, `coverage` (every byte accounted for, exit 3 on unknown), `suspects`.
+3. **Finish function discovery** (`docs/recompiler-core.md`, *Next*): run it on this game; data regions, so `coverage` can reach zero unknown; pointer tables in data as evidence; whatever switch shapes this game's compiler uses.
 4. **FPSCR mode analysis**, then the lifter's slices and the differential test, as in the sister projects.
 5. Hardware-access profile, library boundaries, timing model; then the runtime.
 

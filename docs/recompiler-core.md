@@ -1,6 +1,6 @@
 # Recompiler core
 
-Design and results of the recompiler's pieces, in the order they are built. So far: the decoder.
+Design and results of the recompiler's pieces, in the order they are built. So far: the decoder, and function discovery with control flow.
 
 ## SH-4 decoder (v0.1.0)
 
@@ -45,3 +45,60 @@ The one known difference, 32 words in each run:
 - **`ldc rN,sgr` (`0x4n3A`) and `ldc.l @rN+,sgr` (`0x4n36`).** The SH7750 series can only read SGR, with `stc` and `stc.l`; loading it arrived with the SH-4A. binutils' `sh4` set accepts both encodings anyway. `qilin` rejects them, so the recompiler stops if one ever turns up as code. (QEMU draws the same line: its SH-4 target takes these two only when the CPU is an SH-4A.)
 
 The check also ran on the boot file of one retail Dreamcast game (374,222 words): 0 unexplained, 14 words in the known class (that file, like every boot file, is code and data mixed). Running it on this game's boot file is one of the first steps in `disc-and-boot-analysis.md`.
+
+## Function discovery and control flow (v0.2.0)
+
+`recomp/src/cfg.*`. `qilin cfg`, `qilin coverage`, `qilin suspects`.
+
+**Status: written and tested on synthetic programs, and run on the boot file of one other retail Dreamcast game as a stand-in. It has not been run on this game's boot file yet**, so every number below is about the method, not about Metropolis Street Racer.
+
+### The problem
+
+The boot file has no sections: nothing says where code is. Each function keeps its constants in a literal pool beside it, so code and data alternate every few hundred bytes. Most calls go through a register loaded from the pool (`mov.l L,r3` … `jsr @r3`), so a call's target is a constant to be propagated, not a field of the instruction. And data decodes as instructions most of the time (59,001 of 65,536 words are valid), so a linear sweep proves nothing. **Code is only what can be reached.**
+
+### Method
+
+1. **Recursive descent from the entry point**, a function at a time, bounded by the next known function start.
+   - **Constants:** a forward dataflow over the function tracks which general registers hold a known constant (`mov.l`/`mov.w` from the pool, `mov #imm`, `mova`, register copies, `add #imm`). Where paths join, a register stays known only if every path agrees. After a call nothing is known: the analysis doesn't assume the callee keeps the calling convention.
+   - **Calls and jumps:** `bsr`, and `jsr @rN`/`bsrf rN` with a constant register, are direct calls; their targets become function starts. `jmp @rN`/`braf rN` with a constant register is a tail call, unless it goes back into code the function has already been through. A `bra`, `bt` or `bf` out of the function's range is a tail call too. With a register that isn't constant they are indirect calls and indirect tail calls, dispatched at run time.
+   - **Delay slots:** a delayed branch and its slot are one unit. The slot's instruction runs after the branch has read its operands and before control moves, and the constants follow that order. A missing slot, or an instruction the CPU refuses in one, is recorded (`bad_slots`). So is a branch whose target is a delay slot (`slot_targets`): legal on the console, rare, and something the lifter has to be told about.
+   - **Literals:** every address a PC-relative `mov.w`/`mov.l` reads is claimed as a 2- or 4-byte literal; a `mova` address as 4 bytes unless it is a jump table.
+   - **Jump tables:** the Hitachi compiler's switch, in its two shapes (bound check followed by `bt default`, or by `bf` over a `bra default`): `shll r0; mov r0,rM; mova table,r0; mov.w @(r0,rM),r0; braf r0`, with the table's size taken from the bound check, so it is proven, not guessed. Entries are 16-bit offsets from the `braf`'s PC + 4. A `braf` that fits neither shape is a suspect.
+   - Repeat until no new start appears.
+2. **Weaker evidence**, each candidate explored on trial first and kept only if it is clean; then step 1 again:
+   - **Literal pointers:** a longword that reached code loads from its pool and that points into the image, at bytes nothing has claimed. These are callbacks, and call targets the dataflow lost at a call or a join.
+   - **Gaps:** the first unclaimed word after a function, its pool and any alignment padding. That is where the next function starts when nothing reached calls it by a constant (functions only called through tables of pointers).
+   - **Clean** means: every path ends in a return, a jump or a tail call; no word that isn't an instruction is reached; no delay-slot rule is broken; neither its code nor its literals overlap what accepted functions claim; and everything it calls or jumps to is a known function or is itself clean on trial.
+3. **Accounting** (`qilin coverage`): every byte from the first function to the last claimed byte is code, literal, jump table, padding (zero words or nops, at most 16 bytes together) or unknown. Exit status 3 if anything is unknown.
+
+`qilin suspects` lists every function that reaches a non-instruction, breaks a delay-slot rule, has an unrecognised `braf`, has a literal that is also reached as code, or (found by strong evidence) runs into the next function.
+
+### On the stand-in boot file
+
+748,444 bytes, built with Hitachi's compiler; 1.5 s.
+
+| | |
+|---|---|
+| Functions | 4,243: 1 entry, 2,557 by call, 279 by tail call, 248 by literal pointer, 1,158 by gap |
+| Instructions | 285,258 (27,064 in delay slots) |
+| Literals | 22,352 |
+| Calls | 9,463 direct, 2,082 indirect |
+| Jump tables | 14 (every `braf` in reached code), 578 entries |
+| Weak candidates rejected | 1,147 |
+| Suspects | 12 |
+| Bytes accounted for | 87.0%: code 570,516, literals 72,538, tables 1,156, padding 2,482; unknown 96,364 in 86 spans |
+
+What that shows, and what it doesn't:
+
+- **The method holds up on real compiler output.** The suspects are all in what looks like hand-written library code: one branch into a delay slot (a block-copy routine), ten routines with several entry points that run into one another, and one call to a non-instruction.
+- **Most of the unknown bytes are data inside the code's extent**: four blocks make up 82,464 of the 96,364. A flat image has data between its code regions, and `coverage` has no notion of a data region yet. Until it does, "unknown = 0" can't be reached on any boot file.
+- **Functions found on weak evidence are a third of the total.** Each passed the trial, but a trial can't prove that bytes are code. The proof comes later, from the differential test and from running the game; until then their origin is kept with them.
+- **Nothing has been checked against a reference function list**, because none exists for that game (or for this one).
+
+### Next
+
+- Run it on this game's boot file; see which compiler built it and whether its switches take these shapes.
+- **Data regions:** claim what code references as data (addresses loaded and then read through), and the ranges the start-up code copies or clears, so `coverage` can reach zero unknown.
+- **Pointer tables in data:** longwords in data regions that point at unclaimed clean code (function pointer tables, vtables), as a third kind of weak evidence.
+- Branches into delay slots, and routines with several entry points: decide how the lifter treats each.
+- The FPSCR mode analysis, on top of this dataflow.

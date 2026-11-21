@@ -6,7 +6,7 @@ A static recompilation of **Metropolis Street Racer** (Bizarre Creations, Sega D
 
 ## Status
 
-Roadmap step 1, **analysis**, has started: the tools that read the disc and decode the CPU's instructions are written and checked. The game's own disc has not been read with them yet; that is the next step (`docs/disc-and-boot-analysis.md`).
+Roadmap step 1, **analysis**, is under way: the tools that read the disc, decode the CPU's instructions and find the functions in a boot file are written and checked. The game's own disc has not been read with them yet; that is the next step (`docs/disc-and-boot-analysis.md`).
 
 | Piece | State |
 |---|---|
@@ -16,7 +16,7 @@ Roadmap step 1, **analysis**, has started: the tools that read the disc and deco
 | SH-4 decoder (all 209 instruction forms of the SH7091, `fsca` and `fsrra` included) | ✅ 0 unexplained disagreements with GNU binutils on all 65,536 words, at both PC alignments |
 | CI: Linux x64 (GCC 14, Clang 19), Linux ARM64, macOS ARM64 and x64, Windows x64, warnings as errors, plus the decoder sweep | ✅ |
 | This game's disc: build hash, system layer (Sega's libraries or Windows CE), file and asset formats | next |
-| Function discovery + CFG (literal pools, delay slots, jump tables), every byte accounted for | next |
+| Function discovery + CFG (constant propagation for calls through the literal pool, delay slots, literal pools, the Hitachi compiler's jump tables) | 🔨 written; tested on synthetic programs and on one other retail game's boot file (4,243 functions, 87% of the bytes accounted for, 12 suspects). Not yet run on this game. Data regions are next (`docs/recompiler-core.md`) |
 | Lifter → C++, differential test against the original code | later |
 | Runtime: system layer, GD-ROM files, graphics on Vulkan, audio, input, saves | later (see roadmap) |
 
@@ -56,6 +56,9 @@ build/qilin info    disc/1ST_READ.BIN [--ip disc/IP.BIN] [--json info.json]
                                                                # SHA-256, supported build, load address (JSON)
 build/qilin profile disc/1ST_READ.BIN                         # instruction profile of the boot file
 build/qilin insns   disc/1ST_READ.BIN [-o listing.txt]        # every word of the boot file, decoded
+build/qilin cfg     disc/1ST_READ.BIN [--json cfg.json]       # function discovery + control flow, summary
+build/qilin coverage disc/1ST_READ.BIN [--list]               # every byte: code, literal, table, padding or unknown (exit 3 if any unknown)
+build/qilin suspects disc/1ST_READ.BIN                        # functions with problems, for review
 build/qilin disasm  words.bin [--base 0x8c010000]             # a file of little-endian words, decoded
 ```
 
@@ -74,8 +77,8 @@ This compares the decoder with GNU objdump (`-m sh4 -EL`): mnemonic and every op
 
 | Path | What |
 |---|---|
-| `recomp/src/` | Recompiler core: `gdrom` (disc images), `bootfile` (IP.BIN and the boot file), `sha256`, `decoder` (SH-4), `report` (JSON), `main` (CLI) |
-| `recomp/tests/` | Unit tests on a synthetic disc image and the decoder, so they need no game files |
+| `recomp/src/` | Recompiler core: `gdrom` (disc images), `bootfile` (IP.BIN and the boot file), `sha256`, `decoder` (SH-4), `cfg` (function discovery + control flow), `report` (JSON), `main` (CLI) |
+| `recomp/tests/` | Unit tests on a synthetic disc image, the decoder and synthetic programs, so they need no game files |
 | `tools/check/` | The decoder cross-check against GNU objdump |
 | `docs/` | Roadmap and design targets, prior art, analysis and status notes |
 

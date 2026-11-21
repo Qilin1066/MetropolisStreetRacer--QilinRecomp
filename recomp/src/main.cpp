@@ -9,6 +9,10 @@
 //   qilin disasm  <words.bin> [--base addr] [-o out.txt]
 //                                                       a file of little-endian words, decoded (encoding sweep)
 //   qilin profile <1ST_READ.BIN>                        instruction profile of the boot file
+//   qilin cfg     <1ST_READ.BIN> [--json out.json]      function discovery + control flow, summary
+//   qilin coverage <1ST_READ.BIN> [--list]              byte accounting of the code: code / literal / table /
+//                                                       padding / unknown (exit 3 if any unknown)
+//   qilin suspects <1ST_READ.BIN>                       functions with problems, for review
 //
 // Listings are one line per word: address, word, text ("8c010000 d101 mov.l 0x8c010008,r1").
 // The boot file is a flat image, so `insns` and `profile` cover data as well
@@ -31,6 +35,7 @@
 #include <vector>
 
 #include "bootfile.hpp"
+#include "cfg.hpp"
 #include "decoder.hpp"
 #include "gdrom.hpp"
 #include "report.hpp"
@@ -57,6 +62,9 @@ int usage() {
                "  qilin insns   <1ST_READ.BIN> [-o out.txt]\n"
                "  qilin disasm  <words.bin> [--base addr] [-o out.txt]\n"
                "  qilin profile <1ST_READ.BIN>\n"
+               "  qilin cfg     <1ST_READ.BIN> [--json out.json]\n"
+               "  qilin coverage <1ST_READ.BIN> [--list]\n"
+               "  qilin suspects <1ST_READ.BIN>\n"
                "  qilin --version\n");
     return 2;
 }
@@ -65,6 +73,7 @@ struct Args {
     std::string command, input;
     std::optional<std::string> out, json, out_dir, ip;
     uint32_t base = 0;
+    bool list = false;
 };
 
 uint32_t parse_u32(std::string_view s) {
@@ -93,6 +102,7 @@ Args parse_args(std::span<char*> argv) {
         else if (arg == "--base") a.base = parse_u32(value());
         else if (arg == "--out") a.out_dir = value();
         else if (arg == "--ip") a.ip = value();
+        else if (arg == "--list") a.list = true;
         else if (arg.starts_with("-")) throw Failure{std::format("unknown option {}", arg)};
         else if (a.input.empty()) a.input = arg;
         else throw Failure{std::format("unexpected argument {}", arg)};
@@ -280,6 +290,39 @@ int cmd_profile(const Args& a) {
     return 0;
 }
 
+int cmd_cfg(const Args& a) {
+    const BootFile boot = must(BootFile::load(a.input), a.input);
+    Cfg cfg(boot);
+    cfg.run();
+    std::print("{}", cfg.summary());
+    if (a.json) write_text(*a.json, cfg.to_json());
+    return 0;
+}
+
+int cmd_coverage(const Args& a) {
+    const BootFile boot = must(BootFile::load(a.input), a.input);
+    Cfg cfg(boot);
+    cfg.run();
+    const Coverage c = cfg.coverage();
+    const uint64_t bytes = c.hi - c.lo;
+    std::println("{:08x}-{:08x}: {} bytes: code {} ({}), literal {}, table {}, padding {}, unknown {} ({}) in {} spans",
+                 c.lo, c.hi, bytes, c.code, percent(c.code, bytes, 3), c.literal, c.table, c.padding, c.unknown,
+                 percent(c.unknown, bytes, 3), c.unknown_spans.size());
+    std::println("outside it: {} bytes before, {} after (not classified)", c.before, c.after);
+    if (a.list)
+        for (const auto& [lo, hi] : c.unknown_spans) std::println("  {:08x}-{:08x} ({} bytes)", lo, hi, hi - lo);
+    return c.unknown ? 3 : 0;
+}
+
+int cmd_suspects(const Args& a) {
+    const BootFile boot = must(BootFile::load(a.input), a.input);
+    Cfg cfg(boot);
+    cfg.run();
+    for (const Suspect& s : cfg.suspects()) std::println("{:08x} {}", s.start, s.why);
+    std::println("{} suspects; rejected candidates: {}", cfg.suspects().size(), cfg.rejected().size());
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -296,6 +339,9 @@ int main(int argc, char** argv) {
         if (a.command == "insns") return cmd_insns(a);
         if (a.command == "disasm") return cmd_disasm(a);
         if (a.command == "profile") return cmd_profile(a);
+        if (a.command == "cfg") return cmd_cfg(a);
+        if (a.command == "coverage") return cmd_coverage(a);
+        if (a.command == "suspects") return cmd_suspects(a);
         return usage();
     } catch (const Failure& f) {
         std::println(stderr, "qilin: {}", f.message);

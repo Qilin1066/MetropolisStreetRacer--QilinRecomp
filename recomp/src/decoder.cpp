@@ -141,6 +141,35 @@ uint32_t Insn::pc_address(uint32_t pc) const {
     return (pc & ~3u) + 4 + imm8() * 4;
 }
 
+uint16_t gpr_writes(const Insn& insn) {
+    if (!insn.valid()) return 0;
+    const Spec& s = spec(insn.op);
+    unsigned mask = 0;
+    Opnd last = none;
+    for (Opnd o : s.operands) {
+        if (o == none) break;
+        if (o == AtRnDec || o == AtRnInc) mask |= 1u << insn.n();
+        if (o == AtRmInc) mask |= 1u << insn.m();
+        last = o;
+    }
+    // The last operand is the destination, except for the instructions that
+    // only read their operands: compares and tests (they set T), the
+    // multiplies (MACH/MACL), div0s, and the register-relative branches.
+    switch (insn.op) {
+    case Op::tst: case Op::tst_imm: case Op::cmp_eq: case Op::cmp_eq_imm: case Op::cmp_hs: case Op::cmp_ge:
+    case Op::cmp_hi: case Op::cmp_gt: case Op::cmp_str: case Op::cmp_pz: case Op::cmp_pl: case Op::div0s:
+    case Op::mul_l: case Op::mulu_w: case Op::muls_w: case Op::dmulu_l: case Op::dmuls_l: case Op::bsrf:
+    case Op::braf:
+        return static_cast<uint16_t>(mask);
+    default:
+        break;
+    }
+    if (last == Rn) mask |= 1u << insn.n();
+    if (last == Rm) mask |= 1u << insn.m();
+    if (last == R0) mask |= 1u;
+    return static_cast<uint16_t>(mask);
+}
+
 const Spec& spec(Op op) { return kSpecs[static_cast<size_t>(op)]; }
 
 std::span<const Spec> specs() { return std::span(kSpecs).subspan(1); }

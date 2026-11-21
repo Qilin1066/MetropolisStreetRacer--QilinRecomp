@@ -337,6 +337,11 @@ struct Insn {
 // How many of the 65,536 words are instructions.
 inline constexpr size_t kValidWords = 59001;
 
+// The general registers an instruction writes, as a bit mask (bit N for rN):
+// its destination, and any register a post-increment or pre-decrement
+// operand updates. What a called function changes is not included.
+uint16_t gpr_writes(const Insn& insn);
+
 // The spec of every op (index by Op), and all of them in table order.
 const Spec& spec(Op op);
 std::span<const Spec> specs();

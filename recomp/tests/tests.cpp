@@ -1,17 +1,19 @@
 // Self-contained tests: SHA-256, the SH-4 decoder, IP.BIN and boot-file
-// parsing, and the GD-ROM reader on a synthetic disc image written to a
+// parsing, function discovery on synthetic programs, and the GD-ROM reader on a synthetic disc image written to a
 // temporary folder. No game files required (runs in CI).
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <initializer_list>
 #include <print>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "bootfile.hpp"
+#include "cfg.hpp"
 #include "decoder.hpp"
 #include "gdrom.hpp"
 #include "report.hpp"
@@ -228,6 +230,174 @@ void test_boot_file() {
     CHECK(!BootFile::parse(too_big));
     CHECK(BootFile::parse(std::span(too_big).first(too_big.size() - 2)).has_value());
     CHECK(json_string("a\"b\\c\n") == "\"a\\\"b\\\\c\\u000a\"");
+}
+
+// ---------------------------------------------------------------- function discovery
+
+BootFile program(std::initializer_list<unsigned> words) {
+    std::vector<uint8_t> bytes;
+    for (const unsigned w : words) {
+        bytes.push_back(static_cast<uint8_t>(w));
+        bytes.push_back(static_cast<uint8_t>(w >> 8));
+    }
+    return *BootFile::parse(bytes);
+}
+
+void test_cfg() {
+    constexpr uint32_t B = 0x8C010000u;
+    // Five functions, each found a different way.
+    const BootFile boot = program({
+        /* 00 main */ 0xD102,  // mov.l 0x0c,r1      (the address of A)
+        /* 02 */ 0x410B,       // jsr @r1
+        /* 04 */ 0x0009,       // nop
+        /* 06 */ 0x000B,       // rts
+        /* 08 */ 0x0009,       // nop
+        /* 0a */ 0x0000,       // padding
+        /* 0c */ 0x0010, 0x8C01,
+        /* 10 A */ 0x6043,     // mov r4,r0
+        /* 12 */ 0xE103,       // mov #3,r1
+        /* 14 */ 0x3012,       // cmp/hs r1,r0
+        /* 16 */ 0x890B,       // bt 0x30            (default)
+        /* 18 */ 0x4000,       // shll r0
+        /* 1a */ 0x6103,       // mov r0,r1
+        /* 1c */ 0xC701,       // mova 0x24,r0
+        /* 1e */ 0x001D,       // mov.w @(r0,r1),r0
+        /* 20 */ 0x0023,       // braf r0
+        /* 22 */ 0x0009,       // nop
+        /* 24 */ 0x0006, 0x0008, 0x000C,  // table: 0x2a, 0x2c, 0x30
+        /* 2a */ 0xE001,       // mov #1,r0
+        /* 2c */ 0x000B,       // rts
+        /* 2e */ 0x0009,       // nop
+        /* 30 */ 0xD301,       // mov.l 0x38,r3      (the address of C)
+        /* 32 */ 0x432B,       // jmp @r3            (a tail call)
+        /* 34 */ 0x0009,       // nop
+        /* 36 */ 0x0000,       // padding
+        /* 38 */ 0x0040, 0x8C01,
+        /* 3c */ 0x0000, 0x0000,
+        /* 40 C */ 0xD201,     // mov.l 0x48,r2      (the address of D: a callback, never called here)
+        /* 42 */ 0x000B,       // rts
+        /* 44 */ 0x0009,       // nop
+        /* 46 */ 0x0000,
+        /* 48 */ 0x0050, 0x8C01,
+        /* 4c */ 0x0000, 0x0000,
+        /* 50 D */ 0x000B,     // rts
+        /* 52 */ 0x0009,       // nop
+        /* 54 E */ 0xE000,     // mov #0,r0          (nothing refers to E: found as the gap after D)
+        /* 56 */ 0x000B,       // rts
+        /* 58 */ 0x0009,       // nop
+        /* 5a */ 0xFFFF, 0xFFFF,  // data
+    });
+    Cfg cfg(boot);
+    cfg.run();
+    const auto& fns = cfg.functions();
+    CHECK(fns.size() == 5);
+    if (fns.size() == 5) {
+        const auto origin = [&](uint32_t a) { return fns.contains(B + a) ? fns.at(B + a).origin : Origin::Gap; };
+        CHECK(fns.contains(B) && origin(0x00) == Origin::Entry);
+        CHECK(fns.contains(B + 0x10) && origin(0x10) == Origin::Call);
+        CHECK(fns.contains(B + 0x40) && origin(0x40) == Origin::TailCall);
+        CHECK(fns.contains(B + 0x50) && origin(0x50) == Origin::Literal);
+        CHECK(fns.contains(B + 0x54) && origin(0x54) == Origin::Gap);
+    }
+    if (fns.contains(B)) {
+        const Function& f = fns.at(B);
+        CHECK(f.calls.size() == 1 && f.calls.at(B + 0x02) == B + 0x10);
+        CHECK(f.insns.size() == 5 && f.slots.size() == 2 && f.returns && f.end == B + 0x0A);
+        CHECK(f.literals.size() == 1 && f.literals.at(B + 0x0C) == 4);
+    }
+    if (fns.contains(B + 0x10)) {
+        const Function& f = fns.at(B + 0x10);
+        CHECK(f.jtabs.size() == 1);
+        if (f.jtabs.size() == 1) {
+            CHECK(f.jtabs[0].at == B + 0x20 && f.jtabs[0].table == B + 0x24);
+            CHECK(f.jtabs[0].targets == std::vector<uint32_t>({B + 0x2A, B + 0x2C, B + 0x30}));
+        }
+        CHECK(f.movas.empty());  // the mova is the table's, not a literal's
+        CHECK(f.tails.size() == 1 && f.tails.at(B + 0x32) == B + 0x40);
+        CHECK(f.itails.empty() && f.clean() && f.returns);
+        CHECK(f.leaders.contains(B + 0x2A) && f.leaders.contains(B + 0x2C) && f.leaders.contains(B + 0x30) &&
+              f.leaders.contains(B + 0x18));
+    }
+    CHECK(cfg.suspects().empty());
+    CHECK(cfg.rejected() == std::vector<uint32_t>({B + 0x5A}));
+    const Coverage c = cfg.coverage();
+    CHECK(c.lo == B && c.hi == B + 0x5A && c.after == 4 && c.before == 0);
+    CHECK(c.literal == 12 && c.table == 6 && c.padding == 14 && c.unknown == 0);
+    CHECK(c.code + c.literal + c.table + c.padding == 0x5A);
+    CHECK(cfg.to_json().contains("\"origin\": \"literal pointer\""));
+    CHECK(percent(1, 3, 2) == "33.33%" && percent(2, 3, 0) == "67%" && percent(0, 0, 1) == "n/a");
+
+    // Constants where paths join: the same value on both is kept, different values aren't.
+    const auto join = [](unsigned second_literal_load) {
+        return program({
+            /* 00 */ 0xD103,   // mov.l 0x10,r1
+            /* 02 */ 0x8900,   // bt 0x06
+            /* 04 */ second_literal_load,
+            /* 06 */ 0x410B,   // jsr @r1
+            /* 08 */ 0x0009,   // nop
+            /* 0a */ 0x000B,   // rts
+            /* 0c */ 0x0009,   // nop
+            /* 0e */ 0x0000,
+            /* 10 */ 0x0018, 0x8C01,
+            /* 14 */ 0x001C, 0x8C01,
+            /* 18 */ 0x000B, 0x0009,
+            /* 1c */ 0x000B, 0x0009,
+        });
+    };
+    {
+        const BootFile same = join(0xD102);       // mov.l 0x10,r1 again
+        const Function f = Cfg(same).explore(B, same.end());
+        CHECK(f.calls.size() == 1 && f.icalls.empty());
+        const BootFile different = join(0xD103);  // mov.l 0x14,r1
+        const Function g = Cfg(different).explore(B, different.end());
+        CHECK(g.calls.empty() && g.icalls == std::vector<uint32_t>({B + 0x06}));
+        // A call forgets every register: the second jsr isn't resolved.
+        const BootFile twice = program({0xD103, 0x410B, 0x0009, 0x410B, 0x0009, 0x000B, 0x0009, 0x0000, 0x000A, 0x8C01});
+        const Function h = Cfg(twice).explore(B, twice.end());
+        CHECK(h.calls.size() == 1 && h.icalls == std::vector<uint32_t>({B + 0x06}));
+    }
+    // Delay slots: a branch can't sit in one; a branch into one is recorded.
+    {
+        const BootFile nested = program({0xA000, 0xA000, 0x0009, 0x000B, 0x0009});  // bra ; bra
+        const Function f = Cfg(nested).explore(B, nested.end());
+        CHECK(f.bad_slots == std::vector<uint32_t>({B}) && !f.clean());
+        // bf 0x04 ; bra 0x06 ; (04, the slot) nop ; (06) rts ; nop
+        const BootFile into = program({0x8B00, 0xA000, 0x0009, 0x000B, 0x0009});
+        const Function g = Cfg(into).explore(B, into.end());
+        CHECK(g.slot_targets == std::vector<uint32_t>({B + 0x04}) && !g.clean());
+        // The slot runs before the jump but after it reads its register:
+        // jmp @r1 with "mov #0,r1" in the slot still goes where r1 pointed
+        // (and a jump forward through a constant is a tail call).
+        const BootFile order = program({0xD101, 0x412B, 0xE100, 0x0000, 0x000C, 0x8C01, 0x000B, 0x0009});
+        const Function h = Cfg(order).explore(B, order.end());
+        CHECK(h.clean() && h.insns.size() == 3 && h.tails.size() == 1 && h.tails.at(B + 0x02) == B + 0x0C);
+    }
+    // Reaching a word that isn't an instruction, and running off the image.
+    {
+        const BootFile junk = program({0x0009, 0xFFFF});
+        CHECK(Cfg(junk).explore(B, junk.end()).bad == std::vector<uint32_t>({B + 2}));
+        const BootFile off = program({0x0009, 0x0009});
+        CHECK(Cfg(off).explore(B, off.end()).bad == std::vector<uint32_t>({B + 2}));
+    }
+
+    // What an instruction writes.
+    const auto writes = [](uint16_t w) { return sh4::gpr_writes(sh4::decode(w)); };
+    CHECK(writes(0x6123) == 1u << 1);                // mov r2,r1
+    CHECK(writes(0x6126) == (1u << 1 | 1u << 2));    // mov.l @r2+,r1
+    CHECK(writes(0x2126) == 1u << 1);                // mov.l r2,@-r1
+    CHECK(writes(0x2122) == 0);                      // mov.l r2,@r1
+    CHECK(writes(0x3120) == 0);                      // cmp/eq r2,r1
+    CHECK(writes(0x8801) == 0);                      // cmp/eq #1,r0
+    CHECK(writes(0xC901) == 1);                      // and #1,r0
+    CHECK(writes(0x8412) == 1);                      // mov.b @(2,r1),r0
+    CHECK(writes(0x0127) == 0);                      // mul.l r2,r1
+    CHECK(writes(0x012F) == (1u << 1 | 1u << 2));    // mac.l @r2+,@r1+
+    CHECK(writes(0x4110) == 1u << 1);                // dt r1
+    CHECK(writes(0x410B) == 0);                      // jsr @r1
+    CHECK(writes(0x012A) == 1u << 1);                // sts pr,r1
+    CHECK(writes(0x412A) == 0);                      // lds r1,pr
+    CHECK(writes(0xF129) == 1u << 2);                // fmov @r2+,fr1
+    CHECK(writes(0xFFFF) == 0);
 }
 
 // ---------------------------------------------------------------- GD-ROM
@@ -482,6 +652,7 @@ int main() {
     test_decoder();
     test_ip_bin();
     test_boot_file();
+    test_cfg();
     test_gdrom();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
