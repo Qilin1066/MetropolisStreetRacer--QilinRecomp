@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(MetropolisStreetRacerQilinRecomp VERSION 0.6.0 LANGUAGES CXX)
+project(MetropolisStreetRacerQilinRecomp VERSION 0.7.0 LANGUAGES CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -100,7 +100,9 @@ if(QILIN_GEN_DIR)
     file(GLOB QILIN_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
     add_library(qilin_gen_checked STATIC ${QILIN_GEN_SOURCES} recomp/runtime/dispatch.cpp)
     target_include_directories(qilin_gen_checked PUBLIC "${QILIN_GEN_DIR}")
-    target_compile_definitions(qilin_gen_checked PUBLIC QILIN_CHECKED_MEMORY)
+    # Checked memory; and QEMU's two differences from the hardware, so the rest
+    # can be compared with it (recomp/runtime/guest.hpp). Never in a game build.
+    target_compile_definitions(qilin_gen_checked PUBLIC QILIN_CHECKED_MEMORY QILIN_REFERENCE_QEMU)
     target_link_libraries(qilin_gen_checked PUBLIC qilin_runtime PRIVATE qilin_warnings)
     add_executable(qilin_difftest tools/difftest/harness.cpp)
     target_link_libraries(qilin_difftest PRIVATE qilin_gen_checked qilin_disc qilin_warnings)

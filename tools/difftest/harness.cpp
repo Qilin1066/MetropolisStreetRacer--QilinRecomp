@@ -7,10 +7,10 @@
 // Guest memory is the Dreamcast's RAM (16 MiB at 0x8C000000) holding the
 // program at 0x8C010000, as in the QEMU run; anything else stops with a
 // memory fault (checked memory). All integers are little-endian u32.
-//   case:   fn, r0..r15, pr, gbr, mach, macl, t, s, q, m,
+//   case:   fn, r0..r15, pr, gbr, mach, macl, t, s, q, m, fpul, fpscr, fr[0][0..15], fr[1][0..15],
 //           n, then n x (addr, len, bytes) written over the image
 //   result: status (0 = returned, else 1 + rt::Stop::Kind), stop pc, stop value,
-//           r0..r15, pr, gbr, mach, macl, t, s, q, m, ret,
+//           r0..r15, pr, gbr, mach, macl, t, s, q, m, fpul, fpscr, fr[0][0..15], fr[1][0..15], ret,
 //           then the changed 32-byte blocks of RAM: count, count x (addr, 32 bytes)
 #include <cstdio>
 #include <cstring>
@@ -77,6 +77,9 @@ int main(int argc, char** argv) {
         for (uint32_t& r : c.r) read_u32(r);
         read_u32(c.pr), read_u32(c.gbr), read_u32(c.mach), read_u32(c.macl);
         read_u32(c.t), read_u32(c.s), read_u32(c.q), read_u32(c.m);
+        read_u32(c.fpul), read_u32(c.fpscr);
+        for (auto& bank : c.fr)
+            for (uint32_t& f : bank) read_u32(f);
         initial = baseline;
         uint32_t writes = 0;
         read_u32(writes);
@@ -102,7 +105,11 @@ int main(int argc, char** argv) {
         write_u32(status), write_u32(pc), write_u32(value);
         for (const uint32_t r : c.r) write_u32(r);
         write_u32(c.pr), write_u32(c.gbr), write_u32(c.mach), write_u32(c.macl);
-        write_u32(c.t), write_u32(c.s), write_u32(c.q), write_u32(c.m), write_u32(c.ret);
+        write_u32(c.t), write_u32(c.s), write_u32(c.q), write_u32(c.m);
+        write_u32(c.fpul), write_u32(c.fpscr);
+        for (const auto& bank : c.fr)
+            for (const uint32_t f : bank) write_u32(f);
+        write_u32(c.ret);
         std::vector<uint32_t> changed;
         for (uint32_t off = 0; off < kRamSize; off += 32)
             if (std::memcmp(ram + off, initial.data() + off, 32) != 0) changed.push_back(off);

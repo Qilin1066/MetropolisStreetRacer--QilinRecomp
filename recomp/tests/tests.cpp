@@ -2,6 +2,7 @@
 // parsing, function discovery on synthetic programs, and the GD-ROM reader on a synthetic disc image written to a
 // temporary folder. No game files required (runs in CI).
 #include <algorithm>
+#include <bit>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -582,13 +583,8 @@ void test_lifter() {
         CHECK(r.code.contains("QILIN_OUT fn_8c010034(c); return;"));
         CHECK(r.code.contains("if (t) goto L_8c010024;"));
     }
-    // What this slice refuses, with the reason.
+    // What the lifter refuses, with the reason.
     {
-        const BootFile fp = program({0xF210, 0x000B, 0x0009});  // fadd fr1,fr2
-        Cfg c3(fp);
-        c3.run();
-        const LiftResult r = Lifter(c3).lift(c3.functions().at(B));
-        CHECK(!r.ok && r.fail_at == B && r.why == "floating point (slice 2)");
         const BootFile priv = program({0x0002, 0x000B, 0x0009});  // stc sr,r0
         Cfg c4(priv);
         c4.run();
@@ -641,6 +637,123 @@ void test_lifter() {
         rt::mac_w(c, 0xFFFFu, 1);  // -1 * 1 added to 0x00000000_FFFFFFFF
         CHECK(c.macl == 0xFFFFFFFEu && c.mach == 0);
     }
+}
+
+// ---------------------------------------------------------------- floating point
+
+void test_floating_point() {
+    using namespace qilin::rt;
+    const auto bits = [](float f) { return std::bit_cast<uint32_t>(f); };
+    // DN = 1: denormalised inputs are zero, and so are denormalised results.
+    CHECK(fadd(0x00800000u, 0x00000001u) == 0x00800000u);
+    CHECK(fadd(0x80000001u, 0x00000000u) == 0x00000000u);  // -0 + +0
+    CHECK(fsub(0x00800001u, 0x00800000u) == 0);            // 2^-149: denormal
+    CHECK(fmul(0x00000001u, bits(1073741824.0f)) == 0);   // denormal * 2^30: the input is zero
+    CHECK(fcmp_eq(0x00000001u, 0x80000000u) == 1);          // a denormal equals zero
+    // Any NaN result is the default NaN.
+    CHECK(fadd(0x7F800000u, 0xFF800000u) == kDefaultNan);
+    CHECK(fadd(0x7FC12345u, bits(1.0f)) == kDefaultNan);
+    CHECK(fsqrt(bits(-1.0f)) == kDefaultNan);
+    CHECK(fdiv(bits(1.0f), 0) == 0x7F800000u);
+    CHECK(dadd(0x7FF0000000000000ull, 0xFFF0000000000000ull) == kDefaultNan64);
+    CHECK(fcmp_gt(0x7FC00000u, bits(1.0f)) == 0);
+    // fmac rounds once: (1 + 2^-23)^2 - (1 + 2^-22) = 2^-46.
+    CHECK(fmac(0x3F800001u, 0x3F800001u, 0xBF800002u) == 0x28800000u);
+    // Conversions.
+    CHECK(float_s(0x7FFFFFFFu) == 0x4F000000u);
+    CHECK(ftrc_s(bits(-2.7f)) == 0xFFFFFFFEu && ftrc_s(bits(3e9f)) == 0x7FFFFFFFu);
+    CHECK(ftrc_s(bits(-3e9f)) == 0x80000000u && ftrc_s(0x7FC00000u) == 0x7FFFFFFFu && ftrc_s(0xFFC00000u) == 0x7FFFFFFFu);
+    CHECK(fcnvds(std::bit_cast<uint64_t>(1.0 / 3.0)) == 0x3EAAAAABu);
+    CHECK(fcnvsd(bits(0.5f)) == std::bit_cast<uint64_t>(0.5));
+    CHECK(float_d(0x80000000u) == std::bit_cast<uint64_t>(-2147483648.0));
+    // Double registers: DRn is FRn (high) and FRn+1.
+    uint32_t bank[16] = {};
+    set64(bank, 2, std::bit_cast<uint64_t>(1.5));
+    CHECK(bank[2] == 0x3FF80000u && bank[3] == 0 && get64(bank, 2) == std::bit_cast<uint64_t>(1.5));
+    // A 64-bit fmov puts the even register at the lower address (the hardware's order).
+    {
+        std::vector<uint8_t> memory(64, 0);
+        uint8_t* const saved = g_mem;
+        g_mem = memory.data();
+        bank[4] = 0x11111111u, bank[5] = 0x22222222u;
+        st_pair(8, bank, 4);
+        CHECK(ld32(8) == 0x11111111u && ld32(12) == 0x22222222u);
+        // The compiler's double constants are laid out that way: 0.301 as 3FD34395 810624DD.
+        st32(16, 0x3FD34395u), st32(20, 0x810624DDu);
+        ld_pair(16, bank, 6);
+        CHECK(f64(get64(bank, 6)) == 0.301);
+        g_mem = saved;
+    }
+    // fipr, ftrv, fsrra, fsca.
+    for (unsigned i = 0; i < 8; ++i) bank[i] = bits(float(i + 1));
+    CHECK(fipr(bank, 0, 4) == bits(70.0f));
+    uint32_t matrix[16] = {};
+    for (unsigned i = 0; i < 4; ++i) matrix[5 * i] = bits(1.0f);
+    ftrv(matrix, bank, 4);
+    CHECK(bank[4] == bits(5.0f) && bank[7] == bits(8.0f));
+    CHECK(fsrra(bits(4.0f)) == bits(0.5f));
+    fsca(0, bank, 0);
+    CHECK(bank[0] == 0 && bank[1] == bits(1.0f));
+    fsca(0x4000, bank, 0);  // a quarter turn
+    CHECK(bank[0] == bits(1.0f) && bank[1] == 0);
+    fsca(0x2000, bank, 0);  // an eighth
+    CHECK(bank[0] == 0x3F3504F3u && bank[1] == 0x3F3504F3u);
+    fsca(0x1C000, bank, 0);  // three quarters (bits above 16 ignored)
+    CHECK(bank[0] == bits(-1.0f) && bank[1] == 0);
+    // Loading FPSCR: round to nearest without exceptions enabled only.
+    uint32_t fpscr = 0;
+    lds_fpscr(fpscr, 0x00040000u, 0);
+    CHECK(fpscr == 0x00040000u);
+    bool stopped = false;
+    try {
+        lds_fpscr(fpscr, 0x00040001u, 0x8C010000u);  // round to zero
+    } catch (const Stop& stop) {
+        stopped = stop.kind == Stop::Unsupported && stop.value == 0x00040001u;
+    }
+    CHECK(stopped && fpscr == 0x00040000u);
+}
+
+void test_lifter_floating_point() {
+    const auto lift = [](std::initializer_list<unsigned> words) {
+        const BootFile image = program(words);
+        Cfg cfg(image);
+        cfg.run();
+        return Lifter(cfg).lift(cfg.functions().at(0x8C010000u));
+    };
+    // Single precision in the entry mode.
+    const LiftResult single = lift({0xF210, 0xF225, 0x000B, 0x0009});  // fadd fr1,fr2 ; fcmp/gt fr2,fr2 ; rts ; nop
+    CHECK(single.ok && single.code.contains("c.fr[0][2] = rt::fadd(c.fr[0][2], c.fr[0][1]);"));
+    CHECK(single.code.contains("t = rt::fcmp_gt(c.fr[0][2], c.fr[0][2]);"));
+    // The compiler's change to double precision and back.
+    const LiftResult dbl = lift({0x006A, 0xD105, 0x201B, 0x406A, 0xF420, 0x006A, 0xD103, 0x2019, 0x406A, 0xF210,
+                                 0x000B, 0x0009, 0x0000, 0x0008, 0xFFFF, 0xFFF7});
+    CHECK(dbl.ok);
+    CHECK(dbl.code.contains("rt::set64(c.fr[0], 4, rt::dadd(rt::get64(c.fr[0], 4), rt::get64(c.fr[0], 2)));"));
+    CHECK(dbl.code.contains("rt::lds_fpscr(c.fpscr, r0, 0x8c010006u);"));
+    CHECK(dbl.code.contains("c.fr[0][2] = rt::fadd(c.fr[0][2], c.fr[0][1]);"));
+    // fschg: 64-bit moves, DR for an even register and XD for an odd one.
+    // fschg ; fmov dr2,xd4 ; fmov @r4,dr6 ; fmov xd2,@-r15 ; fschg ; rts ; nop
+    const LiftResult pairs = lift({0xF3FD, 0xF52C, 0xF648, 0xFF3B, 0xF3FD, 0x000B, 0x0009});
+    CHECK(pairs.ok);
+    CHECK(pairs.code.contains("c.fpscr ^= rt::kFpscrSz;"));
+    CHECK(pairs.code.contains("{ const uint32_t hi = c.fr[0][2], lo = c.fr[0][3]; c.fr[1][4] = hi; c.fr[1][5] = lo; }"));
+    CHECK(pairs.code.contains("rt::ld_pair(r4, c.fr[0], 6);"));
+    CHECK(pairs.code.contains("rt::st_pair(r15 - 8, c.fr[1], 2); r15 -= 8;"));
+    // frchg: the banks swap. frchg ; fmov fr1,fr0 ; frchg ; rts ; nop
+    const LiftResult banks = lift({0xFBFD, 0xF01C, 0xFBFD, 0x000B, 0x0009});
+    CHECK(banks.ok && banks.code.contains("c.fr[1][0] = c.fr[1][1];") && banks.code.contains("c.fpscr ^= rt::kFpscrFr;"));
+    // fipr, ftrv, fsca, fmac.
+    const LiftResult vector = lift({0xF4ED, 0xF9FD, 0xF2FD, 0xF21E, 0x000B, 0x0009});
+    CHECK(vector.ok);
+    CHECK(vector.code.contains("c.fr[0][7] = rt::fipr(c.fr[0], 0, 4);"));
+    CHECK(vector.code.contains("rt::ftrv(c.fr[1], c.fr[0], 8);"));
+    CHECK(vector.code.contains("rt::fsca(c.fpul, c.fr[0], 2);"));
+    CHECK(vector.code.contains("c.fr[0][2] = rt::fmac(c.fr[0][0], c.fr[0][1], c.fr[0][2]);"));
+    // Refused: a mode the analysis can't prove, and leaving in another mode.
+    const LiftResult unknown = lift({0x446A, 0xF210, 0x000B, 0x0009});  // lds r4,fpscr ; fadd ...
+    CHECK(!unknown.ok && unknown.why == "floating-point mode not proven");
+    const LiftResult leak = lift({0xF3FD, 0x000B, 0x0009});  // fschg ; rts
+    CHECK(!leak.ok && leak.why == "leaves in a floating-point mode other than the entry mode");
 }
 
 // ---------------------------------------------------------------- GD-ROM
@@ -897,6 +1010,8 @@ int main() {
     test_boot_file();
     test_cfg();
     test_lifter();
+    test_floating_point();
+    test_lifter_floating_point();
     test_gdrom();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);

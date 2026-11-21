@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <format>
+#include <map>
 #include <set>
 
 namespace qilin {
@@ -40,7 +41,9 @@ uint16_t gpr_uses(const Insn& in) {
 // One function being lifted.
 class Emit {
 public:
-    Emit(const Cfg& cfg, const Function& f) : cfg_(cfg), f_(f) {}
+    Emit(const Cfg& cfg, const Function& f) : cfg_(cfg), f_(f) {
+        for (const auto& [pc, mode] : f.fp_modes) modes_[pc] = mode;
+    }
 
     std::string run() {
         check_function();
@@ -78,13 +81,15 @@ public:
 private:
     // What this slice can't lift at all, and the branch targets that need labels.
     void check_function() {
+        if (!f_.fp_unknown.empty()) throw Fail{f_.fp_unknown[0], "floating-point mode not proven"};
+        if (!f_.fp_wrong.empty()) throw Fail{f_.fp_wrong[0], "floating-point instruction in the wrong precision"};
+        if (!f_.fp_leaks.empty()) throw Fail{f_.fp_leaks[0], "leaves in a floating-point mode other than the entry mode"};
         if (!f_.bad.empty()) throw Fail{f_.bad[0], "reaches a word that isn't an instruction"};
         if (!f_.bad_slots.empty()) throw Fail{f_.bad_slots[0], "a delayed branch without a legal delay slot"};
         if (!f_.slot_targets.empty()) throw Fail{f_.slot_targets[0], "a branch into a delay slot"};
         for (const uint32_t pc : f_.insns) {
             const Insn in = cfg_.insn(pc);
             const sh4::Spec& s = sh4::spec(in.op);
-            if (s.flags & sh4::kFloat) throw Fail{pc, "floating point (slice 2)"};
             if (s.flags & sh4::kPrivileged) throw Fail{pc, "privileged"};
             if (f_.slots.contains(pc)) continue;
             if (!(s.flags & sh4::kBranch) || f_.tails.contains(pc)) continue;
@@ -111,6 +116,37 @@ private:
     }
 
     static std::string r(unsigned n) { return std::format("r{}", n); }
+
+    // The floating-point mode the analysis proved at `pc`.
+    uint8_t mode(uint32_t pc) const {
+        const auto it = modes_.find(pc);
+        if (it == modes_.end()) throw Fail{pc, "internal: no floating-point mode recorded"};
+        return it->second;
+    }
+    bool double_mode(uint32_t pc) const { return mode(pc) & kFpPr; }
+    bool pair_mode(uint32_t pc) const { return mode(pc) & kFpSz; }
+    unsigned fbank(uint32_t pc) const { return (mode(pc) & kFpFr) ? 1 : 0; }
+    std::string bank(uint32_t pc) const { return std::format("c.fr[{}]", fbank(pc)); }
+    std::string other_bank(uint32_t pc) const { return std::format("c.fr[{}]", 1 - fbank(pc)); }
+    std::string fr(uint32_t pc, unsigned n) const { return std::format("c.fr[{}][{}]", fbank(pc), n); }
+    // A double-precision operand must be an even register; odd ones are illegal on the SH-4.
+    static void even(uint32_t pc, unsigned n) {
+        if (n & 1) throw Fail{pc, "an odd register in double precision"};
+    }
+    // Half `half` (0 high, 1 low) of the pair a 64-bit fmov names: DRn if even, XD(n-1) if odd.
+    std::string pair_reg(uint32_t pc, unsigned n, unsigned half) const {
+        return (n & 1) ? std::format("c.fr[{}][{}]", 1 - fbank(pc), n - 1 + half)
+                       : std::format("c.fr[{}][{}]", fbank(pc), n + half);
+    }
+    std::string pair_bank(uint32_t pc, unsigned n) const { return (n & 1) ? other_bank(pc) : bank(pc); }
+    std::string fload(uint32_t pc, unsigned n, const std::string& addr) const {
+        if (!pair_mode(pc)) return std::format("{} = rt::ld32({});", fr(pc, n), addr);
+        return std::format("rt::ld_pair({}, {}, {});", addr, pair_bank(pc, n), n & ~1u);
+    }
+    std::string fstore(uint32_t pc, unsigned m, const std::string& addr) const {
+        if (!pair_mode(pc)) return std::format("rt::st32({}, {});", addr, fr(pc, m));
+        return std::format("rt::st_pair({}, {}, {});", addr, pair_bank(pc, m), m & ~1u);
+    }
 
     // Write the locals back before control leaves; read them again after a call.
     std::string sync_out() {
@@ -293,6 +329,79 @@ private:
         case Op::lds_l_mach: return pop_sys("c.mach");
         case Op::lds_l_macl: return pop_sys("c.macl");
         case Op::lds_l_pr: return pop_sys("c.pr");
+        // ---- floating point: what an instruction means comes from the mode the analysis proved ----
+        case Op::fadd: case Op::fsub: case Op::fmul: case Op::fdiv: {
+            const char* op = in.op == Op::fadd ? "add" : in.op == Op::fsub ? "sub" : in.op == Op::fmul ? "mul" : "div";
+            if (!double_mode(pc)) return std::format("{} = rt::f{}({}, {});", fr(pc, in.n()), op, fr(pc, in.n()), fr(pc, in.m()));
+            even(pc, in.n()), even(pc, in.m());
+            return std::format("rt::set64({}, {}, rt::d{}(rt::get64({}, {}), rt::get64({}, {})));", bank(pc), in.n(), op,
+                               bank(pc), in.n(), bank(pc), in.m());
+        }
+        case Op::fcmp_eq: case Op::fcmp_gt: {
+            const char* op = in.op == Op::fcmp_eq ? "eq" : "gt";
+            if (!double_mode(pc)) return std::format("t = rt::fcmp_{}({}, {});", op, fr(pc, in.n()), fr(pc, in.m()));
+            even(pc, in.n()), even(pc, in.m());
+            return std::format("t = rt::dcmp_{}(rt::get64({}, {}), rt::get64({}, {}));", op, bank(pc), in.n(), bank(pc), in.m());
+        }
+        case Op::fsqrt:
+            if (!double_mode(pc)) return std::format("{} = rt::fsqrt({});", fr(pc, in.n()), fr(pc, in.n()));
+            even(pc, in.n());
+            return std::format("rt::set64({}, {}, rt::dsqrt(rt::get64({}, {})));", bank(pc), in.n(), bank(pc), in.n());
+        // fneg and fabs are bit operations; in double precision on the high half.
+        case Op::fneg:
+            if (double_mode(pc)) even(pc, in.n());
+            return std::format("{} ^= 0x80000000u;", fr(pc, in.n()));
+        case Op::fabs:
+            if (double_mode(pc)) even(pc, in.n());
+            return std::format("{} &= 0x7FFFFFFFu;", fr(pc, in.n()));
+        case Op::float_:
+            if (!double_mode(pc)) return std::format("{} = rt::float_s(c.fpul);", fr(pc, in.n()));
+            even(pc, in.n());
+            return std::format("rt::set64({}, {}, rt::float_d(c.fpul));", bank(pc), in.n());
+        case Op::ftrc:
+            if (!double_mode(pc)) return std::format("c.fpul = rt::ftrc_s({});", fr(pc, in.n()));
+            even(pc, in.n());
+            return std::format("c.fpul = rt::ftrc_d(rt::get64({}, {}));", bank(pc), in.n());
+        case Op::fcnvsd: return std::format("rt::set64({}, {}, rt::fcnvsd(c.fpul));", bank(pc), in.n());
+        case Op::fcnvds: return std::format("c.fpul = rt::fcnvds(rt::get64({}, {}));", bank(pc), in.n());
+        case Op::fsts: return std::format("{} = c.fpul;", fr(pc, in.n()));
+        case Op::flds: return std::format("c.fpul = {};", fr(pc, in.n()));
+        case Op::fldi0: return std::format("{} = 0u;", fr(pc, in.n()));
+        case Op::fldi1: return std::format("{} = 0x3F800000u;", fr(pc, in.n()));
+        case Op::fmac: return std::format("{} = rt::fmac({}, {}, {});", fr(pc, in.n()), fr(pc, 0), fr(pc, in.m()), fr(pc, in.n()));
+        case Op::fsrra: return std::format("{} = rt::fsrra({});", fr(pc, in.n()), fr(pc, in.n()));
+        case Op::fipr: {
+            const unsigned vm = (in.n() & 3) * 4, vn = in.n() & 12;
+            return std::format("{} = rt::fipr({}, {}, {});", fr(pc, vn + 3), bank(pc), vm, vn);
+        }
+        case Op::ftrv: return std::format("rt::ftrv({}, {}, {});", other_bank(pc), bank(pc), in.n() & 12);
+        case Op::fsca: return std::format("rt::fsca(c.fpul, {}, {});", bank(pc), in.n());
+        case Op::fschg: return "c.fpscr ^= rt::kFpscrSz;";
+        case Op::frchg: return "c.fpscr ^= rt::kFpscrFr;";
+        // fmov: 32 bits with SZ clear; with SZ set a register pair, DRn for an even field and XDn for an odd one.
+        case Op::fmov:
+            if (!pair_mode(pc)) return std::format("{} = {};", fr(pc, in.n()), fr(pc, in.m()));
+            return std::format("{{ const uint32_t hi = {}, lo = {}; {} = hi; {} = lo; }}", pair_reg(pc, in.m(), 0),
+                               pair_reg(pc, in.m(), 1), pair_reg(pc, in.n(), 0), pair_reg(pc, in.n(), 1));
+        case Op::fmov_load: return at + fload(pc, in.n(), rm);
+        case Op::fmov_load_r0: return at + fload(pc, in.n(), std::format("r0 + {}", rm));
+        case Op::fmov_load_inc:
+            return at + fload(pc, in.n(), rm) + std::format(" {} += {};", rm, pair_mode(pc) ? 8 : 4);
+        case Op::fmov_store: return at + fstore(pc, in.m(), rn);
+        case Op::fmov_store_r0: return at + fstore(pc, in.m(), std::format("r0 + {}", rn));
+        case Op::fmov_store_dec: {
+            const unsigned size = pair_mode(pc) ? 8 : 4;
+            return at + fstore(pc, in.m(), std::format("{} - {}", rn, size)) + std::format(" {} -= {};", rn, size);
+        }
+        case Op::sts_fpul: return std::format("{} = c.fpul;", rn);
+        case Op::lds_fpul: return std::format("c.fpul = {};", rn);
+        case Op::sts_fpscr: return std::format("{} = c.fpscr;", rn);
+        case Op::lds_fpscr: return std::format("rt::lds_fpscr(c.fpscr, {}, {});", rn, hex(pc));
+        case Op::sts_l_fpul: return push_sys("c.fpul");
+        case Op::lds_l_fpul: return pop_sys("c.fpul");
+        case Op::sts_l_fpscr: return push_sys("c.fpscr");
+        case Op::lds_l_fpscr:
+            return at + std::format("{{ const uint32_t v = rt::ld32({}); {} += 4; rt::lds_fpscr(c.fpscr, v, {}); }}", rn, rn, hex(pc));
         // ---- cache ----
         case Op::pref: return std::format("rt::pref({}, {});", rn, hex(pc));
         case Op::ocbi: case Op::ocbp: case Op::ocbwb: return ";";  // cache block control: nothing to do without a cache
@@ -394,6 +503,7 @@ private:
     const Cfg& cfg_;
     const Function& f_;
     std::set<uint32_t> targets_;
+    std::map<uint32_t, uint8_t> modes_;
     uint16_t used_ = 0, written_ = 0;
     bool sync_ = false;
 };

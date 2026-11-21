@@ -17,7 +17,7 @@ Static recompilation of **Metropolis Street Racer** (Dreamcast, North American r
 
 ## Layout
 
-- `recomp/src/`: `gdrom` (Redump CUE and GDI images, sectors, ISO 9660), `bootfile` (IP.BIN's fields, the boot file, known-build SHA table), `decoder` (table-driven, 209 forms, X-macro `QILIN_SH4_OPS`), `cfg` (function discovery, known-bits dataflow, jump tables, coverage, floating-point mode), `lifter` (SH-4 → C++, slice 1: integer), `report` (JSON), `main.cpp` (the `qilin` CLI).
+- `recomp/src/`: `gdrom` (Redump CUE and GDI images, sectors, ISO 9660), `bootfile` (IP.BIN's fields, the boot file, known-build SHA table), `decoder` (table-driven, 209 forms, X-macro `QILIN_SH4_OPS`), `cfg` (function discovery, known-bits dataflow, jump tables, coverage, floating-point mode), `lifter` (SH-4 → C++, slice 1 integer, slice 2 floating point), `report` (JSON), `main.cpp` (the `qilin` CLI).
 - `recomp/runtime/`: `guest.hpp` (context, memory, helpers for generated code), `dispatch.cpp` (function table lookup).
 - `tools/difftest/`: `difftest.py` + `harness.cpp`: lifted code against the original under `qemu-system-sh4`.
 - `recomp/tests/tests.cpp`: unit tests (`ctest`), on a synthetic disc image.
@@ -49,12 +49,14 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - A forward `bra` right after `lds.l @r15+,pr` is a tail call (functions called only that way were being merged into their caller). A constant `jmp @rN` forward is a tail call. The CFG forgets every register at a call (no ABI assumption).
 - Floating-point mode: every function is assumed entered with PR = SZ = FR = 0 and checked to call and return in that mode. The compiler changes precision with `sts fpscr,rN; or/and mask,rN; lds rN,fpscr` (sometimes with the `lds` in a call's delay slot), which is why the dataflow tracks registers bit by bit. Four CRT double helpers around `0x8C0EDE64` are entered with PR = 1.
 - Differential test reference: `qemu-system-sh4 -M r2d` (RAM at `0x0C000000`, i.e. `0x8C000000`), driven over its gdb port (`G`/`M`/`Z0`/`c`/`g`, `qRcmd` for `pmemsave`, file name quoted). Set `TCP_NODELAY` or every packet costs 40 ms. Write both register banks: the debugger writes r0–r7 before SR. A full run (3,614 functions × 3 trials) takes 36 minutes; lifting takes seconds and compiling `gen/` about 80 seconds.
+- FP in lifted code: round to nearest (every FPSCR the game loads), DN = 1 (inputs and results flushed), default NaN `0x7FBFFFFF`, `fmac` fused, flag/cause bits not kept, `rt::lds_fpscr` stops on RM ≠ 0 or enable bits. 64-bit `fmov`: even register at the lower address (the compiler's double constants are laid out that way; QEMU does the opposite). `fipr`/`ftrv`/`fsca`/`fsrra` are provisional models in `guest.hpp`.
+- QEMU 8.2 as an FP reference: debugger writes to FPSCR don't reach its FPU (each trial runs an `lds r0,fpscr` stub at `0x8C00E000`); it doesn't flush denormal inputs; `fipr`/`ftrv` only run with PR = 1 (a bug); no `fsca`; `fsrra` faults. The debugger shows the FP bank FPSCR.FR selects: write bank 1 with FR set, then bank 0.
 - Delay-slot order: the branch reads its condition/target/PR, a call sets PR, then the slot runs. `rts` with `lds.l @r15+,pr` or a pop in the slot is real code.
 - The cloud workspace's file bridge has a 400 MB per-file limit: the disc image can't be staged. The extracted disc is at `D:\Recompilation Projects\MSR Project\disc` on the author's PC (with `qilin.exe` and `read-disc.cmd` beside it); stage `disc\MSR.BIN`, `1ST_READ.BIN`, `IP.BIN` and other small files from there. There is no shell on that PC from the cloud session: programs there are run by the author, or through computer use (File Explorer, double-click).
 - **The launcher (`1ST_READ.BIN`) is replaced natively, not lifted** (author's decision, 2026-11-21). Only `MSR.BIN` is lifted. The hand-over is a command line in a 512-byte argument block at `0x8C1101F0` in the game's image; the game takes `-DEMO=`, `-ZONE=`, `-SPEED=`, `-playable`, `-autodemo`, and starts `1st_read.bin -DEMO=.. -ZONE=.. -SPEED=..` for its attract loop (the launcher then restarts it with `-DEMO=-1` plus those). Game main is `0x8C010202`; start-a-program is `0x8C02F68A`. The game has debug strings (`cblCable = %d`, `Here we go - %s`), useful for naming.
 - The enhancements menu: the author says it is the same across all the recomp projects. It isn't in the Ghoulies, Beat the Beat or APB repos; the other project folders haven't been read.
 
-## Status (v0.6.0)
+## Status (v0.7.0)
 
 - Disc reader, IP.BIN and boot-file loaders, SH-4 decoder, function discovery + CFG, CLI, tests, CI.
 - Decoder: 59,001 of 65,536 words are instructions; 0 unexplained differences with binutils 2.42.
@@ -62,14 +64,15 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - **The disc is read** (MK-51012 V1.010, 2000-11-30, not Windows CE). It boots a launcher, `1ST_READ.BIN` (SHA-256 `b5515a96…`), which loads the game, `MSR.BIN` (`7780f031…`), over itself at `0x8C010000`. Both are in `known_build`. Libraries: Shinobi 1.68, Kamui 2, CRI ADX/Sofdec; sound files are for the Manatee driver.
 - On `MSR.BIN`: decoder 0 unexplained over 660,510 words; 5,247 functions, 22 of 22 jump tables, 99.2% of bytes accounted for (10,024 unknown in 43 spans), 10 suspects. Layout: game code from `0x8C010000`, data `0x8C0EE744`–`0x8C119C80`, libraries after that.
 - Floating-point mode on `MSR.BIN`: 1,498 of 1,507 functions proven, 0 instructions in the wrong precision, 9 functions with something unproven.
-- Lifter slice 1 on `MSR.BIN`: 3,614 of 5,247 functions (1,507 need floating point, 125 privileged, 1 branch into a delay slot). Differential test, 3 trials each: 0 failures, 1,676 pass, 1,938 untested.
+- Lifter on `MSR.BIN` (slices 1 and 2): 5,115 of 5,247 functions (122 privileged, 7 FP leaks, 2 FP mode unproven, 1 branch into a delay slot). Generated code compiles warning-free under GCC 14 and Clang 19. Differential test, 3 trials each (about 85 minutes): 0 failures, 2,452 pass, 2,663 untested.
 
 ## Next steps, in order
 
-1. **Lifter slice 2: floating point**, on the mode analysis (single and double arithmetic, `fmov` in both sizes, both banks, `fipr`/`ftrv`/`fsca`/`fsrra`/`fmac` against QEMU and then against Flycast or hardware where QEMU's model is approximate). Then raise the differential test's tested share (1,938 of 3,614 lifted functions have no conclusive trial): inputs shaped by what a function dereferences, more trials. Also: UBSan and Clang/MSVC builds of the generated code; an entry mode per function for the nine FP leftovers.
-2. **Review the prior art** (`docs/prior-art.md`): the two Dreamcast static recompilations, and the Sonic Adventure decomp as a naming source for Sega's libraries (licence first).
-3. **Confirm the hand-over's open points** (`docs/disc-and-boot-analysis.md`) when the original can be traced under Flycast; read `GINXFER.BIN`.
-4. Hardware-access profile, library boundaries, timing model; then the runtime.
+1. **Raise the differential test's tested share** (about half the lifted functions have no conclusive trial): inputs shaped by what a function dereferences, more trials, another seed. Then UBSan and an MSVC build of the generated code; an entry mode per function for the nine FP leftovers.
+2. **A better reference for floating point**: Flycast or a console, for `fipr`/`ftrv`/`fsca`/`fsrra` (QEMU 8.2 can't run them) and to confirm the 64-bit `fmov` pair order and denormal input flushing (QEMU differs from the hardware on both; the difftest build uses `QILIN_REFERENCE_QEMU`).
+3. **Review the prior art** (`docs/prior-art.md`): the two Dreamcast static recompilations, and the Sonic Adventure decomp as a naming source for Sega's libraries (licence first).
+4. **Confirm the hand-over's open points** (`docs/disc-and-boot-analysis.md`) when the original can be traced under Flycast; read `GINXFER.BIN`.
+5. Hardware-access profile, library boundaries, timing model; then the runtime.
 
 ## Conventions
 

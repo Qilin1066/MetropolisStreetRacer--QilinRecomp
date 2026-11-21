@@ -4,8 +4,10 @@
 // MACH/MACL, PR and GBR; loads and stores in every addressing form; branches
 // with their delay slots; calls, tail calls and fall-through into the next
 // function; the compiler's jump tables; and indirect calls through the
-// function table. Floating point is the next slice: a function that uses it
-// isn't lifted yet, and the reason is reported. Privileged instructions are
+// function table. Slice 2 adds floating point: what each instruction means
+// (single or double, 32- or 64-bit fmov, which bank) comes from the mode the
+// analysis proved at it, so the generated code has no mode checks; a
+// function whose mode isn't proven isn't lifted. Privileged instructions are
 // never lifted (they belong to the system layer the runtime replaces).
 //
 // Delay slots: a delayed branch and the instruction after it are lifted as
@@ -35,7 +37,7 @@ struct LiftResult {
     bool ok = false;
     std::string code;      // the function's C++ definition
     uint32_t fail_at = 0;  // the instruction that stopped it
-    std::string why;       // e.g. "floating point (slice 2)"
+    std::string why;       // e.g. "privileged"
 };
 
 class Lifter {

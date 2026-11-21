@@ -11,6 +11,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-21
+Floating point: 5,115 of the game's 5,247 functions now lift, up from 3,614.
+
+### Added
+- **Lifter, slice 2** (`recomp/src/lifter.*`): every floating-point instruction, its meaning at each place (single or double, 32- or 64-bit `fmov`, which bank) taken from the mode the analysis proved there, so the generated code never tests the mode. Functions whose mode isn't proven aren't lifted, with the reason.
+- **Floating-point helpers** (`recomp/runtime/guest.hpp`): the FPU as the game runs it. Round to nearest; denormalised inputs and results as zero; the default NaN; `fmac` rounded once; saturating `ftrc`; double registers as pairs; 64-bit `fmov` with the even register at the lower address, as the compiler's double constants show. Provisional models for `fipr`, `ftrv`, `fsrra` and `fsca` (the last deterministic on every host, without the C library). Loading an FPSCR that asks for another rounding mode or an FPU exception stops.
+- **The differential test covers floating point:** FPUL, FPSCR and both register banks, realistic float inputs. QEMU 8.2's differences from the hardware were found by probing it and are handled: an `lds` stub per trial (debugger writes don't reach its FPU), a `QILIN_REFERENCE_QEMU` build for its two other behaviours (denormal inputs, 64-bit `fmov` order), and the four instructions it can't run counted as inconclusive. FPSCR's flag and cause bits, which the lifted code doesn't keep, are left out of the comparison.
+- **Results:** the differential test over all 5,115 lifted functions, 3 trials each: **0 failures**; 2,452 pass (1,676 in v0.6.0), 2,663 without a conclusive trial yet. Breaking `fmul` on purpose makes it fail, as it should. The generated code compiles warning-free under Clang 19 as well as GCC 14.
+- **Tests:** the helpers (flushing, NaNs, `fmac`, conversions, pair order against the compiler's own constant, `fipr`, `ftrv`, `fsca`, `fsrra`, FPSCR loads) and the lifter's floating-point output (single, the compiler's change to double and back, `fschg` pairs with DR and XD, `frchg` banks, the vector instructions, what it refuses).
+
 ## [0.6.0] - 2026-11-21
 The first lifted code: 3,614 of the game's 5,247 functions as C++, and a differential test that runs each against the original instructions. No failures.
 

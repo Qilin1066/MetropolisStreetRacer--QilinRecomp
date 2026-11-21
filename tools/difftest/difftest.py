@@ -4,8 +4,9 @@
 Each trial gives a function random registers (pointer-shaped values among
 them) and random heap and stack contents, runs the original SH-4 code under
 qemu-system-sh4 and the lifted C++ in qilin_difftest from the same state, and
-compares everything: r0-r15, PR, GBR, MACH, MACL, the T, S, Q and M bits, and
-every changed byte of the 16 MiB of RAM. Whole call trees run: a lifted
+compares everything: r0-r15, PR, GBR, MACH, MACL, the T, S, Q and M bits,
+FPUL, FPSCR, both banks of floating-point registers, and every changed byte of
+the 16 MiB of RAM. Whole call trees run: a lifted
 function's lifted callees run too, on both sides.
 
   difftest.py --harness build/qilin_difftest --bin disc/MSR.BIN --gen gen
@@ -26,6 +27,17 @@ and counted. If the lifted code returns and the original doesn't (it takes an
 exception or stops elsewhere), or the original finishes and the lifted code
 doesn't, that is a failure.
 
+Floating point. The harness is built with QILIN_REFERENCE_QEMU, which gives
+the lifted code QEMU 8.2's two differences from the hardware (denormalised
+inputs aren't flushed; the halves of a 64-bit fmov are the other way round in
+memory), so that everything else can be compared. QEMU 8.2 can't run fipr,
+ftrv, fsca or fsrra (it refuses the first two in single precision, the
+reverse of the manual, and doesn't have the others): a trial that reaches one
+is inconclusive. FPSCR's flag and cause bits aren't modelled by the lifted
+code, so they are left out of the comparison; where a function reads FPSCR
+into a register and the only differences anywhere are in those bits, the
+trial is counted apart ("FPSCR status bits only"), not as a failure.
+
 Exit status 0 only if no function failed.
 """
 import argparse
@@ -44,6 +56,10 @@ import time
 RAM, RAM_SIZE = 0x8C000000, 16 << 20
 BASE = 0x8C010000
 MAGIC = 0x8C00F000          # the return address the caller gives: zero memory below the image
+STUB = 0x8C00E000           # lds r0,fpscr ; rts ; nop: sets QEMU's FPU state, which debugger writes don't
+FPSCR = 0x00040000          # how the game runs: round to nearest, DN = 1, PR = SZ = FR = 0
+FPSCR_STATUS = 0x0003F07C   # flag and cause bits: not modelled
+STUB_CODE = struct.pack("<3H", 0x406A, 0x000B, 0x0009)
 VECTORS = 0x8C000000        # VBR: exceptions land at +0x100, +0x400, +0x600
 STACK_TOP = 0x8CF00000
 STACK_FILL = 0x2000         # random bytes either side of the stack pointer
@@ -54,8 +70,11 @@ TIMEOUT = 2.0               # seconds of host time for the original under QEMU
 LIFTED_TIMEOUT = 5.0        # ... and for the lifted code, which is far faster
 STATUS = ["returned", "memory fault", "bad jump", "bad return", "trap", "not lifted", "unsupported"]
 # QEMU's register order for SH-4 over the debugger protocol.
-R_PC, R_PR, R_GBR, R_VBR, R_MACH, R_MACL, R_SR = 16, 17, 18, 19, 20, 21, 22
-R_BANK0, R_BANK1, R_COUNT = 43, 51, 59
+R_PC, R_PR, R_GBR, R_VBR, R_MACH, R_MACL, R_SR, R_FPUL, R_FPSCR, R_FR = 16, 17, 18, 19, 20, 21, 22, 23, 24, 25
+R_SPC, R_BANK0, R_BANK1, R_COUNT = 42, 43, 51, 59
+FR_BIT = 1 << 21
+# What QEMU 8.2 can't run (see above), as (mask, match, name).
+UNRUNNABLE = [(0xF0FF, 0xF0ED, "fipr"), (0xF3FF, 0xF1FD, "ftrv"), (0xF1FF, 0xF0FD, "fsca"), (0xF0FF, 0xF07D, "fsrra")]
 
 
 class Gdb:
@@ -177,16 +196,30 @@ class Original:
                 self.current[off:off + BLOCK] = expected[off:off + BLOCK]
         self.stale = []
 
+        # QEMU's FPU state (rounding, flushing) only follows FPSCR when an
+        # instruction loads it: run the stub, then write the real state.
+        r = [0] * R_COUNT
+        r[0], r[R_PC], r[R_PR], r[R_VBR], r[R_SR], r[R_FPSCR] = FPSCR, STUB, MAGIC, VECTORS, SR, FPSCR
+        r[R_BANK0], r[R_BANK1] = FPSCR, FPSCR
+        self.gdb.ok("G" + struct.pack(f"<{R_COUNT}I", *r).hex())
+        self.gdb.send("c")
+        if self.gdb.recv(TIMEOUT) is None:
+            sys.exit("difftest: the FPSCR stub didn't return")
+
         r = [0] * R_COUNT
         r[:16] = regs["r"]
         r[R_PC], r[R_PR], r[R_GBR], r[R_VBR] = fn, MAGIC, regs["gbr"], VECTORS
         r[R_MACH], r[R_MACL] = regs["mach"], regs["macl"]
         r[R_SR] = SR | regs["t"] | regs["s"] << 1 | regs["q"] << 8 | regs["m"] << 9
-        r[24] = 0x00040001  # FPSCR as the console starts programs
+        r[R_FPUL] = regs["fpul"]
         # Both banks of r0-r7 get the same values, so it doesn't matter which
         # is live while the debugger writes SR.
         r[R_BANK0:R_BANK0 + 8] = regs["r"][:8]
         r[R_BANK1:R_BANK1 + 8] = regs["r"][:8]
+        # The debugger shows the bank FPSCR.FR selects: bank 1 first, then bank 0 and the rest.
+        r[R_FPSCR], r[R_FR:R_FR + 16] = regs["fpscr"] | FR_BIT, regs["fr"][1]
+        self.gdb.ok("G" + struct.pack(f"<{R_COUNT}I", *r).hex())
+        r[R_FPSCR], r[R_FR:R_FR + 16] = regs["fpscr"], regs["fr"][0]
         self.gdb.ok("G" + struct.pack(f"<{R_COUNT}I", *r).hex())
 
         self.gdb.send("c")
@@ -197,10 +230,26 @@ class Original:
             if self.gdb.recv(20) is None:
                 sys.exit("difftest: QEMU doesn't stop")
             ended = "ran too long"
-        out = struct.unpack(f"<{R_COUNT}I", bytes.fromhex(self.gdb.cmd("g").decode()))
+        out = list(struct.unpack(f"<{R_COUNT}I", bytes.fromhex(self.gdb.cmd("g").decode())))
+        fr = [[], []]
+        live = out[R_FPSCR] >> 21 & 1
+        fr[live] = out[R_FR:R_FR + 16]
+        self.gdb.ok(f"P{R_FPSCR:x}=" + struct.pack("<I", out[R_FPSCR] ^ FR_BIT).hex())
+        other = struct.unpack(f"<{R_COUNT}I", bytes.fromhex(self.gdb.cmd("g").decode()))
+        fr[1 - live] = list(other[R_FR:R_FR + 16])
         if ended == "stopped":
-            ended = "returned" if out[R_PC] == MAGIC else "exception" if out[R_PC] - VECTORS in (0x100, 0x400, 0x600) \
-                else f"stopped at {out[R_PC]:08x}"
+            if out[R_PC] == MAGIC:
+                ended = "returned"
+            elif out[R_PC] - VECTORS in (0x100, 0x400, 0x600):
+                ended = "took an exception"
+                spc = out[R_SPC]
+                if RAM <= spc < RAM + RAM_SIZE - 1:
+                    word = struct.unpack_from("<H", expected, spc - RAM)[0]
+                    for mask, match, name in UNRUNNABLE:
+                        if word & mask == match:
+                            ended = f"reference can't run {name}"
+            else:
+                ended = f"stopped at {out[R_PC]:08x}"
 
         self.gdb.monitor(f'pmemsave 0x0c000000 {RAM_SIZE} "{self.dump}"')
         with open(self.dump, "rb") as f:
@@ -215,7 +264,8 @@ class Original:
                     self.current[off:off + BLOCK] = after[off:off + BLOCK]
                     self.stale.append(off)
         state = {"r": list(out[:16]), "pr": out[R_PR], "gbr": out[R_GBR], "mach": out[R_MACH], "macl": out[R_MACL],
-                 "t": out[R_SR] & 1, "s": out[R_SR] >> 1 & 1, "q": out[R_SR] >> 8 & 1, "m": out[R_SR] >> 9 & 1}
+                 "t": out[R_SR] & 1, "s": out[R_SR] >> 1 & 1, "q": out[R_SR] >> 8 & 1, "m": out[R_SR] >> 9 & 1,
+                 "fpul": out[R_FPUL], "fpscr": out[R_FPSCR], "fr": fr}
         return ended, state, changed
 
 
@@ -247,6 +297,7 @@ class Lifted:
         """Returns (status, stop pc, stop value, registers, changed blocks); status "ran too long" if it doesn't finish."""
         case = struct.pack("<17I", fn, *regs["r"])
         case += struct.pack("<8I", MAGIC, regs["gbr"], regs["mach"], regs["macl"], regs["t"], regs["s"], regs["q"], regs["m"])
+        case += struct.pack("<2I", regs["fpul"], regs["fpscr"]) + struct.pack("<32I", *regs["fr"][0], *regs["fr"][1])
         case += struct.pack("<I", len(writes))
         for addr, data in writes:
             case += struct.pack("<II", addr, len(data)) + data
@@ -254,7 +305,7 @@ class Lifted:
         self.deadline = time.time() + LIFTED_TIMEOUT
         try:
             status, pc, value = struct.unpack("<3I", self.read(12))
-            out = struct.unpack("<25I", self.read(100))
+            out = struct.unpack("<59I", self.read(236))
             count = struct.unpack("<I", self.read(4))[0]
             changed = {}
             for _ in range(count):
@@ -266,7 +317,8 @@ class Lifted:
             self.start()
             return "ran too long", 0, 0, None, None
         state = {"r": list(out[:16]), "pr": out[16], "gbr": out[17], "mach": out[18], "macl": out[19],
-                 "t": out[20], "s": out[21], "q": out[22], "m": out[23], "ret": out[24]}
+                 "t": out[20], "s": out[21], "q": out[22], "m": out[23], "fpul": out[24], "fpscr": out[25],
+                 "fr": [list(out[26:42]), list(out[42:58])], "ret": out[58]}
         return STATUS[status], pc, value, state, changed
 
 
@@ -285,18 +337,41 @@ def random_case(rng):
             return rng.choice([0, 1, 0xFFFFFFFF, 0x80000000, 0x7FFFFFFF, 0xFFFF, 0x8000, 0xFF, 0x80])
         return rng.getrandbits(32)
 
+    def single():
+        kind = rng.random()
+        if kind < 0.3:
+            x = float(rng.randrange(-16, 17))
+        elif kind < 0.6:
+            x = rng.uniform(-1000.0, 1000.0)
+        elif kind < 0.75:
+            x = rng.uniform(-1.0, 1.0)
+        elif kind < 0.85:
+            return rng.getrandbits(1) << 31 | rng.randrange(1, 255) << 23 | rng.getrandbits(23)
+        elif kind < 0.9:
+            x = rng.choice([0.0, -0.0, 1.0, -1.0, 0.5])
+        elif kind < 0.95:
+            x = rng.choice([1e10, -1e10, 1e-10, -1e-10, 3.0e38, 1.0e-37])
+        else:
+            return rng.getrandbits(32)  # anything: NaN, infinity, denormal
+        return struct.unpack("<I", struct.pack("<f", x))[0]
+
     regs = {"r": [value() for _ in range(16)], "gbr": HEAP + rng.randrange(0, HEAP_SIZE // 2, 4),
             "mach": rng.getrandbits(32), "macl": rng.getrandbits(32),
-            "t": rng.getrandbits(1), "s": rng.getrandbits(1), "q": rng.getrandbits(1), "m": rng.getrandbits(1)}
+            "t": rng.getrandbits(1), "s": rng.getrandbits(1), "q": rng.getrandbits(1), "m": rng.getrandbits(1),
+            "fpul": single() if rng.random() < 0.5 else value(), "fpscr": FPSCR,
+            "fr": [[single() for _ in range(16)] for _ in range(2)]}
     regs["r"][15] = STACK_TOP
 
-    # Heap and stack: random words, a third of them pointers back into the heap.
+    # Heap and stack: random words, a third of them pointers back into the heap, a quarter floats.
     def fill(size):
-        words = [pointer() if rng.random() < 0.33 else rng.getrandbits(32) if rng.random() < 0.6 else rng.randrange(0, 256)
-                 for _ in range(size // 4)]
+        words = []
+        for _ in range(size // 4):
+            kind = rng.random()
+            words.append(pointer() if kind < 0.33 else single() if kind < 0.58 else
+                         rng.getrandbits(32) if kind < 0.8 else rng.randrange(0, 256))
         return struct.pack(f"<{size // 4}I", *words)
 
-    writes = [(HEAP, fill(HEAP_SIZE)), (STACK_TOP - STACK_FILL, fill(2 * STACK_FILL))]
+    writes = [(HEAP, fill(HEAP_SIZE)), (STACK_TOP - STACK_FILL, fill(2 * STACK_FILL)), (STUB, STUB_CODE)]
     return regs, writes
 
 
@@ -310,18 +385,58 @@ def lifted_functions(gen):
 
 
 def differences(ours, theirs, ours_mem, theirs_mem):
-    diffs = []
+    """Every difference, and whether each lies only in FPSCR's status bits."""
+    diffs = []  # (text, status bits only)
+
+    def word(name, a, b, mask=0xFFFFFFFF):
+        if (a ^ b) & mask:
+            diffs.append((f"{name}: lifted {a:08x}, original {b:08x}", not ((a ^ b) & ~FPSCR_STATUS)))
+
     for i in range(16):
-        if ours["r"][i] != theirs["r"][i]:
-            diffs.append(f"r{i}: lifted {ours['r'][i]:08x}, original {theirs['r'][i]:08x}")
-    for key in ("pr", "gbr", "mach", "macl", "t", "s", "q", "m"):
-        if ours[key] != theirs[key]:
-            diffs.append(f"{key}: lifted {ours[key]:x}, original {theirs[key]:x}")
+        word(f"r{i}", ours["r"][i], theirs["r"][i])
+    for key in ("pr", "gbr", "mach", "macl", "t", "s", "q", "m", "fpul"):
+        word(key, ours[key], theirs[key])
+    word("fpscr", ours["fpscr"], theirs["fpscr"], ~FPSCR_STATUS & 0xFFFFFFFF)
+    for bank in (0, 1):
+        for i in range(16):
+            word(f"fr[{bank}][{i}]", ours["fr"][bank][i], theirs["fr"][bank][i])
     for addr in sorted(set(ours_mem) | set(theirs_mem)):
-        if ours_mem.get(addr) != theirs_mem.get(addr):
-            a, b = ours_mem.get(addr), theirs_mem.get(addr)
-            diffs.append(f"memory {addr:08x}: lifted {a.hex() if a else 'unchanged'}, original {b.hex() if b else 'unchanged'}")
+        a, b = ours_mem.get(addr), theirs_mem.get(addr)
+        if a == b:
+            continue
+        # A block one side didn't change holds what the trial started with: compare word by word.
+        a_words = struct.unpack("<8I", a) if a else None
+        b_words = struct.unpack("<8I", b) if b else None
+        if a_words and b_words:
+            status_only = all(not ((x ^ y) & ~FPSCR_STATUS) for x, y in zip(a_words, b_words))
+        else:
+            status_only = False
+        diffs.append((f"memory {addr:08x}: lifted {a.hex() if a else 'unchanged'}, original {b.hex() if b else 'unchanged'}",
+                      status_only))
     return diffs
+
+
+def fpscr_readers(gen):
+    """Lifted functions whose call tree reads FPSCR into a register or memory."""
+    calls, direct = {}, set()
+    for name in os.listdir(gen):
+        if not name.startswith("lifted_"):
+            continue
+        with open(os.path.join(gen, name)) as f:
+            text = f.read()
+        for m in re.finditer(r"^void fn_([0-9a-f]{8})\(rt::Context& c\) \{\n(.*?)^\}\n", text, re.S | re.M):
+            fn = int(m[1], 16)
+            calls[fn] = {int(x, 16) for x in re.findall(r"fn_([0-9a-f]{8})\(c\)", m[2])}
+            if "= c.fpscr;" in m[2] or ", c.fpscr)" in m[2]:
+                direct.add(fn)
+    reach, grew = set(direct), True
+    while grew:
+        grew = False
+        for fn, callees in calls.items():
+            if fn not in reach and callees & reach:
+                reach.add(fn)
+                grew = True
+    return reach
 
 
 def main():
@@ -344,6 +459,7 @@ def main():
     image = bytes(image)
 
     functions = [int(args.only, 16)] if args.only else lifted_functions(args.gen)
+    readers = fpscr_readers(args.gen)
     rng = random.Random(args.seed)
     if args.shuffle:
         rng.shuffle(functions)
@@ -377,8 +493,8 @@ def main():
                         continue
                     if args.verbose:
                         print(f"  {fn:08x} trial {trial}: the original {ended}")
-                    if ended == "ran too long":
-                        inconclusive["the original ran too long"] += 1
+                    if ended == "ran too long" or ended.startswith("reference can't run"):
+                        inconclusive[f"the original {ended}" if ended == "ran too long" else ended] += 1
                         continue
                     status, pc, value, ours, ours_mem = lifted.run(fn, regs, writes)
                     if status == "ran too long":
@@ -401,8 +517,12 @@ def main():
                         failure = f"the lifted code returned; the original {ended} [seed {args.seed}, trial {trial}]"
                         break
                     diffs = differences(ours, theirs, ours_mem, theirs_mem)
+                    if diffs and fn in readers and all(status for _, status in diffs):
+                        inconclusive["FPSCR status bits only"] += 1
+                        continue
                     if diffs:
-                        failure = "; ".join(diffs[:6]) + (f" (+{len(diffs) - 6} more)" if len(diffs) > 6 else "")
+                        texts = [text for text, _ in diffs]
+                        failure = "; ".join(texts[:6]) + (f" (+{len(texts) - 6} more)" if len(texts) > 6 else "")
                         failure += f" [seed {args.seed}, trial {trial}]"
                         break
                     conclusive += 1

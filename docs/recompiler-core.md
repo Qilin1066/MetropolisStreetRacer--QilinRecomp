@@ -1,6 +1,6 @@
 # Recompiler core
 
-Design and results of the recompiler's pieces, in the order they are built. So far: the decoder, function discovery with control flow, the floating-point mode analysis, the lifter's first slice and the differential test.
+Design and results of the recompiler's pieces, in the order they are built. So far: the decoder, function discovery with control flow, the floating-point mode analysis, the lifter (slices 1 and 2) and the differential test.
 
 ## SH-4 decoder (v0.1.0)
 
@@ -239,8 +239,83 @@ Inconclusive trials: 3,811 memory faults in the lifted code, 1,723 calls into fu
 - **A pass is evidence, not proof**: 3 random trials don't visit every path.
 - **Not yet done:** the lifted code under UBSan; Clang and MSVC builds of the generated code.
 
-### Next
+### Next (as of v0.6.0)
 
-- Slice 2: floating point, on the mode analysis.
+- Slice 2: floating point, on the mode analysis (done in v0.7.0, below).
 - Raise the tested share: smarter inputs; more trials; a second seed.
 - The one function with a branch into a delay slot; constant jumps inside a function.
+
+## Lifter, slice 2: floating point (v0.7.0)
+
+### How it works
+
+What a floating-point instruction means depends on FPSCR's PR, SZ and FR bits. The mode analysis has proved those bits at every such instruction, so the lifter emits the one meaning that applies there: single or double arithmetic, a 32-bit move or a register-pair move, registers in bank 0 or bank 1. **The generated code never tests the mode.** A function whose mode isn't proven, that reaches an instruction in a precision it isn't defined in, or that calls or returns in another mode, isn't lifted, and the reason is reported.
+
+The floating-point registers are bits in the context (`c.fr[bank][n]`), with the arithmetic done by helpers in `recomp/runtime/guest.hpp`. They implement FPSCR as the game runs it:
+
+- **Round to nearest.** That is what every value the game loads into FPSCR has. Loading anything else, or enabling an FPU exception, stops (`rt::lds_fpscr`).
+- **DN = 1:** a denormalised input is taken as zero of the same sign, and so is a denormalised result. Two of the game's library routines set DN = 0 for a while. On the hardware a denormal there would raise an FPU error, which code that works never does, so flushing is right there too.
+- **Any NaN result is the default NaN**, `0x7FBFFFFF` (`0x7FF7FFFFFFFFFFFF` in double).
+- **`fmac` rounds once** (`std::fma`).
+- **`ftrc`** truncates and saturates: too large or NaN gives `0x7FFFFFFF`, too small `0x80000000`.
+- **`fneg` and `fabs`** are bit operations, also on NaNs.
+- **The FPSCR flag and cause bits aren't kept.** Nothing in the game reads them back to make a decision: the only reads are the compiler's `sts fpscr` before an `or`/`and` and `lds`, which carry them along unchanged. Keeping them would cost a check after every operation.
+- **Double registers:** DRn is FRn (the high half) and FRn+1. With SZ set, an even register field is DRn and an odd one XD(n−1), the pair in the other bank.
+- **The order of a 64-bit `fmov` in memory: the even register at the lower address.** The evidence is the game itself. The compiler lays out its double constants high word first (the double 0.301 at `0x8C0EDFA0` is `3FD34395` then `810624DD`), which only makes sense if a 64-bit load puts the lower address in the even, high register. QEMU does the opposite: it joins the pair with the odd register as the low half and stores it as a little-endian 64-bit value (`target/sh4/translate.c`, `gen_load_fpr64`). To confirm against Flycast or a console.
+- **`fipr`, `ftrv`, `fsca`, `fsrra`.** The hardware computes these approximately, in ways not measured yet, so the helpers are provisional models, each in one place:
+  - `fipr` and `ftrv`: single-precision multiplies and adds in sequence from +0, as QEMU's helpers do.
+  - `fsrra`: a single-precision square root, then a reciprocal.
+  - `fsca`: the exact sine and cosine rounded to single. It uses polynomials in plain IEEE double operations rather than the C library, so every host gets the same bits; over all 65,536 angles it is within 7×10⁻¹⁶ of the C library's value before rounding.
+  
+  Matching the hardware's results bit for bit is open work.
+
+### On the game
+
+| | v0.6.0 (slice 1) | v0.7.0 (slice 2) |
+|---|---|---|
+| Functions lifted | 3,614 (68.9%) | **5,115 of 5,247 (97.5%)** |
+| Instructions lifted | 178,297 | 459,917 |
+| Not lifted: privileged | 125 | 122 |
+| Not lifted: leaves in another floating-point mode | | 7 |
+| Not lifted: floating-point mode not proven | | 2 |
+| Not lifted: a branch into a delay slot | 1 | 1 |
+| Not lifted: floating point | 1,507 | 0 |
+
+The generated C++ (21 files) compiles without a warning under GCC 14 with warnings as errors.
+
+### The differential test with floating point
+
+The harness now carries FPUL, FPSCR and both banks of floating-point registers both ways, and the comparison includes them. Inputs are realistic floats (small integers, values in a few ranges, ±0, large and tiny magnitudes) with some random bit patterns among them, which gives NaNs, infinities and denormals; a quarter of the random heap and stack words are floats too.
+
+Three things about the reference had to be found out first, by running probes under QEMU:
+
+- **QEMU's FPU follows FPSCR only when an instruction loads it**; a debugger write changes the register but not the rounding and flushing. Each trial therefore starts with a three-instruction stub (`lds r0,fpscr; rts; nop`) that loads the game's FPSCR, `0x00040000`.
+- **QEMU 8.2 differs from the hardware twice.** It doesn't flush denormalised *inputs*, only results. And it orders 64-bit `fmov` pairs the other way round in memory. The harness is built with `QILIN_REFERENCE_QEMU`, which gives the lifted code those two behaviours, so that everything else can be compared. The hardware behaviour of both is covered by the unit tests instead.
+- **QEMU 8.2 can't run `fipr`, `ftrv`, `fsca` or `fsrra`.** It refuses `fipr` and `ftrv` unless PR is set, the reverse of the manual (current QEMU checks for PR clear), doesn't implement `fsca`, and faults after `fsrra`. A trial that reaches one is inconclusive. Testing these needs another reference: Flycast, or a console.
+
+FPSCR's flag and cause bits are left out of the comparison, since the lifted code doesn't keep them. Where a function reads FPSCR into a register (so the bits travel) and every difference lies in those bits only, the trial is counted apart, not as a failure.
+
+**The floating-point comparison can fail:** with `fmul` deliberately turned into a subtraction, a random sample of 120 functions failed 7 of them.
+
+### Result
+
+All 5,115 lifted functions, 3 trials each, seed 1 (about 85 minutes):
+
+| | v0.6.0 (slice 1) | v0.7.0 |
+|---|---|---|
+| Functions tested | 3,614 | 5,115 |
+| **Fail** | 0 | **0** |
+| Pass (at least one conclusive trial, every one equal) | 1,676 | **2,452** |
+| Untested (no conclusive trial) | 1,938 | 2,663 |
+| Conclusive trials | 4,150 | 5,862 |
+
+Inconclusive trials in v0.7.0: 6,860 memory faults in the lifted code, 1,225 where the original shut the reference machine down, 413 where it ran too long, 349 calls into functions not lifted (1,723 in v0.6.0, when floating point wasn't lifted), 344 bad jumps, 215 that reached an instruction QEMU can't run (188 `fipr`, 16 `ftrv`, 9 `fsrra`, 2 `fsca`), 73 returns to somewhere else, 4 unsupported. No trial differed only in FPSCR's status bits.
+
+Half the functions (52%) are still untested, for the same reason as before: random inputs make functions that take structures fault before they return.
+
+### Next
+
+- A reference for `fipr`, `ftrv`, `fsca` and `fsrra` (Flycast or a console), and the 64-bit `fmov` order confirmed the same way.
+- Raise the tested share: inputs shaped by what a function dereferences; more trials; another seed.
+- The nine functions not lifted for their floating-point mode: an entry mode per function, from its call sites.
+- UBSan runs of the generated code.
