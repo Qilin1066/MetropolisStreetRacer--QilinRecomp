@@ -45,6 +45,7 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - Hitachi's compiler: calls are `mov.l L,rN` + `jsr @rN`; pools follow the function, 4-aligned with a zero word of padding; switches are `mova table,r0; mov.w @(r0,rM),r0; braf r0` with 16-bit offsets from the braf's PC + 4. Hand-written library code branches into delay slots and has routines with several entry points.
 - A constant `jmp @rN` forward is a tail call. The CFG forgets every register at a call (no ABI assumption).
 - The cloud workspace's file bridge has a 400 MB per-file limit: the disc image can't be staged. The extracted disc is at `D:\Recompilation Projects\MSR Project\disc` on the author's PC (with `qilin.exe` and `read-disc.cmd` beside it); stage `disc\MSR.BIN`, `1ST_READ.BIN`, `IP.BIN` and other small files from there. There is no shell on that PC from the cloud session: programs there are run by the author, or through computer use (File Explorer, double-click).
+- **The launcher (`1ST_READ.BIN`) is replaced natively, not lifted** (author's decision, 2026-11-21). Only `MSR.BIN` is lifted. The hand-over is a command line in a 512-byte argument block at `0x8C1101F0` in the game's image; the game takes `-DEMO=`, `-ZONE=`, `-SPEED=`, `-playable`, `-autodemo`, and starts `1st_read.bin -DEMO=.. -ZONE=.. -SPEED=..` for its attract loop (the launcher then restarts it with `-DEMO=-1` plus those). Game main is `0x8C010202`; start-a-program is `0x8C02F68A`. The game has debug strings (`cblCable = %d`, `Here we go - %s`), useful for naming.
 - The enhancements menu: the author says it is the same across all the recomp projects. It isn't in the Ghoulies, Beat the Beat or APB repos; the other project folders haven't been read.
 
 ## Status (v0.3.0)
@@ -57,9 +58,9 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 
 ## Next steps, in order
 
-1. **The launcher and the hand-over** (`docs/disc-and-boot-analysis.md`, *Still to find out*): what `1ST_READ.BIN` does, how `GINXFER.BIN` swaps programs, what state `MSR.BIN` expects; then decide lift-or-replace for the launcher and record it in the roadmap.
+1. **Finish function discovery on `MSR.BIN`** (`docs/recompiler-core.md`, *Next*): data regions, so `coverage` can reach zero unknown; pointer tables in data as evidence; a constant `jmp` into the function's own extent as a branch.
 2. **Review the prior art** (`docs/prior-art.md`): the two Dreamcast static recompilations, and the Sonic Adventure decomp as a naming source for Sega's libraries (licence first).
-3. **Finish function discovery** (`docs/recompiler-core.md`, *Next*): data regions, so `coverage` can reach zero unknown; pointer tables in data as evidence; a constant `jmp` into the function's own extent as a branch.
+3. **Confirm the hand-over's open points** (`docs/disc-and-boot-analysis.md`) when the original can be traced under Flycast; read `GINXFER.BIN`.
 4. **FPSCR mode analysis**, then the lifter's slices and the differential test, as in the sister projects.
 5. Hardware-access profile, library boundaries, timing model; then the runtime.
 

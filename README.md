@@ -88,6 +88,7 @@ This compares the decoder with GNU objdump (`-m sh4 -EL`): mnemonic and every op
 - **Static recompilation, SH-4 → C++, compiled ahead of time.** No interpreter, no JIT, no emulator underneath. Hand-written C++ can override any lifted function.
 - **Vulkan 1.3 only.** Sega's graphics library is translated at API level to Vulkan, with a deliberately small baseline feature set (1.3 core plus what the Pi 4's driver offers) so one render path runs on everything from low-end ARM GPUs upwards. macOS runs through MoltenVK.
 - **The hardware-facing libraries are replaced natively**, not recompiled: the system layer, GD-ROM files, graphics, sound, controllers and memory cards. The C runtime and pure-software libraries are lifted with the game, for exact behaviour.
+- **The disc's launcher is replaced natively** (intro movie, starting the game); only the game itself, `MSR.BIN`, is lifted.
 - **Ground truth is Flycast** running the original game.
 - **Enhancements behind settings**, the same set and the same menu as the sister projects: resolution, anisotropic filtering, MSAA, widescreen up to 21:9, high refresh rates.
 

@@ -33,7 +33,45 @@ The reader was also run on a synthetic GD-ROM built by the unit tests (CUE with 
 | `SG_DPLDR.BIN`, `MAIGO.BIN` | 14,856 each | | Sega's loader for the web browser (`2_DP.BIN`). They differ in a few bytes |
 | `2_DP.BIN` | 2,808,036 | | The Dream Passport web browser, with its files in `BROWSER/` and `DPWWW/`. Out of scope: the game's online features have no service to reach |
 
-Both `1ST_READ.BIN` and `MSR.BIN` are in `bootfile.cpp`'s table, and `qilin info` recognises either. What this means for the port (lift the launcher too, or replace it natively and start at the game) is decided once the launcher and `GINXFER.BIN` have been analysed: see the roadmap.
+Both `1ST_READ.BIN` and `MSR.BIN` are in `bootfile.cpp`'s table, and `qilin info` recognises either. **Decision (2026-11-21): the launcher is replaced natively, not lifted.** *The hand-over* below is what the replacement has to reproduce.
+
+### The hand-over between launcher and game
+
+Read from the disassembly of both programs (`qilin insns`, with the function boundaries from `qilin cfg`). Nothing here has been run yet; what is inferred is marked.
+
+**One program starts another with a command line.** Both link the same small library for it:
+
+- An **argument block** in each program's own data: 512 bytes of NUL-separated strings, ending at an empty one. In `MSR.BIN` it is at `0x8C1101F0`; in the file it holds the single string `\manifest.bin`. Beside it are fixed path buffers (`\manifest.bin`, `\ginxfer.bin`, `\manifest`).
+- **Argument count** (`0x8C02FA54` in the game, `0x8C012374` in the launcher): counts the strings in that block. **Argument by index** (`0x8C02FA72`).
+- **Start a program** (`0x8C02F68A` in the game, `0x8C011FAA` in the launcher), given a command line: masks interrupts, uses the top of RAM (`0x8CFE0000`, `0x8CFF0000`) as its work area, opens `GINXFER.BIN`, the manifest and the target, and doesn't return. `GINXFER.BIN` (8,436 bytes, header `SNIG`) is the piece that survives the swap and loads the target at `0x8C010000`. *Inferred:* it also writes the new command line into the target's argument block, since nothing in the game writes that block and the game reads its arguments from it.
+
+**What the launcher does** (its main function, `0x8C01032C`):
+
+1. Reads its own argument count.
+2. With **no arguments** (a cold boot): runs its front part, which is where the movie player is called (*inferred*: the intro movie, `MSR.SFD`), then starts `msr.bin` with no arguments.
+3. With **arguments** (the game sent it back here): skips that, and starts `msr.bin -DEMO=-1` followed by the arguments it was given.
+
+**What the game does with it** (its main function, `0x8C010202`):
+
+- It recognises `-DEMO=<n>`, `-ZONE=<n>`, `-SPEED=<n>`, `-playable` and `-autodemo`.
+- At `0x8C01094C` it builds `1st_read.bin -DEMO=<n> -ZONE=<n> -SPEED=<n>` from its own state, prints `Here we go - <command line>` and starts it. So **the attract loop crosses programs**: the game hands back to the launcher, which starts the game again in demo mode with those values.
+- It can also start `sg_dpldr.bin`, the web browser's loader (menu text `LAUNCH BROWSER`).
+
+**So the native replacement has to:**
+
+1. On a cold start: play the intro movie (skippable), then start the game with an argument block holding one string and nothing else.
+2. When the game asks to start `1st_read.bin <args>`: start the game afresh (its image and RAM as on a first start) with the arguments the launcher would pass: `-DEMO=-1`, then the ones it was given.
+3. When the game asks to start `sg_dpldr.bin`: there is no browser. What the menu entry does instead is to be decided; until then the runtime stops and says so.
+4. Stop loudly on a request to start anything else.
+
+**Still to confirm** (by tracing the original under Flycast, and by reading `GINXFER.BIN`):
+
+- that the transfer program is what fills the argument block, and what the first string is on a cold start (`\manifest.bin`, or the program's name);
+- everything the launcher's front part does besides the movie (logos, a 50/60 Hz choice, memory-card checks), and whether any of it leaves something the game reads: a save, a flash setting, a value in RAM that survives the swap;
+- the byte both programs write to `0x8C0080FC` (inside IP.BIN's area in RAM) before starting another program;
+- that `-DEMO=-1` is what the game should get on the way back, and what `-ZONE` and `-SPEED` carry.
+
+During bring-up the runtime treats any read of memory the game didn't write, and that the replacement didn't set, as an error; that is how a missed piece of launcher state shows up as a message instead of a misbehaving game.
 
 ### The system layer
 
@@ -147,7 +185,7 @@ build/qilin cfg     disc/MSR.BIN
 
 ## Still to find out
 
-1. What the launcher does before it starts the game, and how one program replaces another (`GINXFER.BIN`, `MANIFEST.BIN`, the `-DEMO` argument): what state the game expects to find.
+1. The open points under *The hand-over between launcher and game*.
 2. Which sound library the game links, and the Manatee bank formats.
 3. The game's own file formats.
 4. Where each library sits in each program (signatures; `prior-art.md`).
