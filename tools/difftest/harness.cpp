@@ -10,6 +10,7 @@
 //   case:   fn, r0..r15, pr, gbr, mach, macl, t, s, q, m, fpul, fpscr, fr[0][0..15], fr[1][0..15],
 //           n, then n x (addr, len, bytes) written over the image
 //   result: status (0 = returned, else 1 + rt::Stop::Kind), stop pc, stop value,
+//           the last 64 longword loads, oldest first: 64 x (addr, value) (unused entries 0, 0),
 //           r0..r15, pr, gbr, mach, macl, t, s, q, m, fpul, fpscr, fr[0][0..15], fr[1][0..15], ret,
 //           then the changed 32-byte blocks of RAM: count, count x (addr, 32 bytes)
 #include <cstdio>
@@ -67,6 +68,8 @@ int main(int argc, char** argv) {
     }
     rt::g_regions[0] = {kRamBase, kRamBase + kRamSize};
     rt::g_region_count = 1;
+    // MSR.BIN's game code (its data starts at 0x8C0EE744; the libraries after it mix code and data).
+    rt::g_code = {boot->base(), 0x8C0EE744};
 
     std::vector<uint8_t> baseline(kRamSize, 0), initial(kRamSize);
     std::memcpy(baseline.data() + (boot->base() - kRamBase), boot->image().data(), boot->image().size());
@@ -93,6 +96,8 @@ int main(int argc, char** argv) {
             }
         }
         std::memcpy(ram, initial.data(), kRamSize);
+        std::memset(rt::g_load_trace, 0, sizeof rt::g_load_trace);
+        rt::g_load_next = 0;
 
         uint32_t status = 0, pc = 0, value = 0;
         try {
@@ -103,6 +108,8 @@ int main(int argc, char** argv) {
             value = s.value;
         }
         write_u32(status), write_u32(pc), write_u32(value);
+        for (unsigned i = 0; i < rt::kLoadTrace; ++i)
+            for (const uint32_t w : rt::g_load_trace[(rt::g_load_next + i) % rt::kLoadTrace]) write_u32(w);
         for (const uint32_t r : c.r) write_u32(r);
         write_u32(c.pr), write_u32(c.gbr), write_u32(c.mach), write_u32(c.macl);
         write_u32(c.t), write_u32(c.s), write_u32(c.q), write_u32(c.m);

@@ -17,6 +17,16 @@ tool and nothing of it is in this repository. It needs qemu-system-sh4 (apt
 install qemu-system-misc). There is no SH-4 in Unicorn, which the sister
 projects use.
 
+Inputs are repaired before the original runs. The lifted code runs first,
+natively (milliseconds). If it faults on an address that is one of the
+trial's input values plus a small offset (a register, or a word of the heap
+or stack), that input was meant to be a pointer: it becomes one, and the
+lifted code runs again. An indirect call to an input value is pointed at a
+function that only returns. Random 32-bit values are as good as unique, so
+the value tells which input it came from. Up to 24 repairs a trial; the
+original runs once, on the repaired inputs, and only if the lifted code
+returned.
+
 A trial is conclusive when both sides return: then everything must match, or
 the function fails. It is inconclusive, and counted by kind, when the lifted
 code stops (a memory access outside RAM, a call into a function that isn't
@@ -67,7 +77,9 @@ HEAP, HEAP_SIZE = 0x8CE00000, 0x4000
 SR = 0x400000F0             # privileged, bank 0, exceptions not blocked, interrupts masked
 BLOCK = 32
 TIMEOUT = 2.0               # seconds of host time for the original under QEMU
-LIFTED_TIMEOUT = 5.0        # ... and for the lifted code, which is far faster
+LIFTED_TIMEOUT = 0.5        # ... and for the lifted code, which is far faster (a few ms is typical)
+REPAIRS = 24                # input repairs a trial (see above)
+NEAR = 0x10000              # a fault within this many bytes above an input value came from it
 STATUS = ["returned", "memory fault", "bad jump", "bad return", "trap", "not lifted", "unsupported"]
 # QEMU's register order for SH-4 over the debugger protocol.
 R_PC, R_PR, R_GBR, R_VBR, R_MACH, R_MACL, R_SR, R_FPUL, R_FPSCR, R_FR = 16, 17, 18, 19, 20, 21, 22, 23, 24, 25
@@ -170,6 +182,7 @@ class Original:
             self.gdb.ok(f"Z0,{addr:x},2")
         self.current = bytearray(image)  # what QEMU's RAM holds now
         self.stale = []                  # blocks the last trial changed
+        self.repaired = []               # blocks of single words input repair wrote for the last trial
 
     def close(self):
         self.qemu.kill()
@@ -177,7 +190,10 @@ class Original:
 
     def run(self, fn, regs, writes, expected):
         """Returns (how it ended, registers, {block address: 32 bytes} of RAM that differs from `expected`)."""
-        # Bring RAM to `expected`: this trial's writes, and undo what the last trial changed.
+        # Bring RAM to `expected`: this trial's writes, and undo what the last trial changed
+        # (including the single words input repair wrote for it, which this trial may not have).
+        self.stale += self.repaired
+        self.repaired = [(addr - RAM) & ~(BLOCK - 1) for addr, data in writes if len(data) <= 8]
         for addr, data in writes:
             off = addr - RAM
             if self.current[off:off + len(data)] != data:
@@ -241,8 +257,8 @@ class Original:
             if out[R_PC] == MAGIC:
                 ended = "returned"
             elif out[R_PC] - VECTORS in (0x100, 0x400, 0x600):
-                ended = "took an exception"
                 spc = out[R_SPC]
+                ended = f"took an exception at {spc:08x}"
                 if RAM <= spc < RAM + RAM_SIZE - 1:
                     word = struct.unpack_from("<H", expected, spc - RAM)[0]
                     for mask, match, name in UNRUNNABLE:
@@ -280,6 +296,7 @@ class Lifted:
     def start(self):
         self.proc = subprocess.Popen(self.args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
         self.deadline = None
+        self.loads = []  # the last run's last longword loads, oldest first: (address, value)
 
     def read(self, n):
         data = b""
@@ -289,7 +306,7 @@ class Lifted:
                 raise TimeoutError
             part = os.read(self.proc.stdout.fileno(), n - len(data))
             if not part:
-                sys.exit("difftest: the harness died")
+                raise EOFError
             data += part
         return data
 
@@ -305,6 +322,8 @@ class Lifted:
         self.deadline = time.time() + LIFTED_TIMEOUT
         try:
             status, pc, value = struct.unpack("<3I", self.read(12))
+            trace = struct.unpack("<128I", self.read(512))
+            self.loads = [(trace[i], trace[i + 1]) for i in range(0, 128, 2) if trace[i]]
             out = struct.unpack("<59I", self.read(236))
             count = struct.unpack("<I", self.read(4))[0]
             changed = {}
@@ -316,6 +335,11 @@ class Lifted:
             self.proc.wait()
             self.start()
             return "ran too long", 0, 0, None, None
+        except EOFError:
+            # The lifted code took the harness down (a host stack overflow from runaway recursion, say).
+            code = self.proc.wait()
+            self.start()
+            return f"crashed the harness ({code})", 0, 0, None, None
         state = {"r": list(out[:16]), "pr": out[16], "gbr": out[17], "mach": out[18], "macl": out[19],
                  "t": out[20], "s": out[21], "q": out[22], "m": out[23], "fpul": out[24], "fpscr": out[25],
                  "fr": [list(out[26:42]), list(out[42:58])], "ret": out[58]}
@@ -324,8 +348,8 @@ class Lifted:
 
 def random_case(rng):
     def pointer():
-        return rng.choice([HEAP + rng.randrange(0, HEAP_SIZE - 0x400, 4), STACK_TOP - rng.randrange(0, STACK_FILL - 0x200, 4),
-                           STACK_TOP + rng.randrange(0, STACK_FILL - 0x200, 4)])
+        return rng.choice([HEAP + rng.randrange(0, HEAP_SIZE - 0x400, 32), STACK_TOP - rng.randrange(0, STACK_FILL - 0x200, 32),
+                           STACK_TOP + rng.randrange(0, STACK_FILL - 0x200, 32)])
 
     def value():
         kind = rng.random()
@@ -369,10 +393,73 @@ def random_case(rng):
             kind = rng.random()
             words.append(pointer() if kind < 0.33 else single() if kind < 0.58 else
                          rng.getrandbits(32) if kind < 0.8 else rng.randrange(0, 256))
-        return struct.pack(f"<{size // 4}I", *words)
+        return bytearray(struct.pack(f"<{size // 4}I", *words))
 
     writes = [(HEAP, fill(HEAP_SIZE)), (STACK_TOP - STACK_FILL, fill(2 * STACK_FILL)), (STUB, STUB_CODE)]
     return regs, writes
+
+
+def input_slots(regs, writes, small=False):
+    """Every input value that could have been meant as a pointer: (value, where). Small values
+    (common by chance in memory) only with small, for faults near address zero."""
+    slots = [(regs["r"][i], ("r", i)) for i in range(15)]  # r15 is the stack pointer
+    slots.append((regs["gbr"], ("gbr", 0)))
+    for index, (addr, data) in enumerate(writes):
+        if isinstance(data, bytearray):
+            # In memory, only values unlikely to be there by chance (small numbers are common).
+            for k, value in enumerate(struct.unpack(f"<{len(data) // 4}I", data)):
+                if value >= 0x10000 or small:
+                    slots.append((value, ("mem", index, k)))
+    return slots
+
+
+def set_slot(regs, writes, where, value):
+    if where[0] == "r":
+        regs["r"][where[1]] = value
+    elif where[0] == "gbr":
+        regs["gbr"] = value
+    elif where[0] == "addr":
+        for addr, data in writes:
+            if isinstance(data, bytearray) and addr <= where[1] < addr + len(data):
+                struct.pack_into("<I", data, where[1] - addr, value)
+                return
+        writes.append((where[1], bytearray(struct.pack("<I", value))))
+    else:
+        struct.pack_into("<I", writes[where[1]][1], 4 * where[2], value)
+
+
+def in_ram(addr):
+    return RAM <= addr < RAM + RAM_SIZE
+
+
+def repair(lifted, fn, regs, writes, rng, ret_fn):
+    """Runs the lifted code, turning inputs it faults on into pointers. Returns (repairs, its last result)."""
+    done = set()
+    for repairs in range(REPAIRS + 1):
+        result = lifted.run(fn, regs, writes)
+        status, pc, value = result[:3]
+        where = None
+        if status == "memory fault" and repairs < REPAIRS:
+            def bad(v):  # v can't be the pointer the access was based on as things stand
+                return v <= value < v + NEAR and (not in_ram(v) or value % 4)  # in RAM: misaligned
+            # Where the pointer came from: a longword the code loaded (newest first; the image's
+            # zero-filled globals as much as the heap) or else one of the inputs.
+            loaded = [("addr", a) for a, v in reversed(lifted.loads)
+                      if bad(v) and in_ram(a) and ("addr", a) not in done]
+            slots = input_slots(regs, writes, small=value < NEAR)
+            near = sorted((value - v, w) for v, w in slots if bad(v) and w not in done)
+            where = loaded[0] if loaded else near[0][1] if near else None
+            if where:
+                new = HEAP + rng.randrange(0, (HEAP_SIZE - 0x400) // 32) * 32
+        elif status == "bad jump" and repairs < REPAIRS:
+            exact = [w for v, w in input_slots(regs, writes, small=True) if v == value and w not in done]
+            if exact:
+                where, new = exact[0], ret_fn
+        if where is None:
+            return repairs, result
+        done.add(where)
+        set_slot(regs, writes, where, new)
+    return REPAIRS, result
 
 
 def lifted_functions(gen):
@@ -382,6 +469,13 @@ def lifted_functions(gen):
             with open(os.path.join(gen, name)) as f:
                 found += [int(m, 16) for m in re.findall(r"^void fn_([0-9a-f]{8})\(rt::Context& c\) \{", f.read(), re.M)]
     return sorted(found)
+
+
+def expected_image(image, writes):
+    expected = bytearray(image)
+    for addr, data in writes:
+        expected[addr - RAM:addr - RAM + len(data)] = data
+    return expected
 
 
 def differences(ours, theirs, ours_mem, theirs_mem):
@@ -458,8 +552,13 @@ def main():
     image[BASE - RAM:BASE - RAM + len(program)] = program
     image = bytes(image)
 
-    functions = [int(args.only, 16)] if args.only else lifted_functions(args.gen)
+    all_lifted = lifted_functions(args.gen)
+    functions = [int(args.only, 16)] if args.only else all_lifted
     readers = fpscr_readers(args.gen)
+    # A function that only returns (rts ; nop): where repaired indirect calls go.
+    ret_fn = next(f for f in all_lifted if struct.unpack_from("<2H", program, f - BASE) == (0x000B, 0x0009))
+    repaired = collections.Counter()
+    crashed = set()
     rng = random.Random(args.seed)
     if args.shuffle:
         rng.shuffle(functions)
@@ -477,41 +576,35 @@ def main():
                 conclusive, failure = 0, None
                 for trial in range(args.trials):
                     regs, writes = random_case(rng)
-                    expected = bytearray(image)
-                    for addr, data in writes:
-                        expected[addr - RAM:addr - RAM + len(data)] = data
-                    # The original first: if it never finishes on this input, the lifted code wouldn't either.
+                    repairs, (status, pc, value, ours, ours_mem) = repair(lifted, fn, regs, writes, rng, ret_fn)
+                    repaired[min(repairs, 4)] += 1
+                    if status != "returned":
+                        kind = f"lifted code stopped: {status}"
+                        if status == "memory fault" and not in_ram(value):
+                            kind += " outside RAM"
+                        inconclusive[kind] += 1
+                        if status.startswith("crashed"):
+                            crashed.add(fn)
+                        if args.verbose:
+                            print(f"  {fn:08x} trial {trial}: {status} at {pc:08x} ({value:08x}) after {repairs} repairs")
+                        continue
+                    if ours["ret"] != MAGIC:
+                        # It returned through a PR it loaded from the (random) stack, not to its caller:
+                        # the original would go on to run whatever is there.
+                        inconclusive["returned somewhere other than to the caller"] += 1
+                        continue
                     try:
-                        ended, theirs, theirs_mem = original.run(fn, regs, writes, bytes(expected))
+                        ended, theirs, theirs_mem = original.run(fn, regs, writes, bytes(expected_image(image, writes)))
                     except (ConnectionError, BrokenPipeError, ConnectionResetError):
                         # The original did something that ends the reference machine (a reset, a power-off).
                         original.close()
                         original.start()
-                        inconclusive["the original stopped the reference machine"] += 1
-                        if args.verbose:
-                            print(f"  {fn:08x} trial {trial}: the original stopped the reference machine")
-                        continue
+                        failure = f"the lifted code returned; the original stopped the reference machine [seed {args.seed}, trial {trial}]"
+                        break
                     if args.verbose:
-                        print(f"  {fn:08x} trial {trial}: the original {ended}")
+                        print(f"  {fn:08x} trial {trial}: the original {ended} after {repairs} repairs")
                     if ended == "ran too long" or ended.startswith("reference can't run"):
                         inconclusive[f"the original {ended}" if ended == "ran too long" else ended] += 1
-                        continue
-                    status, pc, value, ours, ours_mem = lifted.run(fn, regs, writes)
-                    if status == "ran too long":
-                        failure = f"the original {ended}; the lifted code didn't finish [seed {args.seed}, trial {trial}]"
-                        break
-                    if status != "returned":
-                        inconclusive[f"lifted code stopped: {status}"] += 1
-                        if args.verbose:
-                            print(f"  {fn:08x} trial {trial}: {status} at {pc:08x} ({value:08x}); the original {ended}")
-                        continue
-                    if ours["ret"] != MAGIC:
-                        # It returned through a PR it had loaded from somewhere: not to its caller.
-                        if ended == "returned":
-                            failure = f"the original returned to its caller; the lifted code to {ours['ret']:08x} " \
-                                      f"[seed {args.seed}, trial {trial}]"
-                            break
-                        inconclusive["returned somewhere other than to the caller"] += 1
                         continue
                     if ended != "returned":
                         failure = f"the lifted code returned; the original {ended} [seed {args.seed}, trial {trial}]"
@@ -548,6 +641,9 @@ def main():
     print(f"  conclusive trials: {trials_passed}")
     for kind, n in inconclusive.most_common():
         print(f"  inconclusive trials, {kind}: {n}")
+    if crashed:
+        print("  functions whose lifted code crashed the harness: " + " ".join(f"{f:08x}" for f in sorted(crashed)))
+    print("  trials by input repairs: " + ", ".join(f"{k if k < 4 else '4+'}: {repaired[k]}" for k in sorted(repaired)))
     return 1 if failed else 0
 
 

@@ -57,9 +57,23 @@ inline void check(uint32_t a, uint32_t n) {
             if (a >= g_regions[i].lo && uint64_t(a) + n <= g_regions[i].hi) return;
     throw Stop{Stop::Memory, g_pc, a};
 }
+// Stores into the program's code stop too: the lifted code is compiled, so
+// code that writes over itself (or a bad pointer into code) would silently
+// part ways with the original.
+inline Region g_code = {0, 0};
+inline void check_store(uint32_t a, uint32_t n) {
+    check(a, n);
+    if (a < g_code.hi && uint64_t(a) + n > g_code.lo) throw Stop{Stop::Memory, g_pc, a};
+}
 #define QILIN_PC(a) (::qilin::rt::g_pc = (a))
+// The last longword loads (address, value): when an access faults, the
+// differential test looks here for where the bad pointer came from.
+inline constexpr unsigned kLoadTrace = 64;
+inline uint32_t g_load_trace[kLoadTrace][2] = {};
+inline unsigned g_load_next = 0;
 #else
 inline void check(uint32_t, uint32_t) {}
+inline void check_store(uint32_t, uint32_t) {}
 #define QILIN_PC(a) ((void)0)
 #endif
 
@@ -77,22 +91,26 @@ inline uint32_t ld32(uint32_t a) {
     check(a, 4);
     uint32_t v;
     std::memcpy(&v, g_mem + a, 4);
+#ifdef QILIN_CHECKED_MEMORY
+    g_load_trace[g_load_next % kLoadTrace][0] = a;
+    g_load_trace[g_load_next++ % kLoadTrace][1] = v;
+#endif
     return v;
 }
 // Sign-extending loads: what mov.b and mov.w do.
 inline uint32_t ld8s(uint32_t a) { return static_cast<uint32_t>(static_cast<int8_t>(ld8(a))); }
 inline uint32_t ld16s(uint32_t a) { return static_cast<uint32_t>(static_cast<int16_t>(ld16(a))); }
 inline void st8(uint32_t a, uint32_t v) {
-    check(a, 1);
+    check_store(a, 1);
     g_mem[a] = static_cast<uint8_t>(v);
 }
 inline void st16(uint32_t a, uint32_t v) {
-    check(a, 2);
+    check_store(a, 2);
     const auto b = static_cast<uint16_t>(v);
     std::memcpy(g_mem + a, &b, 2);
 }
 inline void st32(uint32_t a, uint32_t v) {
-    check(a, 4);
+    check_store(a, 4);
     std::memcpy(g_mem + a, &v, 4);
 }
 

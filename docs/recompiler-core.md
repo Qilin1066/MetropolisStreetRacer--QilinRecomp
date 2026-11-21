@@ -319,3 +319,39 @@ Half the functions (52%) are still untested, for the same reason as before: rand
 - Raise the tested share: inputs shaped by what a function dereferences; more trials; another seed.
 - The nine functions not lifted for their floating-point mode: an entry mode per function, from its call sites.
 - UBSan runs of the generated code.
+
+## Differential test: input repair (v0.8.0)
+
+Half the functions had no conclusive trial in v0.7.0 because random inputs make code that takes structures fault before it returns. The test now runs the recompiled side first and repairs the inputs from what it does.
+
+### How it works
+
+- **The lifted code runs first** (a few milliseconds, natively). The original runs under QEMU only once the lifted code has returned to its caller, on the same, repaired, inputs. A trial where the lifted code doesn't return is inconclusive and costs QEMU nothing, which more than pays for the repair runs.
+- **A memory fault names its pointer.** The checked build records the last 64 longword loads. When an access faults (outside RAM, or misaligned), the newest load whose value is just below the faulting address (within 64 KiB) is where the bad pointer came from: that memory word, in the heap, on the stack or among the image's zero-filled globals, becomes a pointer into the heap. If no load matches, the input registers and heap and stack words are tried the same way. Random 32-bit values are as good as unique, so the match is rarely wrong, and a wrong guess only changes the inputs, never the comparison.
+- **An indirect call to an input value** is pointed at a function that only returns (`rts; nop`).
+- Up to 24 repairs a trial; the run repeats after each. The lifted code's time limit is now 0.5 s (it was 5 s; a typical run is 5 ms).
+
+Two things the repairs exposed, both now guarded:
+
+- **Code that writes over code.** A repaired pointer can be both a function pointer and, elsewhere, a buffer: the original then wrote a message over the `rts; nop` it was about to call and went astray, while the compiled lifted code was unaffected. The checked build now stops on a store into the game's code (`0x8C010000`–`0x8C0EE744`), so such a trial is inconclusive instead of a false failure.
+- **Returns through the random stack.** A shared epilogue that pops PR from a random stack word returns somewhere other than its caller; the original then runs whatever is at that address (once, a hardware area that ended QEMU). Such trials are now inconclusive without running the original.
+
+The reference machine also undoes single-word repairs from one trial before the next, as it does the blocks a trial changed.
+
+### Result
+
+All 5,115 lifted functions, 3 trials each, seed 1 (32 minutes; 85 in v0.7.0):
+
+| | v0.7.0 | v0.8.0 |
+|---|---|---|
+| **Fail** | 0 | **0** |
+| Pass | 2,452 | **3,456** (68%) |
+| Untested | 2,663 | 1,659 |
+| Conclusive trials | 5,862 | 8,949 |
+
+Inconclusive trials in v0.8.0: 4,405 memory faults outside RAM (most on hardware addresses: the SH-4's control registers at `0xFFxxxxxx` and uncached P2 addresses, which need a hardware model; the rest on addresses the code computed rather than loaded), 729 calls into functions not lifted, 397 bad jumps, 395 faults inside RAM (misaligned, or stores into code), 214 runs past the time limit, 146 instructions QEMU can't run (131 `fipr`, 12 `ftrv`, 3 `fsrra`), 101 returns elsewhere, 4 unsupported FPSCR loads, 3 bad returns, and 2 host crashes: `0x8c0323ea` and `0x8c0326a4` walk trees recursively, and repaired pointers can make a cycle, so the recursion doesn't end. 8,102 trials needed no repair, 2,082 one, 941 two, 319 three and 3,901 four or more.
+
+### Next
+
+- A model of the hardware registers the game touches (the hardware-access profile, roadmap step 5) would let the 0xFF and P2 faults run.
+- Run the lifted code on a large host stack, or bound the call depth, so runaway recursion faults like the console would instead of crashing the harness.

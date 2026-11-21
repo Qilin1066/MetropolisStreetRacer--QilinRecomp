@@ -11,6 +11,20 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-21
+The differential test now repairs its inputs: 3,456 of the 5,115 lifted functions pass (2,452 in v0.7.0), still with no failures, in 32 minutes instead of 85.
+
+### Added
+- **Input repair** (`tools/difftest/difftest.py`): the lifted code runs first, natively. When it faults on an address just above a value it loaded (the checked build now records its last 64 longword loads), or just above one of the inputs, that word becomes a pointer into the heap and the run repeats; an indirect call to an input value goes to a function that only returns. Up to 24 repairs a trial. The original runs under QEMU once, on the repaired inputs, and only if the lifted code returned to its caller.
+- **Stores into the game's code stop** in checked builds (`rt::check_store`), so a pointer that aliases code is an inconclusive trial rather than a false failure.
+- A harness crash (lifted code overflowing the host stack in runaway recursion) is an inconclusive trial; the test restarts the harness and names the functions.
+
+### Changed
+- The lifted code's time limit in the test is 0.5 s (was 5 s).
+- A trial where the lifted code returns somewhere other than its caller (through a PR popped from the random stack) is inconclusive without running the original, which would run whatever is at that address.
+- The reference machine undoes the previous trial's single-word repairs before the next trial.
+- An exception in the original is reported with its address.
+
 ## [0.7.0] - 2026-11-21
 Floating point: 5,115 of the game's 5,247 functions now lift, up from 3,614.
 
