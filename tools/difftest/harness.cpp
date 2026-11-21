@@ -8,11 +8,16 @@
 // program at 0x8C010000, as in the QEMU run; anything else stops with a
 // memory fault (checked memory). All integers are little-endian u32.
 //   case:   fn, r0..r15, pr, gbr, mach, macl, t, s, q, m, fpul, fpscr, fr[0][0..15], fr[1][0..15],
+//           sr (without T S Q M), vbr, ssr, spc, rbank[0..7], a seed for hardware loads,
+//           words to treat as hardware: count (at most 8 are used), count x addr,
 //           n, then n x (addr, len, bytes) written over the image
 //   result: status (0 = returned, else 1 + rt::Stop::Kind), stop pc, stop value,
-//           the last 64 longword loads, oldest first: 64 x (addr, value) (unused entries 0, 0),
+//           the last 64 loads, oldest first: 64 x (addr, value, size) (unused entries 0, 0, 0),
 //           r0..r15, pr, gbr, mach, macl, t, s, q, m, fpul, fpscr, fr[0][0..15], fr[1][0..15], ret,
+//           sr, vbr, ssr, spc, rbank[0..7],
+//           the hardware accesses: count, count x (pc, addr, size | 0x100 for a store, value),
 //           then the changed 32-byte blocks of RAM: count, count x (addr, 32 bytes)
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <print>
@@ -68,6 +73,7 @@ int main(int argc, char** argv) {
     }
     rt::g_regions[0] = {kRamBase, kRamBase + kRamSize};
     rt::g_region_count = 1;
+    rt::g_hw_replay = true;
     // MSR.BIN's game code (its data starts at 0x8C0EE744; the libraries after it mix code and data).
     rt::g_code = {boot->base(), 0x8C0EE744};
 
@@ -83,6 +89,20 @@ int main(int argc, char** argv) {
         read_u32(c.fpul), read_u32(c.fpscr);
         for (auto& bank : c.fr)
             for (uint32_t& f : bank) read_u32(f);
+        read_u32(c.sr), read_u32(c.vbr), read_u32(c.ssr), read_u32(c.spc);
+        for (uint32_t& r : c.rbank) read_u32(r);
+        uint32_t seed = 0;
+        read_u32(seed);
+        rt::g_hw_state = 0x9E3779B97F4A7C15ull * (uint64_t{seed} + 1);
+        rt::g_hw_count = 0;
+        uint32_t volatiles = 0;
+        read_u32(volatiles);
+        rt::g_volatile_count = volatiles < 8 ? volatiles : 8;
+        for (uint32_t i = 0; i < volatiles; ++i) {
+            uint32_t a = 0;
+            read_u32(a);
+            if (i < 8) rt::g_volatile[i] = a & ~3u;
+        }
         initial = baseline;
         uint32_t writes = 0;
         read_u32(writes);
@@ -100,6 +120,7 @@ int main(int argc, char** argv) {
         rt::g_load_next = 0;
 
         uint32_t status = 0, pc = 0, value = 0;
+        rt::g_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
         try {
             rt::call(c, fn, 0);
         } catch (const rt::Stop& s) {
@@ -117,6 +138,13 @@ int main(int argc, char** argv) {
         for (const auto& bank : c.fr)
             for (const uint32_t f : bank) write_u32(f);
         write_u32(c.ret);
+        write_u32(c.sr), write_u32(c.vbr), write_u32(c.ssr), write_u32(c.spc);
+        for (const uint32_t r : c.rbank) write_u32(r);
+        write_u32(rt::g_hw_count);
+        for (unsigned i = 0; i < rt::g_hw_count; ++i) {
+            const rt::HwAccess& h = rt::g_hw_log[i];
+            write_u32(h.pc), write_u32(h.addr), write_u32(h.size_store), write_u32(h.value);
+        }
         std::vector<uint32_t> changed;
         for (uint32_t off = 0; off < kRamSize; off += 32)
             if (std::memcmp(ram + off, initial.data() + off, 32) != 0) changed.push_back(off);

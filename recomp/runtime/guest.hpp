@@ -6,10 +6,12 @@
 #pragma once
 
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <utility>
 #include <initializer_list>
 #include <numbers>
 
@@ -20,9 +22,12 @@ static_assert(std::endian::native == std::endian::little, "hosts are little-endi
 struct Context {
     uint32_t r[16] = {};
     uint32_t pr = 0, gbr = 0, mach = 0, macl = 0;
-    // SR's T, S, Q and M bits, each 0 or 1. The rest of SR belongs to the
-    // privileged layer the runtime replaces.
+    // SR's T, S, Q and M bits, each 0 or 1, and the rest of SR (MD, RB, BL,
+    // FD, IMASK) in sr, with those four bits clear. The game runs privileged.
     uint32_t t = 0, s = 0, q = 0, m = 0;
+    uint32_t sr = 0x400000F0u;  // MD = 1, RB = 0, BL = 0, IMASK = 15
+    uint32_t vbr = 0, ssr = 0, spc = 0, sgr = 0, dbr = 0;
+    uint32_t rbank[8] = {};     // the r0-r7 of the bank SR.RB doesn't select
     uint32_t fpul = 0, fpscr = 0;
     uint32_t fr[2][16] = {};  // both banks of floating-point registers, as bits
     uint32_t ret = 0;         // where the last function returned to (its rts's target)
@@ -33,7 +38,7 @@ struct Context {
 // Thrown, so the runtime can name it and its caller, and the differential
 // test can compare it.
 struct Stop {
-    enum Kind : uint32_t { Memory, BadJump, BadReturn, Trap, NotLifted, Unsupported } kind;
+    enum Kind : uint32_t { Memory, BadJump, BadReturn, Trap, NotLifted, Unsupported, HardwareLog, TooLong } kind;
     uint32_t pc;     // guest address of the instruction (or function)
     uint32_t value;  // the address involved
 };
@@ -49,7 +54,19 @@ struct Region {
 inline Region g_regions[16] = {};
 inline unsigned g_region_count = 0;
 inline uint32_t g_pc = 0;  // set by checked code before each access, for the report
+// A time limit, checked every 2^20 accesses: a test's lifted code that runs
+// on (a loop waiting for an interrupt, say) stops with its state intact.
+inline uint64_t g_accesses = 0;
+inline std::chrono::steady_clock::time_point g_deadline = std::chrono::steady_clock::time_point::max();
+inline void count_access(uint32_t a) {
+    if ((++g_accesses & 0xFFFFF) == 0 && std::chrono::steady_clock::now() > g_deadline) throw Stop{Stop::TooLong, g_pc, a};
+}
+// Words the test treats as hardware although they are RAM: ones a loop polls
+// that only an interrupt would change.
+inline uint32_t g_volatile[8] = {};
+inline unsigned g_volatile_count = 0;
 inline void check(uint32_t a, uint32_t n) {
+    count_access(a);
     // The SH-4 raises an address error on a word or longword access that
     // isn't aligned; code that works on the console never does one.
     if (!(a & (n - 1)))
@@ -57,6 +74,54 @@ inline void check(uint32_t a, uint32_t n) {
             if (a >= g_regions[i].lo && uint64_t(a) + n <= g_regions[i].hi) return;
     throw Stop{Stop::Memory, g_pc, a};
 }
+
+// Hardware replay, for the differential test: with g_hw_replay set, an
+// aligned access to the Dreamcast's hardware (the SH-4's control registers,
+// the system, Holly, G1/G2 and AICA registers, sound and video RAM, the TA
+// paths) doesn't stop. A load gets a value from a generator the test seeds
+// and every access is logged, so the original can be given the same values
+// and its accesses checked against these.
+struct HwAccess {
+    uint32_t pc, addr, size_store, value;  // size_store: size, | 0x100 for a store
+};
+inline constexpr unsigned kHwLog = 4096;
+inline HwAccess g_hw_log[kHwLog] = {};
+inline unsigned g_hw_count = 0;
+inline bool g_hw_replay = false;
+inline uint64_t g_hw_state = 0;
+inline bool is_hardware(uint32_t a) {
+    if (a >= 0xFF000000u) return true;                     // P4: the SH-4's control registers
+    if (a >= 0xF0000000u) return a < 0xF8000000u;          // the cache and TLB arrays
+    if (a >= 0xE0000000u) return a < 0xE4000000u;          // the store queues
+    const uint32_t p = a & 0x1FFFFFFFu;
+    return (p >= 0x005F0000u && p < 0x00A00000u)     // system/Holly/G1/G2/modem/AICA/RTC registers, sound RAM
+           || (p >= 0x04000000u && p < 0x06000000u)  // video RAM
+           || (p >= 0x10000000u && p < 0x12000000u); // TA FIFO, YUV and direct texture paths
+}
+inline bool is_volatile(uint32_t a) {
+    for (unsigned i = 0; i < g_volatile_count; ++i)
+        if ((a & ~3u) == g_volatile[i]) return true;
+    return false;
+}
+inline bool hardware(uint32_t a, uint32_t n) {
+    return g_hw_replay && !(a & (n - 1)) && (is_hardware(a) || (g_volatile_count && is_volatile(a)));
+}
+inline void hw_log(uint32_t a, uint32_t n, uint32_t v) {
+    if (g_hw_count == kHwLog) throw Stop{Stop::HardwareLog, g_pc, a};  // more than the test replays
+    g_hw_log[g_hw_count++] = {g_pc, a, n, v};
+}
+inline uint32_t hw_load(uint32_t a, uint32_t n) {
+    // xorshift64*: a few all-zero and all-one values among random ones, which is what status bits polled in a loop need.
+    g_hw_state ^= g_hw_state >> 12, g_hw_state ^= g_hw_state << 25, g_hw_state ^= g_hw_state >> 27;
+    const uint64_t x = g_hw_state * 0x2545F4914F6CDD1Dull;
+    uint32_t v = static_cast<uint32_t>(x >> 32);
+    if ((x & 7) == 0) v = 0;
+    else if ((x & 7) == 1) v = ~0u;
+    if (n < 4) v &= (1u << (8 * n)) - 1;
+    hw_log(a, n, v);
+    return v;
+}
+inline void hw_store(uint32_t a, uint32_t n, uint32_t v) { hw_log(a, n | 0x100, n < 4 ? v & ((1u << (8 * n)) - 1) : v); }
 // Stores into the program's code stop too: the lifted code is compiled, so
 // code that writes over itself (or a bad pointer into code) would silently
 // part ways with the original.
@@ -66,50 +131,72 @@ inline void check_store(uint32_t a, uint32_t n) {
     if (a < g_code.hi && uint64_t(a) + n > g_code.lo) throw Stop{Stop::Memory, g_pc, a};
 }
 #define QILIN_PC(a) (::qilin::rt::g_pc = (a))
+// A lifted function's registers: host locals, synced with the context around
+// calls (QILIN_OUT / QILIN_IN). In checked builds they are the context's own
+// registers instead, so the context is exact wherever lifted code stops.
+#define QILIN_REG [[maybe_unused]] uint32_t&
 // The last longword loads (address, value): when an access faults, the
 // differential test looks here for where the bad pointer came from.
 inline constexpr unsigned kLoadTrace = 64;
-inline uint32_t g_load_trace[kLoadTrace][2] = {};
+inline uint32_t g_load_trace[kLoadTrace][3] = {};  // address, value, size
 inline unsigned g_load_next = 0;
+#define QILIN_TRACE_LOAD(a, v, n)                                     \
+    do {                                                              \
+        uint32_t* entry = g_load_trace[g_load_next++ % kLoadTrace];  \
+        entry[0] = a, entry[1] = v, entry[2] = n;                     \
+    } while (0)
+#define QILIN_HW_LOAD(a, n) \
+    if (hardware(a, n)) return hw_load(a, n)
+#define QILIN_HW_STORE(a, n, v) \
+    if (hardware(a, n)) return hw_store(a, n, v)
 #else
 inline void check(uint32_t, uint32_t) {}
 inline void check_store(uint32_t, uint32_t) {}
+#define QILIN_HW_LOAD(a, n) ((void)0)
+#define QILIN_TRACE_LOAD(a, v, n) ((void)0)
+#define QILIN_HW_STORE(a, n, v) ((void)0)
 #define QILIN_PC(a) ((void)0)
+#define QILIN_REG [[maybe_unused]] uint32_t
 #endif
 
 inline uint32_t ld8(uint32_t a) {
+    QILIN_HW_LOAD(a, 1);
     check(a, 1);
+    QILIN_TRACE_LOAD(a, g_mem[a], 1);
     return g_mem[a];
 }
 inline uint32_t ld16(uint32_t a) {
+    QILIN_HW_LOAD(a, 2);
     check(a, 2);
     uint16_t v;
     std::memcpy(&v, g_mem + a, 2);
+    QILIN_TRACE_LOAD(a, v, 2);
     return v;
 }
 inline uint32_t ld32(uint32_t a) {
+    QILIN_HW_LOAD(a, 4);
     check(a, 4);
     uint32_t v;
     std::memcpy(&v, g_mem + a, 4);
-#ifdef QILIN_CHECKED_MEMORY
-    g_load_trace[g_load_next % kLoadTrace][0] = a;
-    g_load_trace[g_load_next++ % kLoadTrace][1] = v;
-#endif
+    QILIN_TRACE_LOAD(a, v, 4);
     return v;
 }
 // Sign-extending loads: what mov.b and mov.w do.
 inline uint32_t ld8s(uint32_t a) { return static_cast<uint32_t>(static_cast<int8_t>(ld8(a))); }
 inline uint32_t ld16s(uint32_t a) { return static_cast<uint32_t>(static_cast<int16_t>(ld16(a))); }
 inline void st8(uint32_t a, uint32_t v) {
+    QILIN_HW_STORE(a, 1, v);
     check_store(a, 1);
     g_mem[a] = static_cast<uint8_t>(v);
 }
 inline void st16(uint32_t a, uint32_t v) {
+    QILIN_HW_STORE(a, 2, v);
     check_store(a, 2);
     const auto b = static_cast<uint16_t>(v);
     std::memcpy(g_mem + a, &b, 2);
 }
 inline void st32(uint32_t a, uint32_t v) {
+    QILIN_HW_STORE(a, 4, v);
     check_store(a, 4);
     std::memcpy(g_mem + a, &v, 4);
 }
@@ -204,25 +291,35 @@ inline void set64(uint32_t* bank, unsigned n, uint64_t v) {
 // 64-bit fmov between memory and a register pair (DRn or XDn). On the
 // hardware the even register goes at the lower address; the compiler lays
 // out its double constants that way.
-inline void ld_pair(uint32_t a, uint32_t* bank, unsigned n) {
-    check(a, 8);
+// Which register of the pair is at the lower address.
 #ifdef QILIN_REFERENCE_QEMU
-    std::memcpy(&bank[n + 1], g_mem + a, 4);
-    std::memcpy(&bank[n], g_mem + a + 4, 4);
+inline constexpr unsigned kPairLow = 1;
 #else
-    std::memcpy(&bank[n], g_mem + a, 4);
-    std::memcpy(&bank[n + 1], g_mem + a + 4, 4);
+inline constexpr unsigned kPairLow = 0;
 #endif
+inline void ld_pair(uint32_t a, uint32_t* bank, unsigned n) {
+#ifdef QILIN_CHECKED_MEMORY
+    if (hardware(a, 8)) {
+        const uint32_t lo = hw_load(a, 4), hi = hw_load(a + 4, 4);
+        bank[n + kPairLow] = lo, bank[n + 1 - kPairLow] = hi;
+        return;
+    }
+#endif
+    check(a, 8);
+    std::memcpy(&bank[n + kPairLow], g_mem + a, 4);
+    std::memcpy(&bank[n + 1 - kPairLow], g_mem + a + 4, 4);
 }
 inline void st_pair(uint32_t a, const uint32_t* bank, unsigned n) {
-    check(a, 8);
-#ifdef QILIN_REFERENCE_QEMU
-    std::memcpy(g_mem + a, &bank[n + 1], 4);
-    std::memcpy(g_mem + a + 4, &bank[n], 4);
-#else
-    std::memcpy(g_mem + a, &bank[n], 4);
-    std::memcpy(g_mem + a + 4, &bank[n + 1], 4);
+#ifdef QILIN_CHECKED_MEMORY
+    if (hardware(a, 8)) {
+        hw_store(a, 4, bank[n + kPairLow]);
+        hw_store(a + 4, 4, bank[n + 1 - kPairLow]);
+        return;
+    }
 #endif
+    check_store(a, 8);
+    std::memcpy(g_mem + a, &bank[n + kPairLow], 4);
+    std::memcpy(g_mem + a + 4, &bank[n + 1 - kPairLow], 4);
 }
 
 // fipr FVm,FVn: the inner product into FR(n+3). ftrv XMTRX,FVn: the 4x4
@@ -282,6 +379,28 @@ inline void fsca(uint32_t fpul, uint32_t* bank, unsigned n) {
 
 // Loading FPSCR: the helpers above implement round to nearest with no FPU
 // exceptions enabled, which is how the game runs. Anything else stops.
+// SR as stc sr reads it, with T in a local.
+inline constexpr uint32_t kSrBits = 0x700083F3u;  // MD RB BL, FD, M Q, IMASK, S T
+inline constexpr uint32_t kSrMd = 1u << 30, kSrRb = 1u << 29, kSrFd = 1u << 15;
+inline uint32_t get_sr(const Context& c, uint32_t t) {
+#ifdef QILIN_REFERENCE_QEMU
+    // QEMU (8.2 to 11.1 at least) loses Q and M in stc sr: its gen_read_sr overwrites them.
+    return c.sr | t | c.s << 1;
+#else
+    return c.sr | t | c.s << 1 | c.q << 8 | c.m << 9;
+#endif
+}
+// ldc sr (and rte, from SSR): a change of RB swaps r0-r7 with the other bank.
+// User mode and a disabled FPU stop: the game never asks for either.
+inline void set_sr(Context& c, uint32_t v, uint32_t pc) {
+    v &= kSrBits;
+    if (!(v & kSrMd) || (v & kSrFd)) throw Stop{Stop::Unsupported, pc, v};
+    if ((v ^ c.sr) & kSrRb)
+        for (unsigned i = 0; i < 8; ++i) std::swap(c.r[i], c.rbank[i]);
+    c.t = v & 1, c.s = v >> 1 & 1, c.q = v >> 8 & 1, c.m = v >> 9 & 1;
+    c.sr = v & ~0x303u;
+}
+
 inline void lds_fpscr(uint32_t& fpscr, uint32_t v, uint32_t pc);
 
 // ---- calls ----
@@ -313,8 +432,14 @@ inline void lds_fpscr(uint32_t& fpscr, uint32_t v, uint32_t pc) {
 // pref @rN. Addresses 0xE0000000-0xE3FFFFFF are the store queues: a pref
 // there sends a queue's 32 bytes to hardware, which is the graphics layer's
 // business and isn't modelled yet. Anywhere else it is a cache hint.
+// pref of a store-queue address sends the queue to memory; the runtime will
+// do that. In the differential test it is logged as a hardware access.
 inline void pref(uint32_t addr, uint32_t pc) {
-    if ((addr & 0xFC000000u) == 0xE0000000u) throw Stop{Stop::Unsupported, pc, addr};
+    if ((addr & 0xFC000000u) != 0xE0000000u) return;
+#ifdef QILIN_CHECKED_MEMORY
+    if (g_hw_replay) return g_pc = pc, hw_log(addr, 0x200, 0);
+#endif
+    throw Stop{Stop::Unsupported, pc, addr};
 }
 
 // ---- arithmetic the lifter doesn't write inline ----

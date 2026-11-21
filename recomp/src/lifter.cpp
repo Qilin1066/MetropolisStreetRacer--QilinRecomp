@@ -73,8 +73,8 @@ public:
 
         std::string code = std::format("void {}(rt::Context& c) {{\n", fn_name(f_.start));
         for (unsigned r = 0; r < 16; ++r)
-            if (used_ >> r & 1) code += std::format("    [[maybe_unused]] uint32_t r{} = c.r[{}];\n", r, r);
-        code += "    [[maybe_unused]] uint32_t t = c.t;\n";
+            if (used_ >> r & 1) code += std::format("    QILIN_REG r{} = c.r[{}];\n", r, r);
+        code += "    QILIN_REG t = c.t;\n";
         return code + body + "}\n";
     }
 
@@ -90,7 +90,7 @@ private:
         for (const uint32_t pc : f_.insns) {
             const Insn in = cfg_.insn(pc);
             const sh4::Spec& s = sh4::spec(in.op);
-            if (s.flags & sh4::kPrivileged) throw Fail{pc, "privileged"};
+            if (in.op == Op::sleep || in.op == Op::ldtlb) throw Fail{pc, std::format("privileged: {}", s.name)};
             if (f_.slots.contains(pc)) continue;
             if (!(s.flags & sh4::kBranch) || f_.tails.contains(pc)) continue;
             if (in.op == Op::bt || in.op == Op::bf || in.op == Op::bt_s || in.op == Op::bf_s || in.op == Op::bra)
@@ -149,11 +149,11 @@ private:
     }
 
     // Write the locals back before control leaves; read them again after a call.
-    std::string sync_out() {
+    std::string sync_out() const {
         sync_ = true;
         return "QILIN_OUT ";
     }
-    std::string sync_in() {
+    std::string sync_in() const {
         sync_ = true;
         return "QILIN_IN ";
     }
@@ -313,6 +313,35 @@ private:
         case Op::clrs: return "c.s = 0;";
         case Op::sets: return "c.s = 1;";
         case Op::clrmac: return "c.mach = 0; c.macl = 0;";
+        // ---- privileged state ----
+        case Op::stc_sr: return std::format("{} = rt::get_sr(c, t);", rn);
+        case Op::stc_l_sr: return push_sys("rt::get_sr(c, t)");
+        case Op::ldc_sr: return std::format("{{ const uint32_t v = {}; {}rt::set_sr(c, v, {}); {}}}", rn, sync_out(), hex(pc), sync_in());
+        case Op::ldc_l_sr:
+            return at + std::format("{{ const uint32_t v = rt::ld32({}); {} += 4; {}rt::set_sr(c, v, {}); {}}}", rn, rn, sync_out(),
+                                    hex(pc), sync_in());
+        case Op::stc_vbr: return std::format("{} = c.vbr;", rn);
+        case Op::stc_ssr: return std::format("{} = c.ssr;", rn);
+        case Op::stc_spc: return std::format("{} = c.spc;", rn);
+        case Op::stc_sgr: return std::format("{} = c.sgr;", rn);
+        case Op::stc_dbr: return std::format("{} = c.dbr;", rn);
+        case Op::stc_bank: return std::format("{} = c.rbank[{}];", rn, in.bank());
+        case Op::ldc_vbr: return std::format("c.vbr = {};", rn);
+        case Op::ldc_ssr: return std::format("c.ssr = {};", rn);
+        case Op::ldc_spc: return std::format("c.spc = {};", rn);
+        case Op::ldc_dbr: return std::format("c.dbr = {};", rn);
+        case Op::ldc_bank: return std::format("c.rbank[{}] = {};", in.bank(), rn);
+        case Op::stc_l_vbr: return push_sys("c.vbr");
+        case Op::stc_l_ssr: return push_sys("c.ssr");
+        case Op::stc_l_spc: return push_sys("c.spc");
+        case Op::stc_l_sgr: return push_sys("c.sgr");
+        case Op::stc_l_dbr: return push_sys("c.dbr");
+        case Op::stc_l_bank: return push_sys(std::format("c.rbank[{}]", in.bank()));
+        case Op::ldc_l_vbr: return pop_sys("c.vbr");
+        case Op::ldc_l_ssr: return pop_sys("c.ssr");
+        case Op::ldc_l_spc: return pop_sys("c.spc");
+        case Op::ldc_l_dbr: return pop_sys("c.dbr");
+        case Op::ldc_l_bank: return pop_sys(std::format("c.rbank[{}]", in.bank()));
         case Op::stc_gbr: return std::format("{} = c.gbr;", rn);
         case Op::ldc_gbr: return std::format("c.gbr = {};", rn);
         case Op::stc_l_gbr: return push_sys("c.gbr");
@@ -475,6 +504,11 @@ private:
             }
             return 0;
         }
+        case Op::rte:
+            // SR comes back from SSR before the slot runs (banks included); PC from SPC.
+            body += std::format("    {{ const uint32_t ret = c.spc; {}rt::set_sr(c, c.ssr, {}); {}{}{}c.ret = ret; return; }}\n",
+                                sync_out(), hex(pc), sync_in(), slot, sync_out());
+            return 0;
         case Op::rts:
             // The return address is PR's before the slot runs.
             body += std::format("    {{ const uint32_t ret = c.pr; {}{}c.ret = ret; return; }}\n", slot, sync_out());
@@ -505,7 +539,7 @@ private:
     std::set<uint32_t> targets_;
     std::map<uint32_t, uint8_t> modes_;
     uint16_t used_ = 0, written_ = 0;
-    bool sync_ = false;
+    mutable bool sync_ = false;
 };
 
 }  // namespace

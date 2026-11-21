@@ -585,14 +585,48 @@ void test_lifter() {
     }
     // What the lifter refuses, with the reason.
     {
-        const BootFile priv = program({0x0002, 0x000B, 0x0009});  // stc sr,r0
+        const BootFile priv = program({0x001B, 0x000B, 0x0009});  // sleep
         Cfg c4(priv);
         c4.run();
         const LiftResult p = Lifter(c4).lift(c4.functions().at(B));
-        CHECK(!p.ok && p.why == "privileged");
+        CHECK(!p.ok && p.why == "privileged: sleep");
+    }
+    // Privileged state: the interrupt mask the libraries set, and rte.
+    {
+        // stc sr,r0 ; or #0xF0,r0 ; ldc r0,sr ; stc r1_bank,r2 ; rts ; nop
+        const BootFile mask = program({0x0002, 0xCBF0, 0x400E, 0x0292, 0x000B, 0x0009});
+        Cfg c5(mask);
+        c5.run();
+        const LiftResult m = Lifter(c5).lift(c5.functions().at(B));
+        CHECK(m.ok);
+        CHECK(m.code.contains("r0 = rt::get_sr(c, t);"));
+        CHECK(m.code.contains("{ const uint32_t v = r0; QILIN_OUT rt::set_sr(c, v, 0x8c010004u); QILIN_IN }"));
+        CHECK(m.code.contains("r2 = c.rbank[1];"));
+        const BootFile rte = program({0x002B, 0x0009});  // rte ; nop
+        Cfg c6(rte);
+        c6.run();
+        const LiftResult e = Lifter(c6).lift(c6.functions().at(B));
+        CHECK(e.ok && e.code.contains("const uint32_t ret = c.spc; QILIN_OUT rt::set_sr(c, c.ssr, 0x8c010000u); QILIN_IN"));
     }
 
     // ---- the helpers generated code calls ----
+    {
+        rt::Context c;
+        c.t = 1, c.q = 1;
+        CHECK(rt::get_sr(c, c.t) == 0x400001F1u);
+        for (uint32_t i = 0; i < 8; ++i) c.r[i] = i, c.rbank[i] = 100 + i;
+        rt::set_sr(c, 0x600000F2u, 0);  // RB = 1: the banks swap; T, S, Q, M from the value
+        CHECK(c.r[3] == 103 && c.rbank[3] == 3 && c.t == 0 && c.s == 1 && c.q == 0 && c.sr == 0x600000F0u);
+        rt::set_sr(c, 0x400000F0u, 0);
+        CHECK(c.r[3] == 3 && c.rbank[3] == 103);
+        bool stopped = false;
+        try {
+            rt::set_sr(c, 0x000000F0u, 0x8c010000u);  // user mode
+        } catch (const rt::Stop& stop) {
+            stopped = stop.kind == rt::Stop::Unsupported && stop.value == 0xF0u;
+        }
+        CHECK(stopped);
+    }
     uint32_t t = 1;
     CHECK(rt::addc(0xFFFFFFFFu, 0, t) == 0 && t == 1);
     CHECK(rt::addc(1, 2, t) == 4 && t == 0);
