@@ -26,6 +26,9 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
+#include <vector>
+#include <set>
 
 #include "cfg.hpp"
 
@@ -38,15 +41,29 @@ struct LiftResult {
     std::string code;      // the function's C++ definition
     uint32_t fail_at = 0;  // the instruction that stopped it
     std::string why;       // e.g. "privileged"
+    bool dynamic = false;  // lifted with the floating-point mode read at run time
+    bool any_mode = false; // ... or doesn't depend on the mode at all: callable in any mode
+    bool keeps_mode = true;  // returns in the program's mode (else an indirect call checks it after)
+    // Literals compiled as constants: (address, size). Checked builds stop on a store into one.
+    std::vector<std::pair<uint32_t, uint32_t>> folded;
 };
+
+// Whether a function is lifted with the floating-point mode read at run time:
+// its mode isn't proven everywhere.
+bool is_dynamic(const Function& f);
+// Whether it is right whatever the mode it is entered in.
+bool any_mode(const Function& f);
 
 class Lifter {
 public:
-    explicit Lifter(const Cfg& cfg) : cfg_(cfg) {}
+    explicit Lifter(const Cfg& cfg);
     LiftResult lift(const Function& f) const;
 
 private:
     const Cfg& cfg_;
+    // Words some code takes the address of with mova: a literal there may be written (hand-written
+    // code keeps variables in its pools), so it is loaded from memory, not compiled as a constant.
+    std::set<uint32_t> mova_words_;
 };
 
 }  // namespace qilin

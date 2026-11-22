@@ -10,12 +10,37 @@ namespace qilin::rt {
 extern const FnEntry g_functions[];
 extern const size_t g_function_count;
 
-void call(Context& c, uint32_t target, uint32_t from) {
+namespace {
+// The program's code is at its cached (P1) addresses. Start-up runs its cache
+// set-up through the uncached alias (P2: or 0xA0000000), as it must on the
+// console; there is no cache here, so an alias in P2 (or P0, untranslated) runs
+// the same function.
+uint32_t cached(uint32_t target) {
+    const uint32_t area = target >> 29;
+    return area == 5 || area <= 3 ? (target & 0x1FFFFFFFu) | 0x80000000u : target;
+}
+
+const FnEntry& find(uint32_t target, uint32_t from) {
     const FnEntry* end = g_functions + g_function_count;
-    const FnEntry* it = std::lower_bound(g_functions, end, target,
-                                         [](const FnEntry& e, uint32_t a) { return e.addr < a; });
-    if (it == end || it->addr != target) bad_jump(from, target);
-    it->fn(c);
+    const uint32_t a = cached(target);
+    const FnEntry* it = std::lower_bound(g_functions, end, a, [](const FnEntry& e, uint32_t x) { return e.addr < x; });
+    if (it == end || it->addr != a) bad_jump(from, target);
+    return *it;
+}
+}  // namespace
+
+// The code after an indirect call goes on in the program's mode (PR, SZ and
+// FR clear): a callee that may return in another checks it.
+void call(Context& c, uint32_t target, uint32_t from) {
+    const FnEntry& e = find(target, from);
+    e.fn(c);
+    if (!e.keeps_mode) expect_fp_mode(c.fpscr, 0, from);
+}
+
+void call_any_mode(Context& c, uint32_t target, uint32_t from) {
+    const FnEntry& e = find(target, from);
+    if (!e.any_mode) expect_fp_mode(c.fpscr, 0, from);
+    e.fn(c);
 }
 
 }  // namespace qilin::rt

@@ -483,18 +483,28 @@ void test_cfg() {
         // fschg ; fmov fr0,fr1 ; fschg ; rts ; nop
         const Function h = fp({0xF3FD, 0xF10C, 0xF3FD, 0x000B, 0x0009});
         CHECK(h.fp_modes == Modes({at(B + 0x02, all_known(kFpSz))}) && h.fp_leaks.empty() && h.changes_fp_mode);
-        // Returning with the mode changed breaks the proof for every caller.
-        CHECK(fp({0xF3FD, 0x000B, 0x0009}).fp_leaks == std::vector<uint32_t>({B + 0x02}));
+        // Returning with the mode changed: that is the function's exit mode, which its callers go on in.
+        const Function ex = fp({0xF3FD, 0x000B, 0x0009});  // fschg ; rts ; nop
+        CHECK(ex.fp_leaks.empty() && ex.fp_exit_seen && ex.fp_exit == kFpSz && ex.fp_exit_known == kFpAll);
         // So does calling out in a changed mode; after the call the mode is the entry mode again.
         const Function call = fp({0xFBFD, 0xB002, 0x0009, 0xF10C, 0x000B, 0x0009});  // frchg ; bsr ; nop ; fmov ; rts ; nop
         CHECK(call.fp_leaks == std::vector<uint32_t>({B + 0x02}));
         CHECK(call.fp_modes == Modes({at(B + 0x06, all_known(0))}));
         // A mode loaded from a register nothing is known about: unproven.
         const Function u = fp({0x446A, 0xF210, 0x000B, 0x0009});  // lds r4,fpscr ; fadd ; rts ; nop
-        CHECK(u.fp_unknown == std::vector<uint32_t>({B + 0x02}) && u.fp_leaks == std::vector<uint32_t>({B + 0x04}));
+        CHECK(u.fp_unknown == std::vector<uint32_t>({B + 0x02}) && u.fp_leaks.empty() && u.fp_exit_known == 0);
         // Saved and restored around a change: sts.l fpscr,@-r15 ; fschg ; lds.l @r15+,fpscr ; fmov ; rts ; nop
         const Function sv = fp({0x4F62, 0xF3FD, 0x4F66, 0xF10C, 0x000B, 0x0009});
         CHECK(sv.fp_modes == Modes({at(B + 0x06, all_known(0))}) && sv.fp_leaks.empty() && sv.fp_unknown.empty());
+        // A caller goes on in its callee's exit mode: bsr callee ; nop ; fmov fr0,fr2 ; rts ; nop ;
+        // callee: fschg ; rts ; nop. The fmov after the call is a 64-bit move.
+        {
+            Cfg cx(program({0xB003, 0x0009, 0xF20C, 0x000B, 0x0009, 0xF3FD, 0x000B, 0x0009}));
+            cx.run();
+            const Function& caller = cx.functions().at(B);
+            CHECK(caller.fp_modes == Modes({at(B + 0x04, all_known(kFpSz))}) && caller.fp_unknown.empty());
+            CHECK(caller.fp_exit == kFpSz && caller.fp_exit_known == kFpAll);  // and returns in it too
+        }
         // A function with no floating point has nothing to prove.
         const Function none = fp({0xE000, 0x000B, 0x0009});
         CHECK(none.fp_modes.empty() && !none.changes_fp_mode && none.fp_leaks.empty());
@@ -591,6 +601,47 @@ void test_lifter() {
         const LiftResult p = Lifter(c4).lift(c4.functions().at(B));
         CHECK(!p.ok && p.why == "privileged: sleep");
     }
+    // A branch into a delay slot: bt to the slot of the bra below; the slot runs as part of the bra,
+    // and under its own label as an ordinary instruction followed by the next.
+    // bt 8c010006 ; nop ; bra 8c01000a ; add #1,r0 (slot) ; add #2,r0 ; rts ; nop
+    {
+        const BootFile into = program({0x8901, 0x0009, 0xA001, 0x7001, 0x7002, 0x000B, 0x0009});
+        Cfg c7(into);
+        c7.run();
+        const LiftResult r = Lifter(c7).lift(c7.functions().at(B));
+        CHECK(r.ok);
+        CHECK(r.code.contains("if (t) goto L_8c010006;"));
+        CHECK(r.code.contains("r0 += 0x00000001u; goto L_8c01000a;"));
+        CHECK(r.code.contains("L_8c010006:\n    QILIN_TICK(0x8c010006u);\n    r0 += 0x00000001u;\n    r0 += 0x00000002u;\nL_8c01000a:"));
+    }
+    // A pool word the code also writes through a mova pointer (hand-written exception code keeps r0
+    // there) is loaded from memory; an ordinary literal is a constant, and recorded as folded.
+    // mova L,r0 ; mov.l r1,@r0 ; mov.l L,r2 ; rts ; nop ; nop ; L: .long 0x56781234
+    {
+        const BootFile pool = program({0xC702, 0x2012, 0xD201, 0x000B, 0x0009, 0x0009, 0x1234, 0x5678});
+        Cfg c8(pool);
+        c8.run();
+        const LiftResult r = Lifter(c8).lift(c8.functions().at(B));
+        CHECK(r.ok && r.code.contains("QILIN_PC(0x8c010004u); r2 = rt::ld32(0x8c01000cu);") && r.folded.empty());
+        const BootFile plain = program({0xD201, 0x000B, 0x0009, 0x0009, 0x1234, 0x5678});  // mov.l L,r2 ; rts ; nop
+        Cfg c9(plain);
+        c9.run();
+        const LiftResult q = Lifter(c9).lift(c9.functions().at(B));
+        CHECK(q.ok && q.code.contains("r2 = 0x56781234u;") && q.folded.size() == 1 && q.folded[0].first == B + 8);
+    }
+    // A jump to the function's own code through its uncached alias (start-up does this to set up the
+    // cache) is a branch inside the function:
+    // mova L,r0 ; mov.l K,r1 ; or r0,r1 ; jmp @r1 ; nop ; K: .long 0xA0000000 ; L: add #1,r2 ; rts ; nop
+    {
+        const BootFile alias = program({0xC703, 0xD102, 0x210B, 0x412B, 0x0009, 0x0009, 0x0000, 0xA000,
+                                        0x7201, 0x000B, 0x0009});
+        Cfg c10(alias);
+        c10.run();
+        const Function& f = c10.functions().at(B);
+        CHECK(f.jumps.size() == 1 && f.jumps.at(B + 6) == B + 0x10 && f.tails.empty());
+        const LiftResult r = Lifter(c10).lift(f);
+        CHECK(r.ok && r.code.contains("goto L_8c010010;") && r.code.contains("L_8c010010:"));
+    }
     // Privileged state: the interrupt mask the libraries set, and rte.
     {
         // stc sr,r0 ; or #0xF0,r0 ; ldc r0,sr ; stc r1_bank,r2 ; rts ; nop
@@ -610,6 +661,25 @@ void test_lifter() {
     }
 
     // ---- the helpers generated code calls ----
+    // FPSCR.RM: 1 + 0.75 ulp rounds up to nearest, down toward zero; RM 2 is reserved and stops.
+    {
+        // Operands from memory, as in lifted code (constants could be folded at compile time).
+        volatile uint32_t one = 0x3F800000u, part = 0x33C00000u;
+        uint32_t fpscr = 0x00040000u;
+        CHECK(rt::fadd(one, part) == 0x3F800001u);
+        rt::lds_fpscr(fpscr, 0x00040001u, 0);
+        CHECK(fpscr == 0x00040001u && rt::fadd(one, part) == 0x3F800000u);
+        CHECK(rt::fmul(one, part) == 0x33C00000u && rt::fdiv(one, 0x40400000u) == 0x3EAAAAAAu);  // 1/3 truncated
+        rt::lds_fpscr(fpscr, 0x00040000u, 0);
+        CHECK(rt::fadd(one, part) == 0x3F800001u && rt::fdiv(one, 0x40400000u) == 0x3EAAAAABu);
+        bool stopped = false;
+        try {
+            rt::lds_fpscr(fpscr, 0x00040002u, 0x8c010000u);
+        } catch (const rt::Stop& stop) {
+            stopped = stop.kind == rt::Stop::Unsupported;
+        }
+        CHECK(stopped && fpscr == 0x00040000u);
+    }
     {
         rt::Context c;
         c.t = 1, c.q = 1;
@@ -734,15 +804,15 @@ void test_floating_point() {
     CHECK(bank[0] == 0x3F3504F3u && bank[1] == 0x3F3504F3u);
     fsca(0x1C000, bank, 0);  // three quarters (bits above 16 ignored)
     CHECK(bank[0] == bits(-1.0f) && bank[1] == 0);
-    // Loading FPSCR: round to nearest without exceptions enabled only.
+    // Loading FPSCR: no exception enables (round to zero is tested with the helpers).
     uint32_t fpscr = 0;
     lds_fpscr(fpscr, 0x00040000u, 0);
     CHECK(fpscr == 0x00040000u);
     bool stopped = false;
     try {
-        lds_fpscr(fpscr, 0x00040001u, 0x8C010000u);  // round to zero
+        lds_fpscr(fpscr, 0x00040C00u, 0x8C010000u);  // invalid-operation and division-by-zero enables
     } catch (const Stop& stop) {
-        stopped = stop.kind == Stop::Unsupported && stop.value == 0x00040001u;
+        stopped = stop.kind == Stop::Unsupported && stop.value == 0x00040C00u;
     }
     CHECK(stopped && fpscr == 0x00040000u);
 }
@@ -783,11 +853,26 @@ void test_lifter_floating_point() {
     CHECK(vector.code.contains("rt::ftrv(c.fr[1], c.fr[0], 8);"));
     CHECK(vector.code.contains("rt::fsca(c.fpul, c.fr[0], 2);"));
     CHECK(vector.code.contains("c.fr[0][2] = rt::fmac(c.fr[0][0], c.fr[0][1], c.fr[0][2]);"));
-    // Refused: a mode the analysis can't prove, and leaving in another mode.
-    const LiftResult unknown = lift({0x446A, 0xF210, 0x000B, 0x0009});  // lds r4,fpscr ; fadd ...
-    CHECK(!unknown.ok && unknown.why == "floating-point mode not proven");
-    const LiftResult leak = lift({0xF3FD, 0x000B, 0x0009});  // fschg ; rts
-    CHECK(!leak.ok && leak.why == "leaves in a floating-point mode other than the entry mode");
+    // A mode the analysis can't prove: the mode is read at run time. lds r4,fpscr ; fadd fr1,fr2 ; rts ; nop
+    const LiftResult unknown = lift({0x446A, 0xF210, 0x000B, 0x0009});
+    CHECK(unknown.ok);
+    CHECK(unknown.code.contains("switch (c.fpscr >> 19 & 5u) { case 0u: { c.fr[0][2] = rt::fadd(c.fr[0][2], c.fr[0][1]); } break; "));
+    CHECK(unknown.code.contains("case 5u: { "));  // double precision, bank 1
+    CHECK(unknown.dynamic && !unknown.keeps_mode);
+    // Returning in another mode is no longer a refusal: fschg ; rts ; nop is lifted as it is, and
+    // marked for indirect callers to check.
+    const LiftResult leak = lift({0xF3FD, 0x000B, 0x0009});
+    CHECK(leak.ok && !leak.dynamic && !leak.keeps_mode && !leak.code.contains("expect_fp_mode"));
+    {
+        bool stopped = false;
+        try {
+            rt::expect_fp_mode(rt::kFpscrSz, 0, 0x8c010002u);
+        } catch (const rt::Stop& stop) {
+            stopped = stop.kind == rt::Stop::Unsupported;
+        }
+        CHECK(stopped);
+        rt::expect_fp_mode(rt::kFpscrSz | 0x40000u, 2, 0);  // SZ alone is mode 2: no stop
+    }
 }
 
 // ---------------------------------------------------------------- GD-ROM

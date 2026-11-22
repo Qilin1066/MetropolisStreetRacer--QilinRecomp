@@ -57,27 +57,6 @@ State meet(const State& a, const State& b) {
 // FPSCR's PR, SZ and FR are bits 19, 20 and 21: kFpPr, kFpSz, kFpFr shifted up.
 constexpr unsigned kFpscrShift = 19;
 
-// Which mode bits an instruction's meaning depends on.
-uint8_t fp_needs(const Insn& in) {
-    const sh4::Spec& s = sh4::spec(in.op);
-    if (!(s.flags & sh4::kFloat)) return 0;
-    uint8_t need = 0;
-    if (s.flags & sh4::kFpPrecision) need |= kFpPr;
-    if (s.flags & sh4::kFpSize) need |= kFpSz;
-    for (const sh4::Opnd o : s.operands) {
-        using enum sh4::Opnd;
-        if (o == FRn || o == FRm || o == FR0 || o == DRn || o == FVn || o == FVm || o == Xmtrx) need |= kFpFr;
-    }
-    // These are only defined in one precision, so PR has to be known for them too.
-    switch (in.op) {
-    case Op::fmac: case Op::fipr: case Op::ftrv: case Op::fsca: case Op::fsrra: case Op::fldi0: case Op::fldi1:
-    case Op::fcnvsd: case Op::fcnvds:
-        need |= kFpPr;
-        break;
-    default: break;
-    }
-    return need;
-}
 
 // The value PR must have for an instruction defined in one precision only: 0, 1, or -1 for either.
 int fp_required_pr(Op op) {
@@ -93,6 +72,28 @@ constexpr uint32_t kMaxPadding = 32;  // hand-written library routines are align
 bool is_padding_word(uint16_t w) { return w == 0x0000 || w == 0x0009; }
 
 }  // namespace
+
+// Which mode bits an instruction's meaning depends on.
+uint8_t fp_needs(const sh4::Insn& in) {
+    const sh4::Spec& s = sh4::spec(in.op);
+    if (!(s.flags & sh4::kFloat)) return 0;
+    uint8_t need = 0;
+    if (s.flags & sh4::kFpPrecision) need |= kFpPr;
+    if (s.flags & sh4::kFpSize) need |= kFpSz;
+    for (const sh4::Opnd o : s.operands) {
+        using enum sh4::Opnd;
+        if (o == FRn || o == FRm || o == FR0 || o == DRn || o == FVn || o == FVm || o == Xmtrx) need |= kFpFr;
+    }
+    // These are only defined in one precision, so PR has to be known for them too.
+    switch (in.op) {
+    case sh4::Op::fmac: case Op::fipr: case Op::ftrv: case Op::fsca: case Op::fsrra: case Op::fldi0: case Op::fldi1:
+    case Op::fcnvsd: case Op::fcnvds:
+        need |= kFpPr;
+        break;
+    default: break;
+    }
+    return need;
+}
 
 const char* origin_name(Origin o) {
     switch (o) {
@@ -291,6 +292,21 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
     const auto leaves = [&](uint32_t pc, const State& s, bool record) {
         if (record && (s.fp_known != kFpAll || s.fp != entry_mode_)) f.fp_leaks.push_back(pc);
     };
+    // The mode a callee returns in (the entry mode unless found otherwise).
+    const auto exit_of = [&](uint32_t target) -> std::pair<uint8_t, uint8_t> {
+        if (const auto it = fp_exits_.find(target); it != fp_exits_.end()) return it->second;
+        return {entry_mode_, kFpAll};
+    };
+    // Returning, in mode (fp, known): the function's exit mode is the meet of them all.
+    const auto exits = [&](uint8_t fp, uint8_t known, bool record) {
+        if (!record) return;
+        if (!f.fp_exit_seen) {
+            f.fp_exit = fp & known, f.fp_exit_known = known, f.fp_exit_seen = true;
+            return;
+        }
+        f.fp_exit_known = static_cast<uint8_t>(f.fp_exit_known & known & ~(f.fp_exit ^ fp));
+        f.fp_exit = static_cast<uint8_t>(f.fp_exit & f.fp_exit_known);
+    };
 
     const auto step = [&](uint32_t pc, const State& st, std::vector<Edge>& out, bool record) {
         const Insn in = insn(pc);
@@ -304,6 +320,9 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
             if (next < bound) out.push_back({next, s});
             else if (bound < boot_.end()) {
                 if (record) f.falls_into = bound;
+                leaves(pc, s, record);  // running into the next function is a tail call to it
+                const auto [fp, known] = exit_of(bound);
+                exits(fp, known, record);
             } else if (record) f.bad.push_back(pc);  // ran off the end of the image
         };
         // A branch to `t`: inside the function, or a tail call.
@@ -316,6 +335,8 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
             } else {
                 if (record) f.tails[pc] = t;
                 leaves(pc, s, record);
+                const auto [fp, known] = exit_of(t);
+                exits(fp, known, record);
             }
         };
 
@@ -343,6 +364,12 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
         // the entry mode again: every function is checked to leave it so.
         State nothing{};
         nothing.fp = entry_mode_, nothing.fp_known = kFpAll;
+        const auto after_call = [&](uint32_t target) {
+            State s = nothing;
+            const auto [fp, known] = exit_of(target);
+            s.fp = fp, s.fp_known = known;
+            return s;
+        };
         nothing.saved = after.saved, nothing.saved_known = after.saved_known, nothing.saved_valid = after.saved_valid;
         const auto constant = [&](unsigned r) { return st.has(r); };
         switch (in.op) {
@@ -360,6 +387,8 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
             if (target > pc && in_image(target) && (restores_pr(pc + 2) || restores_pr(pc - 2))) {
                 if (record) f.tails[pc] = target;
                 leaves(pc, after, record);
+                const auto [fp, known] = exit_of(target);
+                exits(fp, known, record);
             } else {
                 edge(target, after);
             }
@@ -372,7 +401,7 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
             }
             if (record) f.calls[pc] = in.branch_target(pc);
             leaves(pc, after, record);
-            fall(next, nothing);
+            fall(next, after_call(in.branch_target(pc)));
             break;
         case Op::jsr: case Op::bsrf: {
             const uint32_t target = in.op == Op::jsr ? st.value[in.n()] : pc + 4 + st.value[in.n()];
@@ -381,20 +410,30 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
                 else f.icalls.push_back(pc);
             }
             leaves(pc, after, record);
-            fall(next, nothing);
+            fall(next, constant(in.n()) && in_image(target) ? after_call(target) : nothing);
             break;
         }
         case Op::jmp: case Op::braf: {
-            const uint32_t target = in.op == Op::jmp ? st.value[in.n()] : pc + 4 + st.value[in.n()];
+            uint32_t target = in.op == Op::jmp ? st.value[in.n()] : pc + 4 + st.value[in.n()];
+            // An uncached (P2) alias of the program's own code: start-up switches to it to set up
+            // the cache. It is the same code.
+            const bool uncached = constant(in.n()) && (target >> 29) == 5 && in_image((target & 0x1FFFFFFFu) | 0x80000000u);
+            if (uncached) target = (target & 0x1FFFFFFFu) | 0x80000000u;
             JumpTable table;
             if (constant(in.n()) && in_image(target)) {
                 // A compiler branches inside a function with bra, bt and bf;
                 // a jump through a constant is a tail call, unless it goes
-                // back into code this function has already been through.
-                if (target >= start && target < pc) edge(target, after);
+                // back into code this function has already been through, or to
+                // this function's own code uncached.
+                if (target >= start && (target < pc || (uncached && target < bound))) {
+                    edge(target, after);
+                    if (record) f.jumps[pc] = target;
+                }
                 else {
                     if (record) f.tails[pc] = target;
                     leaves(pc, after, record);
+                    const auto [fp, known] = exit_of(target);
+                    exits(fp, known, record);
                 }
             } else if (in.op == Op::braf && !constant(in.n()) && resolve_table(pc, table)) {
                 State s = after;
@@ -404,12 +443,13 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
             } else {
                 if (record) f.itails.push_back(pc);
                 leaves(pc, after, record);
+                exits(entry_mode_, kFpAll, record);
             }
             break;
         }
         case Op::rts:
             if (record) f.returns = true;
-            leaves(pc, after, record);
+            exits(after.fp, after.fp_known, record);
             break;
         case Op::rte:  // an interrupt returns to whatever mode it interrupted
             if (record) f.returns = true;
@@ -735,6 +775,27 @@ void Cfg::run() {
     // its bound; explore_all has redone those. Starts with no function left
     // can't happen: every start is explored.
     find_suspects();
+    settle_fp_exits();
+}
+
+// Exit modes to a fixed point: explore every function again with its callees'
+// exit modes until none changes. A function whose exit mode isn't fully known
+// leaves its callers' modes unknown after the call (they are then lifted with
+// the mode read at run time).
+void Cfg::settle_fp_exits() {
+    for (int round = 0; round < 16; ++round) {
+        std::map<uint32_t, std::pair<uint8_t, uint8_t>> exits;
+        for (const auto& [start, f] : funcs_)
+            if (f.fp_exit_seen && (f.fp_exit_known != kFpAll || f.fp_exit != entry_mode_))
+                exits[start] = {f.fp_exit, f.fp_exit_known};
+        if (exits == fp_exits_) return;
+        fp_exits_ = std::move(exits);
+        for (auto& [start, f] : funcs_) {
+            const Origin origin = f.origin;  // explore doesn't know how a start was found
+            f = explore(start, f.bound);
+            f.origin = origin;
+        }
+    }
 }
 
 FpSummary Cfg::fp_summary() const {

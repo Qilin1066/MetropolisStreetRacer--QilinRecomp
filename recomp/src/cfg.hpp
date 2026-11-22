@@ -98,6 +98,7 @@ struct Function {
     std::vector<uint32_t> icalls;   // jsr/bsrf through a register that isn't constant: indirect calls
     std::vector<uint32_t> itails;   // jmp/braf likewise: indirect tail calls, or a jump table not recognised
     std::vector<JumpTable> jtabs;
+    std::map<uint32_t, uint32_t> jumps;  // constant jmp/braf followed inside the function: pc -> target (cached)
     std::vector<uint32_t> bad;      // reached a word that isn't an instruction, or left the image
     std::vector<uint32_t> bad_slots;      // delayed branches whose slot is missing or illegal there
     std::vector<uint32_t> slot_targets;   // delay slots that something branches to
@@ -106,7 +107,11 @@ struct Function {
     std::vector<std::pair<uint32_t, uint8_t>> fp_modes;  // mode-dependent instruction -> bits | known bits << 4
     std::vector<uint32_t> fp_unknown;  // ... where a bit its meaning depends on isn't proven
     std::vector<uint32_t> fp_wrong;    // ... defined in one precision only, reached in the other
-    std::vector<uint32_t> fp_leaks;    // calls, tail calls and returns made in a mode other than the entry mode
+    std::vector<uint32_t> fp_leaks;    // calls and tail calls made in a mode other than the entry mode
+    // The mode it returns in (the meet over its returns and tail calls): bits | known bits << 4.
+    // Callers go on in it after a direct call; most functions return in the entry mode.
+    uint8_t fp_exit = 0, fp_exit_known = 0;
+    bool fp_exit_seen = false;
     bool changes_fp_mode = false;      // writes FPSCR, or has fschg or frchg
     bool returns = false;           // some path ends in rts or rte
     uint32_t bytes() const { return 2 * static_cast<uint32_t>(insns.size()); }
@@ -148,12 +153,16 @@ struct FpSummary {
 // so reports are identical on every host.
 std::string percent(uint64_t part, uint64_t whole, int decimals);
 
+// Which of PR, SZ and FR an instruction's meaning depends on (kFpPr | kFpSz | kFpFr).
+uint8_t fp_needs(const sh4::Insn& in);
+
 class Cfg {
 public:
     explicit Cfg(const BootFile& boot);
     void run();
 
     const BootFile& boot() const { return boot_; }
+    uint8_t entry_mode() const { return entry_mode_; }  // the floating-point mode every function is entered with
     const std::map<uint32_t, Function>& functions() const { return funcs_; }
     const std::vector<Suspect>& suspects() const { return suspects_; }
     const std::vector<uint32_t>& rejected() const { return rejected_; }  // weak candidates that weren't clean
@@ -191,6 +200,10 @@ private:
 
     const BootFile& boot_;
     uint8_t entry_mode_ = 0;             // FPSCR.PR, SZ, FR every function is entered with
+    // Each function's exit mode, as explore found it last (start -> bits, known bits): callers go on
+    // in it after a direct call. Settled by run(), to a fixed point.
+    std::map<uint32_t, std::pair<uint8_t, uint8_t>> fp_exits_;
+    void settle_fp_exits();
     std::vector<sh4::Insn> decoded_;     // one per word of the image
     std::map<uint32_t, Origin> starts_;  // every known function start
     std::map<uint32_t, Function> funcs_;

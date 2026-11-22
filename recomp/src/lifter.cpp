@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <format>
+#include <optional>
 #include <map>
 #include <set>
 
@@ -41,7 +42,8 @@ uint16_t gpr_uses(const Insn& in) {
 // One function being lifted.
 class Emit {
 public:
-    Emit(const Cfg& cfg, const Function& f) : cfg_(cfg), f_(f) {
+    Emit(const Cfg& cfg, const Function& f, const std::set<uint32_t>& mova_words)
+        : cfg_(cfg), f_(f), mova_words_(mova_words) {
         for (const auto& [pc, mode] : f.fp_modes) modes_[pc] = mode;
     }
 
@@ -50,9 +52,24 @@ public:
         std::string body;
         uint32_t expected = f_.start;  // where straight-line execution is, or 0 after a jump away
         for (const uint32_t pc : f_.insns) {
-            if (f_.slots.contains(pc)) continue;  // emitted with its branch
+            if (f_.slots.contains(pc)) {
+                if (!slot_target(pc)) continue;  // emitted with its branch
+                // Also reached by a branch to it: here it is an ordinary instruction, followed by the next.
+                const uint32_t after = pc + 2;
+                if (expected) {  // the path running into it has run the slot already, with its branch
+                    body += std::format("    goto {};\n", label(after));
+                    targets_.insert(after);
+                }
+                body += std::format("{}:\n    QILIN_TICK({});\n", label(pc), hex(pc));
+                const Insn in = cfg_.insn(pc);
+                used_ |= gpr_uses(in);
+                written_ |= sh4::gpr_writes(in);
+                if (const std::string code = fp_statement(in, pc); code != ";") body += "    " + code + "\n";
+                expected = after;
+                continue;
+            }
             if (expected && expected != pc) throw Fail{pc, "internal: execution falls into bytes that aren't reached code"};
-            if (targets_.contains(pc)) body += std::format("{}:\n", label(pc));
+            if (targets_.contains(pc)) body += std::format("{}:\n    QILIN_TICK({});\n", label(pc), hex(pc));
             else if (!expected) throw Fail{pc, "internal: code with no way in"};
             const Insn in = cfg_.insn(pc);
             used_ |= gpr_uses(in);
@@ -60,13 +77,13 @@ public:
             if (sh4::spec(in.op).flags & sh4::kBranch) {
                 expected = branch(body, in, pc);
             } else {
-                if (const std::string code = statement(in, pc); code != ";") body += "    " + code + "\n";
+                if (const std::string code = fp_statement(in, pc); code != ";") body += "    " + code + "\n";
                 expected = pc + 2;
             }
             if (expected && !std::ranges::binary_search(f_.insns, expected)) {
                 // Straight on leaves the function: only into the next one.
                 if (expected != f_.falls_into) throw Fail{pc, "internal: execution runs off the function"};
-                body += std::format("    {}{}(c);\n    return;\n", sync_out(), fn_name(expected));
+                body += std::format("    {}{}{}(c);\n    return;\n", mode_check_out(pc, expected), sync_out(), fn_name(expected));
                 expected = 0;
             }
         }
@@ -75,18 +92,20 @@ public:
         for (unsigned r = 0; r < 16; ++r)
             if (used_ >> r & 1) code += std::format("    QILIN_REG r{} = c.r[{}];\n", r, r);
         code += "    QILIN_REG t = c.t;\n";
+
         return code + body + "}\n";
     }
 
 private:
     // What this slice can't lift at all, and the branch targets that need labels.
     void check_function() {
-        if (!f_.fp_unknown.empty()) throw Fail{f_.fp_unknown[0], "floating-point mode not proven"};
-        if (!f_.fp_wrong.empty()) throw Fail{f_.fp_wrong[0], "floating-point instruction in the wrong precision"};
-        if (!f_.fp_leaks.empty()) throw Fail{f_.fp_leaks[0], "leaves in a floating-point mode other than the entry mode"};
+        // A function whose floating-point mode isn't proven everywhere is lifted with the mode read
+        // at run time (see fp_statement), and checks it where it calls out or returns.
+        dynamic_ = is_dynamic(f_);
         if (!f_.bad.empty()) throw Fail{f_.bad[0], "reaches a word that isn't an instruction"};
         if (!f_.bad_slots.empty()) throw Fail{f_.bad_slots[0], "a delayed branch without a legal delay slot"};
-        if (!f_.slot_targets.empty()) throw Fail{f_.slot_targets[0], "a branch into a delay slot"};
+        // A branch into a delay slot (hand-written code does this): the slot's instruction is
+        // emitted twice, as the slot and, under a label, as an ordinary instruction.
         for (const uint32_t pc : f_.insns) {
             const Insn in = cfg_.insn(pc);
             const sh4::Spec& s = sh4::spec(in.op);
@@ -101,13 +120,18 @@ private:
         for (const uint32_t pc : f_.insns) {
             const Insn in = cfg_.insn(pc);
             if ((in.op == Op::jmp || in.op == Op::braf) && !f_.slots.contains(pc) && !f_.tails.contains(pc) &&
-                !std::ranges::binary_search(f_.itails, pc) && !table_at(pc))
-                throw Fail{pc, "a constant jump inside the function (not lifted yet)"};
+                !std::ranges::binary_search(f_.itails, pc) && !table_at(pc)) {
+                const auto j = f_.jumps.find(pc);
+                if (j == f_.jumps.end()) throw Fail{pc, "internal: a jump inside the function with no target"};
+                targets_.insert(j->second);
+            }
         }
         for (const uint32_t t : targets_)
-            if (!std::ranges::binary_search(f_.insns, t) || f_.slots.contains(t))
+            if (!std::ranges::binary_search(f_.insns, t) || (f_.slots.contains(t) && !slot_target(t)))
                 throw Fail{t, "internal: a branch target that isn't an instruction of the function"};
     }
+
+    bool slot_target(uint32_t pc) const { return std::ranges::find(f_.slot_targets, pc) != f_.slot_targets.end(); }
 
     const JumpTable* table_at(uint32_t pc) const {
         for (const JumpTable& t : f_.jtabs)
@@ -119,6 +143,7 @@ private:
 
     // The floating-point mode the analysis proved at `pc`.
     uint8_t mode(uint32_t pc) const {
+        if (forced_) return *forced_;
         const auto it = modes_.find(pc);
         if (it == modes_.end()) throw Fail{pc, "internal: no floating-point mode recorded"};
         return it->second;
@@ -164,6 +189,37 @@ private:
         return fn_name(target);
     }
 
+    // In a function lifted with the mode read at run time, a mode-dependent
+    // instruction becomes a switch on FPSCR's bits it depends on, one case
+    // per meaning; a meaning the SH-4 doesn't define stops.
+    std::string fp_statement(const Insn& in, uint32_t pc) const {
+        const uint8_t need = fp_needs(in);
+        if (!dynamic_ || !need) return statement(in, pc);
+        std::map<uint8_t, std::string> cases;
+        for (uint8_t m = 0; m <= kFpAll; ++m) {
+            if (m & ~need) continue;
+            forced_ = m;
+            try {
+                cases[m] = statement(in, pc);
+            } catch (const Fail&) {
+                cases[m] = std::format("rt::fp_mode_stop({}, c.fpscr);", hex(pc));
+            }
+            forced_.reset();
+        }
+        std::string code = std::format("switch (c.fpscr >> 19 & {}u) {{ ", need);
+        for (const auto& [m, text] : cases) code += std::format("case {}u: {{ {} }} break; ", m, text);
+        return code + "}";
+    }
+    // Where a function lifted with the mode read at run time calls out, the
+    // program's mode must hold (the callee was proven for it). Its returns need
+    // no check: callers go on in its analysed exit mode, unknown if need be.
+    std::string mode_check_out(uint32_t pc, uint32_t target) const {
+        if (!dynamic_) return {};
+        if (const auto it = cfg_.functions().find(target); it != cfg_.functions().end() && any_mode(it->second)) return {};
+        return std::format("rt::expect_fp_mode(c.fpscr, {}u, {}); ", cfg_.entry_mode(), hex(pc));
+    }
+
+
     // An instruction that isn't a branch, as one C++ statement (or a block).
     std::string statement(const Insn& in, uint32_t pc) const {
         const std::string rn = r(in.n()), rm = r(in.m());
@@ -172,6 +228,9 @@ private:
         const auto literal = [&](unsigned size) {
             const uint32_t a = in.pc_address(pc);
             if (!cfg_.boot().mapped(a, size)) throw Fail{pc, "a literal outside the image"};
+            if (mova_words_.contains(a & ~3u))  // a pool word code may write through a pointer
+                return std::format("rt::{}({})", size == 2 ? "ld16s" : "ld32", hex(a));
+            folded_.emplace_back(a, size);
             return hex(size == 2 ? static_cast<uint32_t>(static_cast<int16_t>(cfg_.boot().u16(a))) : cfg_.boot().u32(a));
         };
         // Loads that post-increment the address register, unless it is also the destination.
@@ -192,8 +251,10 @@ private:
         // ---- moves ----
         case Op::mov: return std::format("{} = {};", rn, rm);
         case Op::mov_imm: return std::format("{} = {};", rn, simm);
-        case Op::mov_w_pc: return std::format("{} = {};", rn, literal(2));
-        case Op::mov_l_pc: return std::format("{} = {};", rn, literal(4));
+        case Op::mov_w_pc: case Op::mov_l_pc: {
+            const std::string value = literal(in.op == Op::mov_w_pc ? 2 : 4);
+            return (value.starts_with("rt::") ? at : std::string{}) + std::format("{} = {};", rn, value);
+        }
         case Op::mova: return std::format("r0 = {};", hex(in.pc_address(pc)));
         case Op::mov_b_store: return at + std::format("rt::st8({}, {});", rn, rm);
         case Op::mov_w_store: return at + std::format("rt::st16({}, {});", rn, rm);
@@ -449,14 +510,16 @@ private:
             const Insn s = cfg_.insn(pc + 2);
             used_ |= gpr_uses(s);
             written_ |= sh4::gpr_writes(s);
-            slot = statement(s, pc + 2) + " ";
+            slot = fp_statement(s, pc + 2) + " ";
             if (slot == "; ") slot.clear();  // a nop
         }
         const uint32_t next = pc + (delayed ? 4 : 2);
         const std::string rn = r(in.n());
         const auto tail = f_.tails.find(pc);
         // Leave for another function and return what it returns.
-        const auto leave = [&](uint32_t target) { return std::format("{}{}(c); return;", sync_out(), callee(pc, target)); };
+        const auto leave = [&](uint32_t target) {
+            return std::format("{}{}{}(c); return;", mode_check_out(pc, target), sync_out(), callee(pc, target));
+        };
         switch (in.op) {
         case Op::bt: case Op::bf: case Op::bt_s: case Op::bf_s: {
             const char* cond = in.op == Op::bt || in.op == Op::bt_s ? "t" : "!t";
@@ -480,15 +543,21 @@ private:
                 body += in.op == Op::jsr ? std::format("const uint32_t target = {}; ", rn)
                                          : std::format("const uint32_t target = {} + {}; ", hex(pc + 4), rn);
             }
-            body += std::format("c.pr = {}; {}{}", ret, slot, sync_out());
+            // An indirect call checks the callee's needs itself (rt::call_any_mode).
+            body += std::format("c.pr = {}; {}{}{}", ret, slot,
+                                direct != f_.calls.end() ? mode_check_out(pc, direct->second) : std::string{}, sync_out());
             if (direct != f_.calls.end()) body += std::format("{}(c); ", callee(pc, direct->second));
-            else body += std::format("rt::call(c, target, {}); ", hex(pc));
+            else body += std::format("rt::call{}(c, target, {}); ", dynamic_ ? "_any_mode" : "", hex(pc));
             body += std::format("rt::returned_to(c, {}, {}); {}}}\n", ret, hex(pc), sync_in());
             return next;
         }
         case Op::jmp: case Op::braf: {
             if (tail != f_.tails.end()) {
                 body += std::format("    {}{}\n", slot, leave(tail->second));
+                return 0;
+            }
+            if (const auto j = f_.jumps.find(pc); j != f_.jumps.end()) {  // a constant jump inside the function
+                body += std::format("    {}goto {};\n", slot, label(j->second));
                 return 0;
             }
             const std::string target = in.op == Op::jmp ? rn : std::format("{} + {}", hex(pc + 4), rn);
@@ -500,7 +569,8 @@ private:
                 body += std::format("default: rt::bad_jump({}, target); }} }}\n", hex(pc));
             } else {
                 // Through a register nothing is known about: another function, by the table.
-                body += std::format("{}rt::call(c, target, {}); return; }}\n", sync_out(), hex(pc));
+                body += std::format("{}rt::call{}(c, target, {}); return; }}\n", sync_out(), dynamic_ ? "_any_mode" : "",
+                                    hex(pc));
             }
             return 0;
         }
@@ -532,6 +602,8 @@ public:
         return o + " c.t = t;\n" + i + " t = c.t;\n";
     }
     bool synced() const { return sync_; }
+    bool dynamic() const { return dynamic_; }
+    const std::vector<std::pair<uint32_t, uint32_t>>& folded() const { return folded_; }
 
 private:
     const Cfg& cfg_;
@@ -540,18 +612,49 @@ private:
     std::map<uint32_t, uint8_t> modes_;
     uint16_t used_ = 0, written_ = 0;
     mutable bool sync_ = false;
+    bool dynamic_ = false;                 // the floating-point mode is read at run time
+    mutable std::optional<uint8_t> forced_;  // the mode fp_statement is lifting for
+    const std::set<uint32_t>& mova_words_;
+    mutable std::vector<std::pair<uint32_t, uint32_t>> folded_;
 };
 
 }  // namespace
 
 std::string fn_name(uint32_t addr) { return std::format("fn_{:08x}", addr); }
 
+bool is_dynamic(const Function& f) { return !f.fp_unknown.empty() || !f.fp_wrong.empty() || !f.fp_leaks.empty(); }
+
+bool any_mode(const Function& f) {
+    // Lifted with the mode read at run time, or a leaf with no mode-dependent instruction: right in any mode.
+    return is_dynamic(f) ||
+           (f.fp_modes.empty() && f.calls.empty() && f.tails.empty() && f.icalls.empty() && f.itails.empty() && !f.falls_into);
+}
+
+Lifter::Lifter(const Cfg& cfg) : cfg_(cfg) {
+    // Pool words code may write: one a mova points at, or one whose address is itself a constant in
+    // some pool (cached or uncached alias), as the libraries' handler table is (0x8C130B24).
+    std::set<uint32_t> pool;
+    for (const auto& [start, f] : cfg.functions()) {
+        for (const uint32_t a : f.movas) mova_words_.insert(a & ~3u);
+        for (const auto& [a, size] : f.literals) pool.insert(a & ~3u);
+    }
+    for (const uint32_t a : pool) {
+        if (!cfg.boot().mapped(a, 4)) continue;
+        const uint32_t v = cfg.boot().u32(a), cached = (v & 0x1FFFFFFFu) | 0x80000000u;
+        if (pool.contains(cached & ~3u)) mova_words_.insert(cached & ~3u);
+    }
+}
+
 LiftResult Lifter::lift(const Function& f) const {
     LiftResult result;
     try {
-        Emit emit(cfg_, f);
+        Emit emit(cfg_, f, mova_words_);
         const std::string code = emit.run();
         result.code = emit.sync_macros() + code;
+        result.dynamic = emit.dynamic();
+        result.any_mode = any_mode(f);
+        result.folded = emit.folded();
+        result.keeps_mode = f.fp_exit_known == kFpAll && f.fp_exit == cfg_.entry_mode();
         if (emit.synced()) result.code += "#undef QILIN_OUT\n#undef QILIN_IN\n";
         result.ok = true;
     } catch (const Fail& fail) {

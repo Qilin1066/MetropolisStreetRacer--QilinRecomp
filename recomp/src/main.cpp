@@ -32,6 +32,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <optional>
 #include <print>
 #include <span>
@@ -359,6 +360,7 @@ int cmd_lift(const Args& a) {
                                     "extern const FnEntry g_functions[] = {{\n", kHead);
     std::string stubs = std::format("{}#include \"functions.hpp\"\nnamespace qilin::gen {{\n", kHead);
     std::string chunk, report;
+    std::set<std::pair<uint32_t, uint32_t>> folded;  // literals compiled as constants
     std::map<std::string, size_t> reasons;
     size_t lifted = 0, in_chunk = 0, chunks = 0, instructions = 0;
     const auto flush = [&] {
@@ -371,9 +373,11 @@ int cmd_lift(const Args& a) {
     for (const auto& [start, f] : cfg.functions()) {
         const std::string name = fn_name(start);
         decls += std::format("void {}(rt::Context& c);\n", name);
-        table += std::format("    {{0x{:08x}u, gen::{}}},\n", start, name);
         const LiftResult result = lifter.lift(f);
+        table += std::format("    {{0x{:08x}u, gen::{}, {}, {}}},\n", start, name, result.any_mode ? "true" : "false",
+                             result.keeps_mode || !result.ok ? "true" : "false");
         if (result.ok) {
+            folded.insert(result.folded.begin(), result.folded.end());
             chunk += result.code + "\n";
             ++lifted;
             instructions += f.insns.size();
@@ -391,6 +395,11 @@ int cmd_lift(const Args& a) {
                table + std::format("}};\nextern const size_t g_function_count = {};\n}}  // namespace qilin::rt\n",
                                    cfg.functions().size()));
     write_text((dir / "stubs.cpp").string(), stubs + "}  // namespace qilin::gen\n");
+    // The literals compiled as constants, sorted: checked builds stop on a store into one.
+    std::string lits = std::format("{}#include \"guest.hpp\"\nnamespace qilin::rt {{\nextern const Region g_folded[] = {{\n", kHead);
+    for (const auto& [addr, size] : folded) lits += std::format("    {{0x{:08x}u, 0x{:08x}u}},\n", addr, addr + size);
+    write_text((dir / "literals.cpp").string(),
+               lits + std::format("}};\nextern const size_t g_folded_count = {};\n}}  // namespace qilin::rt\n", folded.size()));
     write_text((dir / "lift_report.txt").string(), report);
 
     const size_t total = cfg.functions().size();
@@ -410,7 +419,7 @@ int cmd_fpmode(const Args& a) {
     std::println("{} functions use floating point; {} change the mode", t.functions, t.changers);
     std::println("{} mode-dependent instructions: {} with the mode unproven, {} in the wrong precision", t.instructions,
                  t.unknown, t.wrong);
-    std::println("{} calls, jumps and returns made in a mode other than the entry mode", t.leaks);
+    std::println("{} calls and jumps made in a mode other than the entry mode", t.leaks);
     std::println("{} functions with any of these", t.unproven_functions);
     if (a.list)
         for (const auto& [start, f] : cfg.functions()) {
@@ -419,7 +428,13 @@ int cmd_fpmode(const Args& a) {
             for (const uint32_t pc : f.fp_wrong)
                 std::println("{:08x} wrong precision at {:08x}: {}", start, pc, sh4::disasm(cfg.insn(pc), pc));
             for (const uint32_t pc : f.fp_leaks)
-                std::println("{:08x} leaves in another mode at {:08x}: {}", start, pc, sh4::disasm(cfg.insn(pc), pc));
+                std::println("{:08x} calls out in another mode at {:08x}: {}", start, pc, sh4::disasm(cfg.insn(pc), pc));
+            if (f.fp_exit_seen && (f.fp_exit_known != kFpAll || f.fp_exit != cfg.entry_mode())) {
+                std::string mode;
+                for (const auto& [bit, name] : {std::pair{kFpPr, "PR"}, std::pair{kFpSz, "SZ"}, std::pair{kFpFr, "FR"}})
+                    mode += std::format(" {}={}", name, !(f.fp_exit_known & bit) ? "?" : (f.fp_exit & bit) ? "1" : "0");
+                std::println("{:08x} returns in another mode:{}", start, mode);
+            }
         }
     return t.unproven_functions ? 3 : 0;
 }

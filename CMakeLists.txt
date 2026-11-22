@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(MetropolisStreetRacerQilinRecomp VERSION 0.8.0 LANGUAGES CXX)
+project(MetropolisStreetRacerQilinRecomp VERSION 0.9.0 LANGUAGES CXX)
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -87,7 +87,8 @@ target_include_directories(qilin_runtime INTERFACE recomp/runtime)
 if(MSVC)
     target_compile_options(qilin_runtime INTERFACE /fp:precise)
 else()
-    target_compile_options(qilin_runtime INTERFACE -ffp-contract=off -fno-fast-math)
+    # -frounding-math: FPSCR.RM changes the host's rounding mode at run time (rt::set_rounding).
+    target_compile_options(qilin_runtime INTERFACE -ffp-contract=off -fno-fast-math -frounding-math)
 endif()
 
 # ---- Lifted code (optional): the output of `qilin lift`, which is derived
@@ -107,6 +108,10 @@ if(QILIN_GEN_DIR)
     add_executable(qilin_difftest tools/difftest/harness.cpp)
     target_link_libraries(qilin_difftest PRIVATE qilin_gen_checked qilin_disc qilin_warnings)
     qilin_tool(qilin_difftest)
+    if(MSVC)
+        # The checked runtime stops guest recursion at 4 MiB of host stack; Windows gives 1 MiB by default.
+        target_link_options(qilin_difftest PRIVATE /STACK:16777216)
+    endif()
 endif()
 
 # ---- Tests (no game files needed) ----

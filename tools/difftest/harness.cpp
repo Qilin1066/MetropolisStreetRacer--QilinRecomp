@@ -7,9 +7,12 @@
 // Guest memory is the Dreamcast's RAM (16 MiB at 0x8C000000) holding the
 // program at 0x8C010000, as in the QEMU run; anything else stops with a
 // memory fault (checked memory). All integers are little-endian u32.
+// A case whose fn is 0xFFFFFFFF asks for an instruction's model instead: op, FPSCR (1 fipr: FVm then FVn;
+// 2 ftrv: XMTRX then FVn; 3 fsca: FPUL; 4 fsrra: FRn), its inputs; the reply is 4 words.
 //   case:   fn, r0..r15, pr, gbr, mach, macl, t, s, q, m, fpul, fpscr, fr[0][0..15], fr[1][0..15],
 //           sr (without T S Q M), vbr, ssr, spc, rbank[0..7], a seed for hardware loads,
 //           words to treat as hardware: count (at most 8 are used), count x addr,
+//           a hardware access to stop at (0: none; for finding where the two sides part),
 //           n, then n x (addr, len, bytes) written over the image
 //   result: status (0 = returned, else 1 + rt::Stop::Kind), stop pc, stop value,
 //           the last 64 loads, oldest first: 64 x (addr, value, size) (unused entries 0, 0, 0),
@@ -52,6 +55,8 @@ void write_u32(uint32_t v) { std::fwrite(&v, 4, 1, stdout); }
 
 }  // namespace
 
+constexpr uint32_t kEvaluate = 0xFFFFFFFFu;
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         std::println(stderr, "usage: qilin_difftest <MSR.BIN>");
@@ -82,6 +87,23 @@ int main(int argc, char** argv) {
     uint8_t* ram = rt::g_mem + kRamBase;
 
     for (uint32_t fn; read_u32(fn);) {
+        if (fn == kEvaluate) {
+            // The runtime's model of an instruction QEMU can't run, for the reference side.
+            uint32_t op = 0, fpscr = 0, in[20] = {}, out[4] = {};
+            read_u32(op), read_u32(fpscr);
+            rt::set_rounding(fpscr);  // the original's rounding mode at that point
+            const unsigned inputs = op == 1 ? 8 : op == 2 ? 20 : 1;
+            for (unsigned i = 0; i < inputs; ++i) read_u32(in[i]);
+            if (op == 1) out[0] = rt::fipr(in, 0, 4);
+            else if (op == 2) {
+                std::memcpy(out, in + 16, 16);
+                rt::ftrv(in, out, 0);
+            } else if (op == 3) rt::fsca(in[0], out, 0);
+            else out[0] = rt::fsrra(in[0]);
+            for (const uint32_t v : out) write_u32(v);
+            std::fflush(stdout);
+            continue;
+        }
         rt::Context c;
         for (uint32_t& r : c.r) read_u32(r);
         read_u32(c.pr), read_u32(c.gbr), read_u32(c.mach), read_u32(c.macl);
@@ -103,6 +125,9 @@ int main(int argc, char** argv) {
             read_u32(a);
             if (i < 8) rt::g_volatile[i] = a & ~3u;
         }
+        uint32_t limit = 0;
+        read_u32(limit);
+        rt::g_hw_limit = limit && limit < rt::kHwLog ? limit : rt::kHwLog;
         initial = baseline;
         uint32_t writes = 0;
         read_u32(writes);
@@ -121,8 +146,13 @@ int main(int argc, char** argv) {
 
         uint32_t status = 0, pc = 0, value = 0;
         rt::g_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+        rt::set_rounding(c.fpscr);
+        const char stack_base = 0;
+        rt::g_stack_base = &stack_base;
         try {
-            rt::call(c, fn, 0);
+            // Not rt::call: the test compares whatever mode the function returns in; rt::call would stop
+            // after one that returns in another mode (its callers here are the test).
+            rt::call_any_mode(c, fn, 0);
         } catch (const rt::Stop& s) {
             status = 1 + s.kind;
             pc = s.pc;

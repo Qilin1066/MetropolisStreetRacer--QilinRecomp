@@ -6,6 +6,7 @@
 #pragma once
 
 #include <bit>
+#include <cfenv>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -14,6 +15,9 @@
 #include <utility>
 #include <initializer_list>
 #include <numbers>
+#ifdef _MSC_VER
+#pragma fenv_access(on)  // FPSCR.RM sets the host's rounding mode (set_rounding)
+#endif
 
 namespace qilin::rt {
 
@@ -38,7 +42,7 @@ struct Context {
 // Thrown, so the runtime can name it and its caller, and the differential
 // test can compare it.
 struct Stop {
-    enum Kind : uint32_t { Memory, BadJump, BadReturn, Trap, NotLifted, Unsupported, HardwareLog, TooLong } kind;
+    enum Kind : uint32_t { Memory, BadJump, BadReturn, Trap, NotLifted, Unsupported, HardwareLog, TooLong, TooDeep, LiteralStore } kind;
     uint32_t pc;     // guest address of the instruction (or function)
     uint32_t value;  // the address involved
 };
@@ -58,8 +62,14 @@ inline uint32_t g_pc = 0;  // set by checked code before each access, for the re
 // on (a loop waiting for an interrupt, say) stops with its state intact.
 inline uint64_t g_accesses = 0;
 inline std::chrono::steady_clock::time_point g_deadline = std::chrono::steady_clock::time_point::max();
+// And a limit on the host stack: guest recursion that doesn't end (a cycle
+// in a structure the test made up) stops before it overflows the host's.
+inline const char* g_stack_base = nullptr;
+inline constexpr std::ptrdiff_t kStackLimit = 4 << 20;
 inline void count_access(uint32_t a) {
     if ((++g_accesses & 0xFFFFF) == 0 && std::chrono::steady_clock::now() > g_deadline) throw Stop{Stop::TooLong, g_pc, a};
+    const char probe = 0;
+    if (g_stack_base && g_stack_base - &probe > kStackLimit) throw Stop{Stop::TooDeep, g_pc, a};
 }
 // Words the test treats as hardware although they are RAM: ones a loop polls
 // that only an interrupt would change.
@@ -87,6 +97,7 @@ struct HwAccess {
 inline constexpr unsigned kHwLog = 4096;
 inline HwAccess g_hw_log[kHwLog] = {};
 inline unsigned g_hw_count = 0;
+inline unsigned g_hw_limit = kHwLog;  // the test can stop the lifted code at an earlier access
 inline bool g_hw_replay = false;
 inline uint64_t g_hw_state = 0;
 inline bool is_hardware(uint32_t a) {
@@ -106,8 +117,11 @@ inline bool is_volatile(uint32_t a) {
 inline bool hardware(uint32_t a, uint32_t n) {
     return g_hw_replay && !(a & (n - 1)) && (is_hardware(a) || (g_volatile_count && is_volatile(a)));
 }
+inline void hw_room(unsigned entries, uint32_t a) {
+    if (g_hw_count + entries > g_hw_limit) throw Stop{Stop::HardwareLog, g_pc, a};
+}
 inline void hw_log(uint32_t a, uint32_t n, uint32_t v) {
-    if (g_hw_count == kHwLog) throw Stop{Stop::HardwareLog, g_pc, a};  // more than the test replays
+    if (g_hw_count >= g_hw_limit) throw Stop{Stop::HardwareLog, g_pc, a};  // more than the test replays
     g_hw_log[g_hw_count++] = {g_pc, a, n, v};
 }
 inline uint32_t hw_load(uint32_t a, uint32_t n) {
@@ -126,15 +140,31 @@ inline void hw_store(uint32_t a, uint32_t n, uint32_t v) { hw_log(a, n | 0x100, 
 // code that writes over itself (or a bad pointer into code) would silently
 // part ways with the original.
 inline Region g_code = {0, 0};
+// The literals the lifter compiled as constants (generated: literals.cpp,
+// sorted): a store into one would leave the lifted code on the old value.
+extern const Region g_folded[];
+extern const size_t g_folded_count;
+inline bool folded_literal(uint32_t a, uint32_t n) {
+    size_t lo = 0, hi = g_folded_count;
+    while (lo < hi) {  // the first literal ending after a
+        const size_t mid = (lo + hi) / 2;
+        if (g_folded[mid].hi <= a) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < g_folded_count && g_folded[lo].lo < a + n;
+}
 inline void check_store(uint32_t a, uint32_t n) {
     check(a, n);
     if (a < g_code.hi && uint64_t(a) + n > g_code.lo) throw Stop{Stop::Memory, g_pc, a};
+    if (folded_literal(a, n)) throw Stop{Stop::LiteralStore, g_pc, a};
 }
 #define QILIN_PC(a) (::qilin::rt::g_pc = (a))
 // A lifted function's registers: host locals, synced with the context around
 // calls (QILIN_OUT / QILIN_IN). In checked builds they are the context's own
 // registers instead, so the context is exact wherever lifted code stops.
 #define QILIN_REG [[maybe_unused]] uint32_t&
+// At every label (so in every loop): the time limit, for loops that touch no memory.
+#define QILIN_TICK(a) (::qilin::rt::g_pc = (a), ::qilin::rt::count_access(0))
 // The last longword loads (address, value): when an access faults, the
 // differential test looks here for where the bad pointer came from.
 inline constexpr unsigned kLoadTrace = 64;
@@ -157,6 +187,7 @@ inline void check_store(uint32_t, uint32_t) {}
 #define QILIN_HW_STORE(a, n, v) ((void)0)
 #define QILIN_PC(a) ((void)0)
 #define QILIN_REG [[maybe_unused]] uint32_t
+#define QILIN_TICK(a) ((void)0)
 #endif
 
 inline uint32_t ld8(uint32_t a) {
@@ -300,6 +331,7 @@ inline constexpr unsigned kPairLow = 0;
 inline void ld_pair(uint32_t a, uint32_t* bank, unsigned n) {
 #ifdef QILIN_CHECKED_MEMORY
     if (hardware(a, 8)) {
+        hw_room(2, a);  // both halves, or neither: the original makes them as one access
         const uint32_t lo = hw_load(a, 4), hi = hw_load(a + 4, 4);
         bank[n + kPairLow] = lo, bank[n + 1 - kPairLow] = hi;
         return;
@@ -312,6 +344,7 @@ inline void ld_pair(uint32_t a, uint32_t* bank, unsigned n) {
 inline void st_pair(uint32_t a, const uint32_t* bank, unsigned n) {
 #ifdef QILIN_CHECKED_MEMORY
     if (hardware(a, 8)) {
+        hw_room(2, a);
         hw_store(a, 4, bank[n + kPairLow]);
         hw_store(a + 4, 4, bank[n + 1 - kPairLow]);
         return;
@@ -377,8 +410,6 @@ inline void fsca(uint32_t fpul, uint32_t* bank, unsigned n) {
     bank[n + 1] = out(static_cast<float>(turn_sin(fpul + 0x4000)));  // cos x = sin(x + quarter turn)
 }
 
-// Loading FPSCR: the helpers above implement round to nearest with no FPU
-// exceptions enabled, which is how the game runs. Anything else stops.
 // SR as stc sr reads it, with T in a local.
 inline constexpr uint32_t kSrBits = 0x700083F3u;  // MD RB BL, FD, M Q, IMASK, S T
 inline constexpr uint32_t kSrMd = 1u << 30, kSrRb = 1u << 29, kSrFd = 1u << 15;
@@ -401,6 +432,16 @@ inline void set_sr(Context& c, uint32_t v, uint32_t pc) {
     c.sr = v & ~0x303u;
 }
 
+// Code lifted with the floating-point mode read at run time (where the
+// analysis couldn't prove it) checks the mode where it calls out or returns,
+// and stops on a meaning of an instruction the SH-4 doesn't define.
+inline void expect_fp_mode(uint32_t fpscr, uint32_t mode, uint32_t pc) {
+    if ((fpscr >> 19 & 7) != mode) throw Stop{Stop::Unsupported, pc, fpscr};
+}
+[[noreturn]] inline void fp_mode_stop(uint32_t pc, uint32_t fpscr) { throw Stop{Stop::Unsupported, pc, fpscr}; }
+
+// Loading FPSCR: the helpers above implement round to nearest with no FPU
+// exceptions enabled, which is how the game runs. Anything else stops.
 inline void lds_fpscr(uint32_t& fpscr, uint32_t v, uint32_t pc);
 
 // ---- calls ----
@@ -409,12 +450,17 @@ using Fn = void (*)(Context&);
 struct FnEntry {
     uint32_t addr;
     Fn fn;
+    bool any_mode;    // lifted with the floating-point mode read at run time: callable in any mode
+    bool keeps_mode;  // returns in the program's mode: an indirect call (which assumes so) needn't check
 };
 
 // An indirect call or jump to `target` from the instruction at `from`,
 // through the generated function table (dispatch.cpp). An address that isn't
 // a function stops.
 void call(Context& c, uint32_t target, uint32_t from);
+// The same from code lifted with the mode read at run time: a callee proven
+// for the program's mode is only called in it.
+void call_any_mode(Context& c, uint32_t target, uint32_t from);
 
 [[noreturn]] inline void bad_jump(uint32_t from, uint32_t target) { throw Stop{Stop::BadJump, from, target}; }
 [[noreturn]] inline void not_lifted(uint32_t fn) { throw Stop{Stop::NotLifted, fn, fn}; }
@@ -424,8 +470,15 @@ inline void returned_to(const Context& c, uint32_t expected, uint32_t from) {
 }
 [[noreturn]] inline void trap(uint32_t pc, uint32_t number) { throw Stop{Stop::Trap, pc, number}; }
 
+// FPSCR.RM 0 rounds to nearest, 1 toward zero (the game switches to it: the
+// library pair at 0x8C02BF24/0x8C02BF30); 2 and 3 are reserved. The host's own
+// rounding mode is set to match, so the host's arithmetic rounds as the SH-4's
+// does at no cost per operation; the runtime is compiled for a rounding mode
+// that changes (-frounding-math, fenv_access).
+inline void set_rounding(uint32_t fpscr) { std::fesetround((fpscr & 3u) == 1 ? FE_TOWARDZERO : FE_TONEAREST); }
 inline void lds_fpscr(uint32_t& fpscr, uint32_t v, uint32_t pc) {
-    if ((v & 3u) != 0 || (v & 0xF80u) != 0) throw Stop{Stop::Unsupported, pc, v};  // RM, or an exception enable
+    if ((v & 3u) > 1 || (v & 0xF80u) != 0) throw Stop{Stop::Unsupported, pc, v};  // a reserved RM, or an exception enable
+    if ((v ^ fpscr) & 3u) set_rounding(v);
     fpscr = v & 0x003FFFFFu;
 }
 

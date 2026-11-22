@@ -355,3 +355,69 @@ Inconclusive trials in v0.8.0: 4,405 memory faults outside RAM (most on hardware
 
 - A model of the hardware registers the game touches (the hardware-access profile, roadmap step 5) would let the 0xFF and P2 faults run.
 - Run the lifted code on a large host stack, or bound the call depth, so runaway recursion faults like the console would instead of crashing the harness.
+
+## Every function lifted, and the differential test to the end (v0.9.0)
+
+### The last 132 functions
+
+- **Privileged state.** The context now has the rest of SR (MD, RB, BL, FD, IMASK), VBR, SSR, SPC, SGR, DBR and the second bank of r0–r7, and the lifter lifts `stc`/`ldc` of all of them (register and memory forms), the bank registers and `rte` (SR from SSR before the slot runs, banks with it; PC from SPC). `ldc sr` that changes RB swaps the banks in the context; the function's register locals are synced around it. User mode or a disabled FPU stops: the game asks for neither. 117 of the 122 functions were the libraries masking interrupts (`stc sr; or #0xF0; ldc sr`). Only `sleep` and `ldtlb` are still refused, and the game has neither.
+- **Exit modes.** The floating-point analysis no longer assumes every function returns in the program's mode. Each function's exit mode is the meet over its returns and tail calls, callers go on in their callee's exit mode after a direct call, and the whole program is explored again until no exit mode changes. That proves the C runtime's double helpers (`0x8C0EDE64` and the rest): they are entered in the program's mode and return with PR = 1, and their callers clear PR again before using the FPU. `qilin fpmode --list` shows the functions that return in another mode (14, among them `setjmp`/`longjmp`, whose exit is unknown). An indirect call can't know its callee, so `rt::call` checks the mode after a callee that may return in another one.
+- **The floating-point mode at run time.** Ten functions still have a mode the analysis can't prove: the libraries' exception entry and context switch (FPSCR loaded from a saved context), routines that swap the banks and call through a register, and those that call them. These are lifted with each mode-dependent instruction as a `switch` on FPSCR's bits it depends on, one case per meaning (a meaning the SH-4 doesn't define stops). Where such a function calls out, a callee proven for the program's mode is only called in it (`rt::expect_fp_mode`; indirect calls through `rt::call_any_mode`, which reads the callee's flag in the function table); a leaf with no mode-dependent instruction is callable in any mode. The other 5,237 functions have their modes proven and fixed in the code.
+- **Round to zero.** The game switches FPSCR.RM to round toward zero (the library pair at `0x8C02BF24` sets it, `0x8C02BF30` clears it), which the runtime used to refuse. `lds fpscr` now sets the host's rounding mode to match, so the host's arithmetic rounds as the SH-4's does at no cost per operation; the runtime is compiled for a rounding mode that changes (`-frounding-math`; `fenv_access` on MSVC). RM 2 and 3 are reserved and stop. `fmac` (`std::fma`) was checked against exact quad-precision results in round-to-zero: 200,000 cases, no difference.
+- **Literal pools that are variables.** The libraries' exception entry keeps the interrupted r0 in a word of its literal pool (`mova` to it, store, then a PC-relative load). The lifter compiles PC-relative loads as constants, so a pool word whose address some code also takes with `mova` is now loaded from memory (22 words). Every literal still compiled as a constant is listed in the generated `literals.cpp`, and checked builds stop on any store into one, so another case can't hide.
+- **A branch into a delay slot** (hand-written vertex code at `0x8C0DE138`: `bf` to the slot of the `bra` before it): the slot's instruction is emitted twice, inside the branch and, under a label, as an ordinary instruction followed by the next.
+
+**All functions lift: 5,252 of 5,252** (following start-up's uncached jumps found five more; the analysis now accounts for all but 8,306 bytes, 0.64%).
+
+### The differential test
+
+Every trial now ends in a comparison, at the end or at the point the lifted code stopped:
+
+- **Exact state wherever the lifted code stops.** In checked builds the lifter's register locals are references to the context (`QILIN_REG`), so when lifted code stops (a fault, a bad jump, a limit) the context is exactly the machine's state at that instruction. Release builds keep host locals.
+- **Stop points.** The original is then run to the same instruction and execution under QEMU (a breakpoint, and for a memory access the same effective address; for a jump, its target), and everything is compared there: registers, both banks, the privileged registers and RAM. A function whose trials only end this way counts as *pass to a stop*, apart from *pass*.
+- **Hardware replay.** In checked builds an aligned access to the Dreamcast's hardware (the SH-4's control registers, cache and TLB arrays and store queues; the system, Holly, G1/G2 and AICA registers; sound and video RAM; the TA paths) doesn't stop: a load gets a value from a generator the trial seeds, and every access is logged with its PC, address, size and value. Under QEMU, each logged PC gets a breakpoint; when the instruction there accesses hardware, its address register is moved so the access lands on a scratch word (in RAM only the reference board has, above the Dreamcast's 16 MiB) holding the lifted code's value, and the instruction is single-stepped and the register moved back. QEMU so executes every instruction itself; the test checks its effective addresses and stored values against the log, in order, and any difference is a failure. A `pref` of a store queue is logged and checked the same way. 64-bit `fmov` pairs are two log entries, logged together or not at all.
+- **Words only an interrupt changes.** A loop that waits on a word an interrupt updates (`0x8C0101B4` waits on the vblank counter at `0x8C152840`) can't end in a test. The checked build stops itself after 0.3 s with its last 64 loads, of every size; words read four times or more there are treated as hardware on both sides in the next run, which is valid because an interrupt could change them at any moment.
+- **Limits that stop cleanly.** A host stack over 4 MiB (guest recursion through a cycle the repairs made) and a full hardware log (4,096 accesses; a memset of video RAM) stop the lifted code like a fault, so they are stop points too.
+- **More repairs.** Pointer matching wraps around (a pointer of −1 plus 32 is 31); a fault no pointer explains tries the large values the code loaded, then the input registers, as small indices; function pointers and popped return addresses are found in the load trace; an FPSCR with a rounding mode or enables loaded from the random data is made valid.
+- **The instructions QEMU 8.2 can't run.** When the original takes the illegal-instruction exception at `fipr`, `ftrv` or `fsca`, the test computes the instruction with the runtime's own model (the harness evaluates it), writes the result, and returns from the exception. That tests the lifting around them (operands, banks, what follows), not the model, which still needs Flycast or a console. QEMU computes `fsrra` before it raises the exception (its decoder breaks out of the instruction instead of returning), so its own result is kept.
+- **Varied modes.** Trials of the run-time-mode functions start in double precision and in random modes as well as the program's; 15% of all trials start in round to zero.
+- **Loops that touch no memory** reach the time limit too: checked builds tick at every label (`QILIN_TICK`, nothing in release builds). A `bra` to itself (the game halts so when a check fails) changes nothing, so it is compared on arrival.
+- **`longjmp`** returns to the frame that called `setjmp`, which the recompiled call stack can't yet do (runtime work: unwinding to the `setjmp` call site). In the test it stops as a bad return, and the original is stopped where it lands, at the address the buffer holds.
+
+Two more of QEMU's differences from the hardware turned up and are handled the same way as before: `stc sr` drops Q and M (its `gen_read_sr` overwrites the result; the `QILIN_REFERENCE_QEMU` build does the same), and a stop inside a delay slot leaves QEMU inside the branch, so the next trial gets a fresh machine.
+
+**Finding where two runs part.** A case can ask the harness to stop at its k-th hardware access, which with exact state makes it possible to search for the first access at which the two sides differ. Every failure the new test showed was tracked down that way or by reading the trial:
+
+- One was a lifting error: the literal-pool variable above.
+- Five were the test's own: a stale hardware log handed to the reference after a fruitless index search; the model evaluator lost when the reference machine restarted; the models evaluated in the wrong rounding mode; a 64-bit pair split across the end of the log; and the FPSCR stub, which loaded the default FPSCR instead of the trial's because the packet's bank registers came after r0, so QEMU had never run a round-to-zero trial at all.
+
+### Result
+
+All 5,252 functions, 3 trials each, seed 1 (about 55 minutes):
+
+| | v0.8.0 | v0.9.0 |
+|---|---|---|
+| Functions lifted | 5,115 of 5,247 | **5,252 of 5,252** |
+| **Fail** | 0 | **0** |
+| Pass (a trial to the end, every trial equal) | 3,456 | **4,431** |
+| Pass to a stop (equal where the lifted code stopped) | — | **810** |
+| Untested | 1,659 | **11** |
+| Conclusive trials | 8,949 | 11,581 to the end, 4,081 to a stop |
+
+**5,241 of 5,252 functions (99.79%) have at least one conclusive trial, and none differs.** 1,081 functions had hardware accesses replayed; the test ran `fipr` 66,734 times, `ftrv` 22,381 and `fsca` 874 for QEMU with the runtime's model, and kept QEMU's `fsrra` 25 times.
+
+The 11 without a conclusive trial:
+
+- **The SH-4 exception and interrupt machinery** (4: `0x8C122F1C`, `0x8C130B84`, `0x8C130BB4`, `0x8C130D1C`): the libraries' interrupt entry, which calls the handler with the FP banks swapped (FR = 1; the handler was proven for FR = 0, so the mode check stops it, as it must), the exception dispatcher and the context save and restore, whose stack holds a saved context the random inputs don't. The runtime replaces this layer with native interrupt delivery; running it as the console does would need a second lifting of the handler for FR = 1.
+- **Walking off the end of RAM** (4: `0x8C02D2C4`, `0x8C04EA28`, `0x8C11CC40`, `0x8C1412D0`): string and block loops over random data with no terminator reach `0x8D000000`, where the lifted code faults (the Dreamcast's RAM ends there; its mirror isn't modelled) and the reference board has more memory, so the original never faults where the lifted code did.
+- **Start-up** (2: `0x8C010000`, the boot entry, and `0x8C119C80`): the original, under QEMU with every hardware access replayed, doesn't reach the lifted code's stop within the 30 s limit.
+- **One that returns elsewhere** (`0x8C0F1668`): its return address comes from data the repairs don't reach.
+
+What is still not tested, by design: the arithmetic of `fipr`, `ftrv`, `fsca` and `fsrra` (QEMU 8.2 can't run three of them, and its `fsrra` isn't the hardware's either; they need Flycast or a console), and the hardware itself, whose values are made up.
+
+### Next
+
+- A second lifting for the FR = 1 interrupt path, or the runtime's native interrupt delivery in its place.
+- `setjmp`/`longjmp` across recompiled frames (unwinding to the `setjmp` call site).
+- The RAM mirrors at `0x8D000000`–`0x8FFFFFFF` in the runtime.
+- Flycast or a console for the vector instructions.

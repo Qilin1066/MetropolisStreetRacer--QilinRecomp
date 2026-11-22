@@ -11,6 +11,22 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-22
+Every function lifts (5,252 of 5,252), and every trial of the differential test ends in a comparison, at the end or where the lifted code stopped: 5,241 of 5,252 functions have a conclusive trial (4,431 to the end, 810 to a stop), with no failures. 11 remain: the SH-4 exception and interrupt machinery the runtime replaces, loops walking random data off the end of RAM, and start-up, which doesn't reach its stop in QEMU in time.
+
+### Added
+- **Privileged state** in the lifter and runtime: SR's MD, RB, BL, FD and IMASK, VBR, SSR, SPC, SGR, DBR, the second register bank, `stc`/`ldc` of all of them and `rte`. A change of RB swaps the banks; user mode or a disabled FPU stops. The libraries' interrupt masking (117 functions) lifts.
+- **Exit modes** in the floating-point analysis: each function's mode on return, which its callers go on in, settled over the whole program. The C runtime's double helpers (entered in the program's mode, returning with PR = 1) are proven. `qilin fpmode --list` shows functions that return in another mode.
+- **Functions lifted with the mode read at run time** (10, where the mode can't be proven: the libraries' exception entry, context switch and bank-swapping routines, and their callers): each mode-dependent instruction is a `switch` on FPSCR; calls out check the mode a callee was proven for; the function table says which functions take any mode and which may return in another (indirect calls check those).
+- **Round to zero** (FPSCR.RM = 1), which the game uses: the host's rounding mode follows FPSCR; runtime code is built with `-frounding-math` (`fenv_access` on MSVC).
+- **Branches into delay slots**, and **constant jumps to a function's own uncached alias** (start-up runs its cache set-up uncached; following that found 5 more functions and cut the unknown bytes from 10,024 to 8,306). Indirect calls to an uncached alias run the cached function.
+- **Literal-pool words that are variables** (the libraries' exception entry keeps r0 in one; the handler table is written at start-up) are loaded from memory: those a `mova` points at or whose address is a constant somewhere (34). The literals compiled as constants are listed in the generated `literals.cpp`; checked builds stop on a store into one.
+- **Differential test**: exact state wherever the lifted code stops (registers are context references in checked builds) and the original stopped at the same instruction and execution to compare (*pass to a stop*); hardware replay (the Dreamcast's registers, device memories, store queues and the SH-4's control registers and arrays: values from a seeded generator, every access logged and checked against the original's, which QEMU makes against a scratch word); polled words treated as hardware; clean stops for time (0.3 s, ticks at every label), host stack depth (4 MiB) and a full log (4,096 accesses); more repairs (wrapping pointers, indices, function pointers, popped return addresses, FPSCR words); `fipr`/`ftrv`/`fsca` done for QEMU 8.2 with the runtime's model, QEMU's own `fsrra` kept; varied FP modes and round to zero in trials; uncached aliases of code compared as equal; a per-function JSON report (`--report`), `--list`, and a per-case hardware-access limit for bisecting.
+
+### Fixed
+- The test's FPSCR stub loaded the default FPSCR, not the trial's (both banks' r0 came later in the debugger packet), so QEMU never ran a round-to-zero trial.
+- QEMU 8.2 drops Q and M in `stc sr` (still in 11.1): the reference build does the same.
+
 ## [0.8.0] - 2026-11-21
 The differential test now repairs its inputs: 3,456 of the 5,115 lifted functions pass (2,452 in v0.7.0), still with no failures, in 32 minutes instead of 85.
 

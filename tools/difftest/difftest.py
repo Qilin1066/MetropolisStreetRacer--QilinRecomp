@@ -68,6 +68,7 @@ import time
 RAM, RAM_SIZE = 0x8C000000, 16 << 20
 BASE = 0x8C010000
 CODE_END = 0x8C0EE744       # MSR.BIN's game code ends (its data starts) here
+CODE_TOP = 0x8C15283C       # ... and the image, libraries included, ends here (for telling code addresses)
 MAGIC = 0x8C00F000          # the return address the caller gives: zero memory below the image
 STUB = 0x8C00E000           # lds r0,fpscr ; rts ; nop: sets QEMU's FPU state, which debugger writes don't
 FPSCR = 0x00040000          # how the game runs: round to nearest, DN = 1, PR = SZ = FR = 0
@@ -158,7 +159,8 @@ def memory_form(word):
 
 
 STATUS = ["returned", "memory fault", "bad jump", "bad return", "trap", "not lifted", "unsupported",
-          "more hardware accesses than the test replays", "ran too long"]
+          "more hardware accesses than the test replays", "ran too long", "recursion too deep",
+          "store into a literal compiled as a constant"]
 # QEMU's register order for SH-4 over the debugger protocol.
 R_PC, R_PR, R_GBR, R_VBR, R_MACH, R_MACL, R_SR, R_FPUL, R_FPSCR, R_FR = 16, 17, 18, 19, 20, 21, 22, 23, 24, 25
 R_SSR, R_SPC, R_BANK0, R_BANK1, R_COUNT = 41, 42, 43, 51, 59
@@ -242,6 +244,8 @@ class Original:
     def __init__(self, image, workdir):
         self.dump = os.path.join(workdir, "ram.bin")
         self.image = image
+        self.evaluate = None             # the harness's model of fipr, ftrv, fsca, fsrra: f(op, inputs)
+        self.ran_for_qemu = collections.Counter()
         self.blank = os.path.join(workdir, "blank.bin")
         with open(self.blank, "wb") as f:
             f.write(image)
@@ -275,6 +279,7 @@ class Original:
         original's accesses at those PCs are redirected to SCRATCH, given the same load values and
         checked against them. self.hw_problem says afterwards if they didn't match."""
         self.hw_problem = None
+        self.ssr0, self.spc0 = regs["ssr"], regs["spc"]
         self.cut_in_slot = False
         if self.restart_after:
             self.restart_after = False
@@ -292,9 +297,12 @@ class Original:
                 self.gdb.write(addr, data)
                 self.current[off:off + len(data)] = data
         if len(self.stale) > 4096:
-            # A runaway trial rewrote much of RAM: a fresh machine is quicker than undoing it.
+            # A runaway trial rewrote much of RAM: a fresh machine is quicker than undoing it. (It
+            # still has this trial's single-word repairs to undo next time.)
+            repaired = self.repaired
             self.close()
             self.start()
+            self.repaired = repaired
             for addr, data in writes:
                 self.gdb.write(addr, data)
                 self.current[addr - RAM:addr - RAM + len(data)] = data
@@ -307,8 +315,8 @@ class Original:
         # QEMU's FPU state (rounding, flushing) only follows FPSCR when an
         # instruction loads it: run the stub, then write the real state.
         r = [0] * R_COUNT
-        r[0], r[R_PC], r[R_PR], r[R_VBR], r[R_SR], r[R_FPSCR] = FPSCR, STUB, MAGIC, VECTORS, SR, FPSCR
-        r[R_BANK0], r[R_BANK1] = FPSCR, FPSCR
+        r[0], r[R_PC], r[R_PR], r[R_VBR], r[R_SR], r[R_FPSCR] = regs["fpscr"], STUB, MAGIC, VECTORS, SR, FPSCR
+        r[R_BANK0], r[R_BANK1] = regs["fpscr"], regs["fpscr"]  # r0 of both banks: the register the stub loads
         self.gdb.ok("G" + struct.pack(f"<{R_COUNT}I", *r).hex())
         self.gdb.send("c")
         if self.gdb.recv(TIMEOUT) is None:
@@ -329,11 +337,14 @@ class Original:
         assert not regs["sr"] & SR_RB
         r[R_BANK0:R_BANK0 + 8] = regs["r"][:8]
         r[R_BANK1:R_BANK1 + 8] = regs["rbank"]
-        # The debugger shows the bank FPSCR.FR selects: bank 1 first, then bank 0 and the rest.
+        # The debugger shows the bank FPSCR.FR selects: bank 1 first, then bank 0 and the rest,
+        # then the trial's own FPSCR (which may have FR set).
         r[R_FPSCR], r[R_FR:R_FR + 16] = regs["fpscr"] | FR_BIT, regs["fr"][1]
         self.gdb.ok("G" + struct.pack(f"<{R_COUNT}I", *r).hex())
-        r[R_FPSCR], r[R_FR:R_FR + 16] = regs["fpscr"], regs["fr"][0]
+        r[R_FPSCR], r[R_FR:R_FR + 16] = regs["fpscr"] & ~FR_BIT, regs["fr"][0]
         self.gdb.ok("G" + struct.pack(f"<{R_COUNT}I", *r).hex())
+        if regs["fpscr"] & FR_BIT:
+            self.set_reg(R_FPSCR, regs["fpscr"])
 
         ended = self.go(hw, expected)
         if ended == "cut" and self.cut_in_slot:
@@ -405,10 +416,12 @@ class Original:
         """Runs to the end: "stopped" (then the caller looks at where) or "ran too long"."""
         hw_pcs = {h[0] for h in hw}
         pcs = sorted(hw_pcs | ({self.cut[1]} if self.cut else set()))
-        for pc in pcs:
+        # The program's code can run at its uncached alias too (start-up does): break at both.
+        aliases = [pc ^ 0x20000000 for pc in pcs if BASE <= pc < CODE_TOP]
+        for pc in pcs + aliases:
             self.gdb.ok(f"Z0,{pc:x},2")
         pending = list(hw)
-        deadline = time.time() + (HW_TIMEOUT if hw else TIMEOUT)
+        deadline = time.time() + (HW_TIMEOUT if hw or self.cut else TIMEOUT)
         ended = "stopped"
         try:
             for _ in range(MAX_HW_STOPS):
@@ -420,8 +433,11 @@ class Original:
                     ended = "ran too long"
                     break
                 regs = self.regs_now()
-                pc = regs[R_PC]
+                self.raw_pc = regs[R_PC]  # where QEMU is: the code's address, or its uncached alias
+                pc = self.raw_pc ^ 0x20000000 if self.raw_pc in aliases else self.raw_pc
                 if pc not in pcs:
+                    if pc == VECTORS + 0x100 and self.evaluate and self.run_unrunnable(regs, expected):
+                        continue
                     break
                 if self.cut and pc == self.cut[1] and self.at_cut(pc, regs, expected, pending):
                     self.cut_in_slot = RAM <= pc - 2 < RAM + RAM_SIZE and is_delayed_branch(
@@ -434,7 +450,7 @@ class Original:
                     ended = "cut"
                     break
                 if pc not in hw_pcs:
-                    self.step(pc)
+                    self.step(self.raw_pc)
                     continue
                 problem = self.hw_access(pc, regs, pending, expected)
                 if problem:
@@ -443,13 +459,55 @@ class Original:
             else:
                 ended = "ran too long"
         finally:
-            for pc in pcs:
+            for pc in pcs + aliases:
                 self.gdb.ok(f"z0,{pc:x},2")
         if ended == "stopped" and not self.hw_problem and pending and self.regs_now()[R_PC] == MAGIC:
             h = pending[0]
             self.hw_problem = ("mismatch", f"the lifted code made {len(pending)} more hardware accesses "
                                            f"(next: {h[0]:08x} {'store' if h[2] & 0x100 else 'load'} {h[1]:08x})")
         return ended
+
+    def run_unrunnable(self, regs, expected):
+        """The original stopped at an instruction QEMU 8.2 can't run (fipr, ftrv, fsca): do it with the
+        runtime's model, return from the exception and go on. Only the lifting around the instruction
+        is tested this way, not the model. fsrra QEMU does compute (then faults). False if it isn't
+        one of them (or is in a delay slot)."""
+        spc = regs[R_SPC]
+        if not RAM <= spc < RAM + RAM_SIZE - 1:
+            return False
+        word = struct.unpack_from("<H", expected, spc - RAM)[0]
+        name = next((name for mask, match, name in UNRUNNABLE if word & mask == match), None)
+        if name is None:
+            return False
+        fr = regs[R_FR:R_FR + 16]  # the bank FPSCR.FR selects
+        if name == "fipr":
+            m, n = (word >> 8 & 3) * 4, (word >> 10 & 3) * 4
+            results = {n + 3: self.evaluate(1, regs[R_FPSCR], fr[m:m + 4] + fr[n:n + 4])[0]}
+        elif name == "ftrv":
+            n = (word >> 10 & 3) * 4
+            self.set_reg(R_FPSCR, regs[R_FPSCR] ^ FR_BIT)
+            matrix = self.regs_now()[R_FR:R_FR + 16]
+            self.set_reg(R_FPSCR, regs[R_FPSCR])
+            out = self.evaluate(2, regs[R_FPSCR], matrix + fr[n:n + 4])
+            results = {n + i: out[i] for i in range(4)}
+        elif name == "fsca":
+            n = (word >> 9 & 7) * 2
+            out = self.evaluate(3, regs[R_FPSCR], [regs[R_FPUL]])
+            results = {n: out[0], n + 1: out[1]}
+        else:
+            # fsrra: QEMU 8.2 computes the result, then raises the exception (its decoder breaks out of
+            # the instruction instead of returning). The result is QEMU's own: keep it.
+            results = {}
+        for k, v in results.items():
+            self.set_reg(R_FR + k, v)
+        # Back from the exception: SR from SSR (the bank switch with it), on after the instruction;
+        # SSR and SPC as the trial gave them (the exception overwrote them).
+        self.set_reg(R_SR, regs[R_SSR])
+        self.set_reg(R_PC, spc + 2)
+        self.set_reg(R_SSR, self.ssr0)
+        self.set_reg(R_SPC, self.spc0)
+        self.ran_for_qemu[name] += 1
+        return True
 
     def effective_address(self, word, regs):
         """The address a memory instruction accesses, its size, and its form; None if it isn't one."""
@@ -468,7 +526,9 @@ class Original:
 
     def at_cut(self, pc, regs, expected, pending):
         """Whether this execution of pc is the one the lifted code stopped at."""
-        kind, _, value = self.cut
+        kind, _, value = self.cut[:3]
+        if len(self.cut) > 3 and regs[15] != self.cut[3]:
+            return False
         if kind == "access":
             word = struct.unpack_from("<H", expected, pc - RAM)[0]
             ea = self.effective_address(word, regs)
@@ -491,7 +551,7 @@ class Original:
         if size < 0:  # pref
             ea = regs[word >> 8 & 15]
             if not 0xE0000000 <= ea < 0xE4000000:
-                self.step(pc)
+                self.step(self.raw_pc)
                 return None
             if not pending or pending[0][:3] != (pc, ea, 0x200):
                 return ("mismatch", f"store queue sent at {pc:08x} ({ea:08x}) in the original; the lifted code's next "
@@ -499,7 +559,7 @@ class Original:
             pending.pop(0)
             n = word >> 8 & 15
             self.set_reg(n, SCRATCH)  # a pref of RAM does nothing
-            self.step(pc)
+            self.step(self.raw_pc)
             self.set_reg(n, ea)
             return None
         if size == 0:
@@ -511,7 +571,7 @@ class Original:
         if mode == "r0" and reg == 0:
             return ("unsupported", f"a hardware access at {pc:08x} addressed by r0 twice")
         if not self.is_hw(ea) or ea % min(size, 4):
-            self.step(pc)  # an access to RAM (or a fault, the same on both sides)
+            self.step(self.raw_pc)  # an access to RAM (or a fault, the same on both sides)
             return None
         data_reg = None if data is None else 0 if data == "r0" else (word >> 8 & 15) if data == "n" else (word >> 4 & 15)
         if base != "gbr" and data_reg == reg and store:
@@ -531,7 +591,7 @@ class Original:
         self.gdb.write(SCRATCH, bytes(scratch))
         delta = (SCRATCH - ea) & 0xFFFFFFFF
         self.set_reg(reg, b + delta)
-        self.step(pc)
+        self.step(self.raw_pc)
         after = self.regs_now()
         if not (load and data_reg == reg):  # unless the load overwrote the address register
             self.set_reg(reg, after[reg] - delta)
@@ -579,6 +639,12 @@ class Lifted:
             data += part
         return data
 
+    def evaluate(self, op, fpscr, inputs):
+        """The runtime's model of fipr (1), ftrv (2), fsca (3) or fsrra (4), rounding as FPSCR says: 4 words."""
+        self.proc.stdin.write(struct.pack(f"<III{len(inputs)}I", 0xFFFFFFFF, op, fpscr, *inputs))
+        self.deadline = time.time() + LIFTED_TIMEOUT
+        return list(struct.unpack("<4I", self.read(16)))
+
     def run(self, fn, regs, writes):
         """Returns (status, stop pc, stop value, registers, changed blocks); status "ran too long" if it doesn't finish."""
         case = struct.pack("<17I", fn, *regs["r"])
@@ -587,6 +653,7 @@ class Lifted:
         case += struct.pack("<12I", regs["sr"], regs["vbr"], regs["ssr"], regs["spc"], *regs["rbank"])
         case += struct.pack("<I", regs["hw_seed"])
         case += struct.pack(f"<{1 + len(regs['volatile'])}I", len(regs["volatile"]), *regs["volatile"])
+        case += struct.pack("<I", regs.get("hw_limit", 0))
         case += struct.pack("<I", len(writes))
         for addr, data in writes:
             case += struct.pack("<II", addr, len(data)) + data
@@ -660,7 +727,8 @@ def random_case(rng):
     regs = {"r": [value() for _ in range(16)], "gbr": HEAP + rng.randrange(0, HEAP_SIZE // 2, 4),
             "mach": rng.getrandbits(32), "macl": rng.getrandbits(32),
             "t": rng.getrandbits(1), "s": rng.getrandbits(1), "q": rng.getrandbits(1), "m": rng.getrandbits(1),
-            "fpul": single() if rng.random() < 0.5 else value(), "fpscr": FPSCR,
+            "fpul": single() if rng.random() < 0.5 else value(),
+            "fpscr": FPSCR | (1 if rng.random() < 0.15 else 0),  # sometimes round to zero, as the game sets it
             "fr": [[single() for _ in range(16)] for _ in range(2)],
             # Privileged state: SR's other bits as the game runs (MD = 1, RB = 0, IMASK = 15),
             # exceptions to VECTORS, and an SSR/SPC an rte can return through (sometimes to the
@@ -772,6 +840,10 @@ def repair(lifted, fn, regs, writes, rng, ret_fn):
                     regs.clear(), regs.update(saved[0])
                     writes[:] = saved[1]
                 if moved is None:
+                    # The last try changed nothing, but the harness's log and load trace are from it:
+                    # run the restored inputs again, so they belong to the result returned.
+                    if candidates:
+                        result = lifted.run(fn, regs, writes)
                     return repairs, result
                 result, repairs = moved, repairs + 1
                 continue
@@ -782,6 +854,36 @@ def repair(lifted, fn, regs, writes, rng, ret_fn):
             exact = [w for v, w in input_slots(regs, writes, small=True) if v == value and w not in done]
             if loaded or exact:
                 where, new = (loaded or exact)[0], ret_fn
+        elif status == "unsupported" and value & 0xF83:
+            # lds of an FPSCR with a rounding mode or exception enables (the runtime refuses those)
+            # loaded from the random data, as a context switch does: make that word a valid FPSCR.
+            loaded = [("addr", a) for a, v in reversed(lifted.loads)
+                      if v == value and repairable(a) and ("addr", a) not in done]
+            if loaded:
+                where, new = loaded[0], FPSCR | (value & 0x00380000) | (1 if value & 3 == 1 else 0)
+        elif status == "ran too long" and not (lifted.all_loads and len(regs["volatile"]) < 8 and any(
+                k >= 4 and repairable(a) and a not in regs["volatile"]
+                for a, k in collections.Counter(a & ~3 for a, v, n in lifted.all_loads).items())):
+            # A long loop with no polled word: a count from the random inputs, then; try them as small.
+            candidates = [("r", i) for i in range(15) if regs["r"][i] >= 0x100 and ("r", i) not in done][:INDEX_TRIES]
+            moved = None
+            for w in candidates:
+                saved = (copy.deepcopy(regs), copy.deepcopy(writes))
+                set_slot(regs, writes, w, rng.randrange(1, 16))
+                done.add(w)
+                attempt = lifted.run(fn, regs, writes)
+                runs += 1
+                if attempt[0] != "ran too long":
+                    moved = attempt
+                    break
+                regs.clear(), regs.update(saved[0])
+                writes[:] = saved[1]
+            if moved is None:
+                if candidates:
+                    result = lifted.run(fn, regs, writes)
+                return repairs, result
+            result, repairs = moved, repairs + 1
+            continue
         elif status == "ran too long" and lifted.all_loads and len(regs["volatile"]) < 8:
             # A loop waiting on words only an interrupt would change: treat them as hardware.
             counts = collections.Counter(a & ~3 for a, v, n in lifted.all_loads)
@@ -823,12 +925,18 @@ def expected_image(image, writes):
     return expected
 
 
+def alias(a, b):
+    """The same code address, cached in the lifted code (P1) and uncached in the original (P2): code the
+    original ran at its uncached alias (start-up's cache set-up) leaves return addresses there."""
+    return (a ^ b) == 0x20000000 and BASE <= (min(a, b) & 0x9FFFFFFF) < CODE_TOP
+
+
 def differences(ours, theirs, ours_mem, theirs_mem):
     """Every difference, and whether each lies only in FPSCR's status bits."""
     diffs = []  # (text, status bits only)
 
     def word(name, a, b, mask=0xFFFFFFFF):
-        if (a ^ b) & mask:
+        if (a ^ b) & mask and not alias(a, b):
             diffs.append((f"{name}: lifted {a:08x}, original {b:08x}", not ((a ^ b) & ~FPSCR_STATUS)))
 
     for i in range(16):
@@ -848,6 +956,8 @@ def differences(ours, theirs, ours_mem, theirs_mem):
         # A block one side didn't change holds what the trial started with: compare word by word.
         a_words = struct.unpack("<8I", a) if a else None
         b_words = struct.unpack("<8I", b) if b else None
+        if a_words and b_words and all(x == y or alias(x, y) for x, y in zip(a_words, b_words)):
+            continue
         if a_words and b_words:
             status_only = all(not ((x ^ y) & ~FPSCR_STATUS) for x, y in zip(a_words, b_words))
         else:
@@ -855,6 +965,19 @@ def differences(ours, theirs, ours_mem, theirs_mem):
         diffs.append((f"memory {addr:08x}: lifted {a.hex() if a else 'unchanged'}, original {b.hex() if b else 'unchanged'}",
                       status_only))
     return diffs
+
+
+def any_mode_functions(gen):
+    """Lifted functions that read the floating-point mode at run time (their trials vary it)."""
+    found = set()
+    for name in os.listdir(gen):
+        if name.startswith("lifted_"):
+            with open(os.path.join(gen, name)) as f:
+                text = f.read()
+            for m in re.finditer(r"^void fn_([0-9a-f]{8})\(rt::Context& c\) \{\n(.*?)^\}\n", text, re.S | re.M):
+                if "entry_fp_mode" in m.group(2):
+                    found.add(int(m.group(1), 16))
+    return found
 
 
 def fpscr_readers(gen):
@@ -908,6 +1031,7 @@ def main():
         with open(args.list) as f:
             functions = [int(line, 16) for line in f if line.strip()]
     readers = fpscr_readers(args.gen)
+    any_mode = any_mode_functions(args.gen)
     # A function that only returns (rts ; nop): where repaired indirect calls go.
     ret_fn = next(f for f in all_lifted if struct.unpack_from("<2H", program, f - BASE) == (0x000B, 0x0009))
     repaired = collections.Counter()
@@ -929,11 +1053,16 @@ def main():
     with tempfile.TemporaryDirectory() as workdir:
         original = Original(image, workdir)
         lifted = Lifted(args.harness, args.bin)
+        original.evaluate = lifted.evaluate
         try:
             for index, fn in enumerate(functions):
                 conclusive, cut_conclusive, failure = 0, 0, None
                 for trial in range(args.trials):
                     regs, writes = random_case(rng)
+                    if fn in any_mode and trial:
+                        # Entered in another mode too: double precision on the second trial, then any.
+                        mode = 1 if trial == 1 else rng.randrange(8)
+                        regs["fpscr"] = FPSCR | mode << 19
                     repairs, (status, pc, value, ours, ours_mem) = repair(lifted, fn, regs, writes, rng, ret_fn)
                     repaired[min(repairs, 4)] += 1
                     # Where the lifted code stopped short, if the original can be stopped at the same
@@ -942,11 +1071,23 @@ def main():
                     if not args.no_cuts:
                         if status == "memory fault":
                             cut = ("access", pc, value)
+                        elif status == "recursion too deep":
+                            # The same instruction and address at every level: the stack pointer tells them apart.
+                            cut = ("access", pc, value, ours["r"][15])
                         elif status == "more hardware accesses than the test replays":
                             cut = ("access", pc, None)
-                        elif status == "bad jump":
+                        elif status == "bad jump" and pc:
                             # The lifted code stops having run the jump and its slot: the original at the target.
+                            # (pc 0 is the harness's own call: nothing ran, so there is nothing to compare.)
                             cut = ("jump", value, pc)
+                        elif status == "bad return":
+                            # A callee returned somewhere other than where it was called from: longjmp,
+                            # to the address its buffer holds. The original is stopped when it gets there.
+                            cut = ("jump", value, pc)
+                        elif status == "ran too long" and struct.unpack_from("<H", program, pc - BASE)[0] == 0xAFFE \
+                                if BASE <= pc < BASE + len(program) else False:
+                            # bra to itself: a deliberate halt, which changes nothing; compared on arrival.
+                            cut = ("at", pc, 0)
                         elif status == "trap":
                             cut = ("at", pc, value)
                     if status != "returned" and cut is None:
@@ -1009,6 +1150,7 @@ def main():
                             break
                         if not diffs:
                             cut_conclusive += 1
+                            details[fn].append(["stop", status, f"{pc:08x}", f"{value:08x}" if value is not None else ""])
                         continue
                     if ended == "ran too long" or ended.startswith("reference can't run"):
                         inconclusive[f"the original {ended}" if ended == "ran too long" else ended] += 1
@@ -1057,6 +1199,9 @@ def main():
     for kind, n in inconclusive.most_common():
         print(f"  inconclusive trials, {kind}: {n}")
     print(f"  functions with hardware accesses replayed: {len(hw_trials)}")
+    if original.ran_for_qemu:
+        print("  instructions QEMU can't run, done with the runtime's model (the lifting around them tested, not the "
+              "model): " + ", ".join(f"{k} {v}" for k, v in original.ran_for_qemu.most_common()))
     if args.report:
         with open(args.report, "w") as f:
             json.dump({f"{fn:08x}": {"outcome": outcome[fn], "reasons": reasons[fn], "stops": details[fn]}
