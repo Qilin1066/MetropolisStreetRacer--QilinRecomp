@@ -113,7 +113,7 @@ if(QILIN_GEN_DIR)
     # Checked memory; and QEMU's two differences from the hardware, so the rest
     # can be compared with it (recomp/runtime/guest.hpp). Never in a game build.
     target_compile_definitions(qilin_gen_checked PUBLIC QILIN_CHECKED_MEMORY QILIN_REFERENCE_QEMU)
-    target_link_libraries(qilin_gen_checked PUBLIC qilin_runtime PRIVATE qilin_warnings)
+    target_link_libraries(qilin_gen_checked PUBLIC qilin_runtime qilin_platform PRIVATE qilin_warnings)
     add_executable(qilin_difftest tools/difftest/harness.cpp)
     target_link_libraries(qilin_difftest PRIVATE qilin_gen_checked qilin_disc qilin_warnings)
     qilin_tool(qilin_difftest)

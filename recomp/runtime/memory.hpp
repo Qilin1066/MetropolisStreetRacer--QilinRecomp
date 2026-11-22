@@ -9,7 +9,8 @@
 // it can prove two accesses use different offsets from the base (constant
 // addresses at two aliases in one function), it may reorder them. Lifted code
 // that writes through one alias and reads through another has to be lifted
-// with that in mind (an open point: canonical addresses for constants).
+// with that in mind: guest.hpp's access helpers fold a constant address to its
+// P1 view when compiled (rt::view).
 //
 // Runtime code: no std::format.
 #pragma once

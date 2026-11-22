@@ -699,6 +699,18 @@ void test_lifter() {
             std::atomic_signal_fence(std::memory_order_seq_cst);
             CHECK(g[0x8C010004u] == 0xAB && g[0x0F010004u] == 0xAB);
             CHECK(rt::GuestMemory::ram_view(0) == 0x0C000000u && rt::GuestMemory::ram_view(15) == 0xCF000000u);
+            // Through the access helpers, constant addresses in different views need no barrier: they
+            // are folded to one view when compiled.
+            uint8_t* const saved = rt::g_mem;
+            rt::g_mem = g;
+            rt::st32(0x8C020000u, 0x11111111u);
+            rt::st32(0xAC020000u, 0x22222222u);
+            const uint32_t through_mirror = rt::ld32(0x0F020000u);
+            rt::st8(0xAD020001u, 0x33);
+            const uint32_t cached = rt::ld32(0x8C020000u);
+            rt::g_mem = saved;
+            CHECK(through_mirror == 0x22222222u && cached == 0x22223322u);
+            CHECK(rt::view(0x8C020000u) == 0x8C020000u);
         }
     }
 
@@ -1262,14 +1274,124 @@ void test_nonlocal_return() {
     }
 }
 
+// The libraries' scheduler and a task, by hand in the same shape: the
+// scheduler setjmps and longjmps into the task's context, which first returns
+// to the task's entry function on a stack of its own (a new guest thread);
+// the task yields by a setjmp and a longjmp back, three times, then returns
+// from its entry function, which has nowhere to go.
+namespace threads {
+using namespace qilin;
+constexpr uint32_t kTask = 0x8C000400u, kYield = 0x8C000508u, kSched = 0x8C000608u;
+constexpr uint32_t kTaskStack = 0x8C00E000u, kSchedStack = 0x8C00F800u;
+struct Buf {
+    uint32_t ret, sp;
+};
+Buf task_buf{kTask, kTaskStack}, sched_buf{};
+std::vector<int> log;
+void setjmp_(rt::Context& c, Buf& b) {
+    b = {c.pr, c.r[15]};
+    c.r[0] = 0;
+    c.ret = c.pr;
+}
+void longjmp_(rt::Context& c, const Buf& b) {
+    c.r[15] = b.sp;
+    c.r[0] = 1;
+    c.ret = b.ret;
+}
+void yield(rt::Context& c) {
+    rt::JumpSite site(kYield);
+    for (uint32_t resume = rt::take_resume();;) {
+        try {
+            if (resume == kYield) goto after;
+            c.pr = kYield;
+            site.arm(c.r[15]);
+            setjmp_(c, task_buf);
+            rt::returned_to(c, kYield, kYield - 4);
+        after:
+            if (c.r[0] == 0) {
+                c.pr = 0x8C000520u;
+                longjmp_(c, sched_buf);
+                rt::returned_to(c, 0x8C000520u, 0x8C00051Cu);
+            }
+            return;
+        } catch (const rt::Unwind& u) {
+            if (u.site != &site) throw;
+            resume = kYield;
+        }
+    }
+}
+void task(rt::Context& c) {
+    const uint32_t sp = c.r[15];
+    for (int i = 1; i <= 3; ++i) {
+        log.push_back(i);
+        c.r[15] = sp - 16;  // a frame of its own
+        yield(c);
+        CHECK(c.r[15] == sp - 16);
+        c.r[15] = sp;
+    }
+    c.ret = 0x8C000700u;  // its saved PR: nowhere a frame waits
+}
+void scheduler(rt::Context& c, int rounds) {
+    rt::JumpSite site(kSched);
+    int round = 0;
+    for (uint32_t resume = rt::take_resume();;) {
+        try {
+            if (resume == kSched) goto after;
+            c.pr = kSched;
+            site.arm(c.r[15]);
+            setjmp_(c, sched_buf);
+            rt::returned_to(c, kSched, kSched - 4);
+        after:
+            if (round++ < rounds) {
+                log.push_back(100 + round);
+                c.pr = 0x8C000620u;
+                longjmp_(c, task_buf);
+                rt::returned_to(c, 0x8C000620u, 0x8C00061Cu);
+            }
+            return;
+        } catch (const rt::Unwind& u) {
+            if (u.site != &site) throw;
+            resume = kSched;
+        }
+    }
+}
+}  // namespace threads
+
+void test_guest_threads() {
+    using namespace threads;
+    rt::g_guest_threads = true;
+    rt::Context c{};
+    c.r[15] = kSchedStack;
+    try {
+        scheduler(c, 5);
+        CHECK(false);
+    } catch (const rt::Stop& e) {
+        // The task ended by returning from its entry function: the scheduler hears of it.
+        CHECK(e.kind == rt::Stop::BadReturn && e.value == 0x8C000700u);
+    }
+    CHECK((log == std::vector<int>{101, 1, 102, 2, 103, 3, 104}));
+    // A task left suspended, then one started on its stack: the first ends (its frames unwound).
+    log.clear();
+    task_buf = {kTask, kTaskStack};
+    c.r[15] = kSchedStack;
+    scheduler(c, 1);
+    CHECK((log == std::vector<int>{101, 1}));
+    log.clear();
+    task_buf = {kTask, kTaskStack};
+    c.r[15] = kSchedStack;
+    scheduler(c, 2);
+    CHECK((log == std::vector<int>{101, 1, 102, 2}));
+    rt::g_guest_threads = false;
+}
+
 }  // namespace
 
-// The tables `qilin lift` generates, for dispatch.cpp: no functions, one setjmp site.
+// The tables `qilin lift` generates, for dispatch.cpp: the task, and the setjmp sites.
 namespace qilin::rt {
-extern const FnEntry g_functions[] = {{0u, nullptr, false, false}};
-extern const size_t g_function_count = 0;
-extern const JumpSiteEntry g_jump_sites[] = {{jumps::kSite, nullptr}};
-extern const size_t g_jump_site_count = 1;
+extern const FnEntry g_functions[] = {{threads::kTask, threads::task, false, false}};
+extern const size_t g_function_count = 1;
+extern const JumpSiteEntry g_jump_sites[] = {{jumps::kSite, nullptr}, {threads::kYield, nullptr}, {threads::kSched, nullptr}};
+extern const size_t g_jump_site_count = 3;
 }  // namespace qilin::rt
 
 int main() {
@@ -1283,6 +1405,7 @@ int main() {
     test_lifter_floating_point();
     test_gdrom();
     test_nonlocal_return();
+    test_guest_threads();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;

@@ -190,17 +190,38 @@ inline void check_store(uint32_t, uint32_t) {}
 #define QILIN_TICK(a) ((void)0)
 #endif
 
+// Main RAM answers at sixteen addresses (its area 0x0C000000 and three
+// mirrors, in P0 to P3), each mapped to the same memory (memory.hpp). The
+// compiler doesn't know that: two accesses at constant addresses in different
+// views look like different bytes, and it may reorder them. A constant
+// address is folded to its P1 view (0x8C000000-0x8CFFFFFF) when compiled;
+// nothing changes for addresses known only at run time, which costs nothing.
+// (Not on MSVC, which has no way to ask whether a value is a constant.)
+#if defined(__GNUC__) || defined(__clang__)
+[[gnu::always_inline]] inline uint32_t view(uint32_t a) {
+    if (__builtin_constant_p(a)) {
+        const uint32_t segment = a & 0xE0000000u;
+        if ((segment == 0 || segment == 0x80000000u || segment == 0xA0000000u || segment == 0xC0000000u) &&
+            (a & 0x1C000000u) == 0x0C000000u)
+            return (a & 0x00FFFFFFu) | 0x8C000000u;
+    }
+    return a;
+}
+#else
+inline uint32_t view(uint32_t a) { return a; }
+#endif
+
 inline uint32_t ld8(uint32_t a) {
     QILIN_HW_LOAD(a, 1);
     check(a, 1);
-    QILIN_TRACE_LOAD(a, g_mem[a], 1);
-    return g_mem[a];
+    QILIN_TRACE_LOAD(a, g_mem[view(a)], 1);
+    return g_mem[view(a)];
 }
 inline uint32_t ld16(uint32_t a) {
     QILIN_HW_LOAD(a, 2);
     check(a, 2);
     uint16_t v;
-    std::memcpy(&v, g_mem + a, 2);
+    std::memcpy(&v, g_mem + view(a), 2);
     QILIN_TRACE_LOAD(a, v, 2);
     return v;
 }
@@ -208,7 +229,7 @@ inline uint32_t ld32(uint32_t a) {
     QILIN_HW_LOAD(a, 4);
     check(a, 4);
     uint32_t v;
-    std::memcpy(&v, g_mem + a, 4);
+    std::memcpy(&v, g_mem + view(a), 4);
     QILIN_TRACE_LOAD(a, v, 4);
     return v;
 }
@@ -218,18 +239,18 @@ inline uint32_t ld16s(uint32_t a) { return static_cast<uint32_t>(static_cast<int
 inline void st8(uint32_t a, uint32_t v) {
     QILIN_HW_STORE(a, 1, v);
     check_store(a, 1);
-    g_mem[a] = static_cast<uint8_t>(v);
+    g_mem[view(a)] = static_cast<uint8_t>(v);
 }
 inline void st16(uint32_t a, uint32_t v) {
     QILIN_HW_STORE(a, 2, v);
     check_store(a, 2);
     const auto b = static_cast<uint16_t>(v);
-    std::memcpy(g_mem + a, &b, 2);
+    std::memcpy(g_mem + view(a), &b, 2);
 }
 inline void st32(uint32_t a, uint32_t v) {
     QILIN_HW_STORE(a, 4, v);
     check_store(a, 4);
-    std::memcpy(g_mem + a, &v, 4);
+    std::memcpy(g_mem + view(a), &v, 4);
 }
 
 // ---- floating point ----
@@ -338,8 +359,8 @@ inline void ld_pair(uint32_t a, uint32_t* bank, unsigned n) {
     }
 #endif
     check(a, 8);
-    std::memcpy(&bank[n + kPairLow], g_mem + a, 4);
-    std::memcpy(&bank[n + 1 - kPairLow], g_mem + a + 4, 4);
+    std::memcpy(&bank[n + kPairLow], g_mem + view(a), 4);
+    std::memcpy(&bank[n + 1 - kPairLow], g_mem + view(a) + 4, 4);
 }
 inline void st_pair(uint32_t a, const uint32_t* bank, unsigned n) {
 #ifdef QILIN_CHECKED_MEMORY
@@ -351,8 +372,8 @@ inline void st_pair(uint32_t a, const uint32_t* bank, unsigned n) {
     }
 #endif
     check_store(a, 8);
-    std::memcpy(g_mem + a, &bank[n + kPairLow], 4);
-    std::memcpy(g_mem + a + 4, &bank[n + 1 - kPairLow], 4);
+    std::memcpy(g_mem + view(a), &bank[n + kPairLow], 4);
+    std::memcpy(g_mem + view(a) + 4, &bank[n + 1 - kPairLow], 4);
 }
 
 // fipr FVm,FVn: the inner product into FR(n+3). ftrv XMTRX,FVn: the 4x4
@@ -476,6 +497,7 @@ void call_any_mode(Context& c, uint32_t target, uint32_t from);
 // A call to setjmp in a lifted frame: while the frame lives, a longjmp may
 // come back to the instruction after it (`ret`) with the stack pointer it had
 // then. Armed when the call runs; registered with the guest thread running.
+struct GuestThread;
 struct JumpSite {
     explicit JumpSite(uint32_t ret_) : ret(ret_) {}
     ~JumpSite();
@@ -483,8 +505,9 @@ struct JumpSite {
     JumpSite& operator=(const JumpSite&) = delete;
     void arm(uint32_t sp_);
     uint32_t ret, sp = 0;
+    uint64_t armed = 0;  // when it was last armed: of two sites alike, the later is meant
     JumpSite* next = nullptr;
-    void* thread = nullptr;  // the guest thread it is registered with, once armed
+    GuestThread* thread = nullptr;  // the guest thread it is registered with, once armed
 };
 // Thrown to unwind to the frame holding `site` (a longjmp to it).
 struct Unwind {
@@ -493,12 +516,18 @@ struct Unwind {
 // A new guest thread entering a function at a setjmp site: the site's return
 // address, once (0 otherwise).
 uint32_t take_resume();
+// Whether a longjmp may switch to another guest thread or start one (each on
+// its own fiber). Off in the differential test, which runs one function;
+// there such a longjmp stops.
+extern bool g_guest_threads;
 // A callee returned somewhere other than the instruction after its call: a
-// longjmp, to a live setjmp site of this thread (unwind), of another (switch
-// to it) or to one no frame holds (a new guest thread starts there). Anything
-// else stops.
-[[noreturn]] void nonlocal_return(const Context& c, uint32_t from);
-inline void returned_to(const Context& c, uint32_t expected, uint32_t from) {
+// longjmp. To an armed setjmp site of this guest thread, it unwinds there; of
+// another, it switches to that thread (the latest armed, if several match);
+// to a setjmp site or a function that no frame holds, a new guest thread
+// starts there, and suspended threads whose guest stack it lands in end.
+// Anything else stops.
+[[noreturn]] void nonlocal_return(Context& c, uint32_t from);
+inline void returned_to(Context& c, uint32_t expected, uint32_t from) {
     if (c.ret != expected) [[unlikely]]
         nonlocal_return(c, from);
 }
