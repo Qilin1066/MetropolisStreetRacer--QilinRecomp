@@ -192,6 +192,31 @@ bool Cfg::resolve_table(uint32_t at, JumpTable& out) const {
     return true;
 }
 
+bool Cfg::resolve_address_table(uint32_t at, JumpTable& out) const {
+    if (at < boot_.base() + 8 || insn(at).op != Op::jmp) return false;
+    const unsigned reg = insn(at).n();
+    for (uint32_t back = 2; back <= 4; back += 2) {
+        const Insn load = insn(at - back), lit = insn(at - back - 2);
+        if (load.op != Op::mov_l_load_r0 || load.n() != reg || load.m() != reg) continue;
+        if (lit.op != Op::mov_l_pc || lit.n() != reg) return false;
+        // The instruction between, if any, is the index's adjustment (add #imm,r0).
+        if (back == 4 && (insn(at - 2).op != Op::add_imm || insn(at - 2).n() != 0)) return false;
+        const uint32_t pool = lit.pc_address(at - back - 2);
+        if (!boot_.mapped(pool, 4)) return false;
+        const uint32_t table = boot_.u32(pool);
+        if (table <= at + 4 || !boot_.mapped(table, 4)) return false;
+        out.at = at, out.table = table, out.entry = 4;
+        out.targets.clear();
+        for (uint32_t e = table; boot_.mapped(e, 4) && out.targets.size() < 256; e += 4) {
+            const uint32_t target = boot_.u32(e);
+            if ((target & 1u) || target < at + 4 || target >= table) break;
+            out.targets.push_back(target);
+        }
+        return out.targets.size() >= 2;
+    }
+    return false;
+}
+
 Function Cfg::explore(uint32_t start, uint32_t bound) const {
     Function f;
     f.start = start;
@@ -308,6 +333,9 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
         f.fp_exit = static_cast<uint8_t>(f.fp_exit & f.fp_exit_known);
     };
 
+    // Where the function's code may run to: its bound, or further where a jump through an address
+    // table goes on to code past another entry point (resolve_address_table).
+    uint32_t reach = bound;
     const auto step = [&](uint32_t pc, const State& st, std::vector<Edge>& out, bool record) {
         const Insn in = insn(pc);
         if (!in.valid()) {
@@ -317,7 +345,7 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
         const uint32_t flags = sh4::spec(in.op).flags;
         // Straight on to `next`, unless that leaves the function.
         const auto fall = [&](uint32_t next, const State& s) {
-            if (next < bound) out.push_back({next, s});
+            if (next < reach) out.push_back({next, s});
             else if (bound < boot_.end()) {
                 if (record) f.falls_into = bound;
                 leaves(pc, s, record);  // running into the next function is a tail call to it
@@ -329,7 +357,7 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
         const auto edge = [&](uint32_t t, const State& s) {
             if (!in_image(t)) {
                 if (record) f.bad.push_back(pc);
-            } else if (t >= start && t < bound) {
+            } else if (t >= start && t < reach) {
                 out.push_back({t, s});
                 if (record) f.leaders.insert(t);
             } else {
@@ -352,7 +380,7 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
         if (flags & sh4::kDelayed) {
             const uint32_t slot = pc + 2;
             const Insn s = insn(slot);
-            if (slot >= bound || !s.valid() || (sh4::spec(s.op).flags & sh4::kSlotIllegal)) {
+            if (slot >= reach || !s.valid() || (sh4::spec(s.op).flags & sh4::kSlotIllegal)) {
                 if (record) f.bad_slots.push_back(pc);
                 return;
             }
@@ -438,6 +466,14 @@ Function Cfg::explore(uint32_t start, uint32_t bound) const {
             } else if (in.op == Op::braf && !constant(in.n()) && resolve_table(pc, table)) {
                 State s = after;
                 s.forget(static_cast<uint16_t>(1u | 1u << insn(pc - 2).m()));
+                for (const uint32_t t : table.targets) edge(t, s);
+                if (record) f.jtabs.push_back(std::move(table));
+            } else if (in.op == Op::jmp && !constant(in.n()) && resolve_address_table(pc, table)) {
+                // The code between the jmp and its table is this function's, even where another
+                // entry point (the routine's sibling) starts before it.
+                State s = after;
+                s.forget(static_cast<uint16_t>(1u << in.n()));
+                reach = std::max(reach, table.table);
                 for (const uint32_t t : table.targets) edge(t, s);
                 if (record) f.jtabs.push_back(std::move(table));
             } else {

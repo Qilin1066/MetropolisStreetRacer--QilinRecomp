@@ -10,9 +10,17 @@
 
 #include <cstdint>
 
+#include "guest.hpp"
+
 namespace msr {
 
-// Writes the vectors into guest RAM and registers their native code.
-void install_bios();
+class Drive;
+
+// Writes the vectors into guest RAM and registers their native code. The
+// GDROM calls read `drive` (which must outlive the run).
+void install_bios(Drive& drive);
+// How the boot ROM's calls raise a system bus event (the GD-ROM DMA's end,
+// 0xA40): the port's interrupt delivery (msr/src/game.cpp).
+void set_bus_event(void (*raise)(qilin::rt::Context& c, uint32_t event));
 
 }  // namespace msr

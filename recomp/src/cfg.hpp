@@ -63,10 +63,11 @@
 namespace qilin {
 
 struct JumpTable {
-    uint32_t at = 0;                // the braf
+    uint32_t at = 0;                // the braf (or jmp)
     uint32_t table = 0;             // table address
     std::vector<uint32_t> targets;  // in index order
-    uint32_t end() const { return table + 2 * static_cast<uint32_t>(targets.size()); }
+    uint32_t entry = 2;             // bytes an entry: 2 (the compiler's braf offsets) or 4 (absolute addresses, jmp)
+    uint32_t end() const { return table + entry * static_cast<uint32_t>(targets.size()); }
 };
 
 // How a function was found, strongest evidence first.
@@ -197,6 +198,10 @@ private:
     bool seed_data_pointers();
     void find_suspects();
     bool resolve_table(uint32_t at, JumpTable& out) const;
+    // A table of absolute addresses jumped through: mov.l Ltab,rT; mov.l @(r0,rT),rT; [one
+    // instruction]; jmp @rT, its entries pointing just after the jmp, before the table (the C
+    // library's unrolled copies, entered part-way: Duff's device).
+    bool resolve_address_table(uint32_t at, JumpTable& out) const;
 
     const BootFile& boot_;
     uint8_t entry_mode_ = 0;             // FPSCR.PR, SZ, FR every function is entered with

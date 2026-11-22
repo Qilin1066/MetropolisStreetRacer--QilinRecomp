@@ -9,6 +9,7 @@
 #include <format>
 #include <fstream>
 #include <initializer_list>
+#include <map>
 #include <print>
 #include <string>
 #include <string_view>
@@ -18,6 +19,7 @@
 #include "bootfile.hpp"
 #include "cfg.hpp"
 #include "decoder.hpp"
+#include "drive.hpp"
 #include "gdrom.hpp"
 #include "guest.hpp"
 #include "fiber.hpp"
@@ -1358,6 +1360,47 @@ void scheduler(rt::Context& c, int rounds) {
 }
 }  // namespace threads
 
+// A folder served as a disc: the file system a GD-ROM driver reads.
+void test_folder_drive() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "qilin_folder_drive_test";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "sub");
+    const auto write = [](const fs::path& p, const std::string& text) { std::ofstream(p, std::ios::binary) << text; };
+    write(dir / "IP.BIN", std::string(32768, 'I'));
+    write(dir / "a.bin", "hello");
+    write(dir / "sub" / "b.txt", std::string(3000, 'b'));
+    std::string why;
+    const auto drive = msr::Drive::of_folder(dir, why);
+    CHECK(drive != nullptr);
+    if (!drive) return;
+    uint8_t s[2048];
+    CHECK(drive->read(45000, s) && s[0] == 'I');
+    CHECK(drive->read(45016, s) && s[0] == 1 && std::memcmp(s + 1, "CD001", 5) == 0);
+    const auto le = [](const uint8_t* p) { return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24; };
+    const uint32_t root = le(s + 156 + 2);
+    // The root: ".", "..", A.BIN;1, SUB.
+    std::map<std::string, std::pair<uint32_t, uint32_t>> names;
+    const auto list = [&](uint32_t sector) {
+        names.clear();
+        uint8_t d[2048];
+        CHECK(drive->read(sector, d));
+        for (size_t at = 0; at < 2048 && d[at];) {
+            names[std::string(reinterpret_cast<const char*>(d + at + 33), d[at + 32])] = {le(d + at + 2), le(d + at + 10)};
+            at += d[at];
+        }
+    };
+    list(root);
+    CHECK(names.size() == 4 && names.contains("A.BIN;1") && names.contains("SUB") && !names.contains("IP.BIN;1"));
+    CHECK(names["A.BIN;1"].second == 5);
+    CHECK(drive->read(names["A.BIN;1"].first, s) && std::memcmp(s, "hello", 5) == 0 && s[5] == 0);
+    list(names["SUB"].first);
+    CHECK(names.contains("B.TXT;1") && names["B.TXT;1"].second == 3000);
+    CHECK(drive->read(names["B.TXT;1"].first + 1, s) && s[951] == 'b' && s[952] == 0);
+    CHECK(!drive->read(44999, s));
+    fs::remove_all(dir);
+}
+
 void test_guest_threads() {
     using namespace threads;
     rt::g_guest_threads = true;
@@ -1408,6 +1451,7 @@ int main() {
     test_gdrom();
     test_nonlocal_return();
     test_guest_threads();
+    test_folder_drive();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;

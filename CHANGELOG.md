@@ -18,6 +18,8 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
   - the sound chip's channels and CD audio, flash memory;
   - the settings, the menu and the saves' history;
   - the SDL3 window, Vulkan, audio and pads, with their tests (graphical ones under Xvfb in CI).
+- **The boot ROM's GDROM calls**, after Toy Commander's (reads, table of contents, the drive's state). The drive is the disc image, or for development a folder of the extracted disc served as ISO 9660.
+- **Jumps through tables of absolute addresses** (the C library's unrolled copies, entered part-way) are resolved: 25 jump tables, 5,249 functions, all lifted.
 - **The real-time clock**, and MMUCR; `msr` starts with VBR where the boot ROM leaves it, and runs to the boot ROM's GD-ROM initialisation.
 - **`msr`, the game's program** (bring-up stage):
   - reads `MSR.BIN` and IP.BIN from the player's disc image, checks the file is the one the build was lifted from, and loads both where the boot ROM would;

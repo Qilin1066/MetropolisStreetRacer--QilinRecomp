@@ -11,11 +11,14 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
 
 #include "bios.hpp"
+#include "drive.hpp"
+#include "game.hpp"
 #include "gdrom.hpp"
 #include "guest.hpp"
 #include "memory.hpp"
@@ -42,11 +45,13 @@ std::optional<std::vector<uint8_t>> read_whole(const std::filesystem::path& p) {
 }
 
 struct Disc {
+    std::optional<qilin::GdRom> image;  // the player's disc image, when that's what was given
+    std::unique_ptr<msr::Drive> drive;
     std::vector<uint8_t> program, ip_bin;
 };
 
 // The game and IP.BIN from the player's disc image (.cue or .gdi), or, for
-// development, from a folder holding the extracted MSR.BIN and IP.BIN.
+// development, from a folder of the extracted disc (served as a disc too).
 Disc read_disc(const std::filesystem::path& path) {
     Disc d;
     std::error_code ec;
@@ -55,22 +60,27 @@ Disc read_disc(const std::filesystem::path& path) {
         if (!program) rt::fatal("%s: no MSR.BIN in this folder", path.string().c_str());
         d.program = std::move(*program);
         if (auto ip = read_whole(path / "IP.BIN")) d.ip_bin = std::move(*ip);
+        std::string why;
+        d.drive = msr::Drive::of_folder(path, why);
+        if (!d.drive) rt::fatal("%s: %s", path.string().c_str(), why.c_str());
         return d;
     }
     auto disc = qilin::GdRom::open(path);
     if (!disc) rt::fatal("%s: %s", path.string().c_str(), disc.error().c_str());
-    auto files = disc->files();
+    d.image = std::move(*disc);
+    auto files = d.image->files();
     if (!files) rt::fatal("%s: %s", path.string().c_str(), files.error().c_str());
     for (const qilin::GdFile& f : *files)
         if (f.path == "MSR.BIN") {
-            auto bytes = disc->read_file(f);
+            auto bytes = d.image->read_file(f);
             if (!bytes) rt::fatal("%s: MSR.BIN: %s", path.string().c_str(), bytes.error().c_str());
             d.program = std::move(*bytes);
         }
     if (d.program.empty()) rt::fatal("%s: no MSR.BIN on this disc (is it Metropolis Street Racer?)", path.string().c_str());
-    auto ip = disc->system_area();
+    auto ip = d.image->system_area();
     if (!ip) rt::fatal("%s: IP.BIN: %s", path.string().c_str(), ip.error().c_str());
     d.ip_bin = std::move(*ip);
+    d.drive = msr::Drive::of_image(*d.image);
     return d;
 }
 
@@ -81,7 +91,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: msr <disc image (.cue or .gdi)>\n");
         return 1;
     }
-    const Disc disc = read_disc(argv[1]);
+    Disc disc = read_disc(argv[1]);
     // The game this build was lifted from, and nothing else: lifted code is that file's.
     const std::string sha = qilin::sha256_hex(disc.program);
     if (sha != rt::g_lifted_sha256)
@@ -100,7 +110,8 @@ int main(int argc, char** argv) {
     dreamcast::ta::map();
     dreamcast::map_sh4_peripherals();
     msr::map_rtc();
-    msr::install_bios();
+    msr::install_bios(*disc.drive);
+    msr::set_bus_event(dreamcast::game::raise_bus_event);
 
     rt::g_guest_threads = true;
     rt::Context c;

@@ -64,7 +64,13 @@ Each step: run `msr`, read where it stops, provide what it needs, run again.
 6. **VBR** read as 0 by start-up's exception set-up (`0x8C130918`, which copies the libraries' exception code to VBR + 0x100 to 0x600): the boot ROM leaves VBR at `0x8C000000`, and so does `msr` now.
 7. **MMUCR** (`0xFF000010`), read to decide whether to map the store queues through the TLB (`0x8C130ECC`): stored, reset 0; a write turning translation on stops (no MMU here).
 8. **The real-time clock** (`0xA0710000`, read through a G2 copy by `0x8C131038`): `rtc.cpp`, the host's clock as seconds since 1950, with a time the game sets kept as an offset.
-9. **The boot ROM's GDROM call** (vector `0x8C0000BC`, r6 = 0, r7 = 3, initialise, from `0x8C12E3BC`): the next stop. The drive comes next: Toy Commander's replacement of these calls (its `gdrom_bios.cpp`) is the model.
+9. **The boot ROM's GDROM calls** (vector `0x8C0000BC`, r6 = 0, r7 the function; first initialise, from `0x8C12E3BC`). These are now `bios.cpp`'s, from Toy Commander's replacement of the same calls (its `gdrom_bios.cpp`). Each command is done as it is sent:
+   - PIO and DMA reads, the table of contents, initialisation, the version string;
+   - the drive's state, the main loop, abort and reset.
+
+   CD audio commands stop for now. The drive (`drive.cpp`) is the disc image, or, for development, a folder of the extracted files served as an ISO 9660 file system built in memory. A unit test reads one back.
+10. **A jump into an unrolled copy** (`0x8C0DE3D2`, from the C library's `0x8C0DE3A4`). The copy goes through a table of absolute addresses (`mov.l Ltab,rT; mov.l @(r0,rT),rT; add #-4,r0; jmp @rT`), into the unrolled loads and stores after it (Duff's device). The CFG resolves such tables now (`recompiler-core.md`).
+11. **The GD-ROM DMA's end** (system bus event `0xA40`), which the file system waits for after a DMA read (`0x8C12E6AA`): the next stop, the first interrupt to deliver.
 
 ## The Dreamcast and host layers
 

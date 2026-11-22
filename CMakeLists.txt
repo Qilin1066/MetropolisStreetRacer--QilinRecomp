@@ -219,9 +219,9 @@ endif()
 
 # ---- The port: the hardware and system software the game runs on (msr/src),
 # built without the lifted code too, so CI compiles it ----
-add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp)
+add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp msr/src/drive.cpp)
 target_include_directories(msr_port PUBLIC msr/src)
-target_link_libraries(msr_port PUBLIC qilin_runtime PRIVATE qilin_warnings)
+target_link_libraries(msr_port PUBLIC qilin_runtime qilin_disc PRIVATE qilin_warnings)
 
 # ---- Lifted code (optional): the output of `qilin lift`, which is derived
 # from the game and so lives outside the repository ----
@@ -269,6 +269,6 @@ endif()
 # ---- Tests (no game files needed) ----
 add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/dispatch.cpp recomp/runtime/system.cpp
     recomp/runtime/bus.cpp)
-target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_platform qilin_warnings)
+target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_platform msr_port qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)
