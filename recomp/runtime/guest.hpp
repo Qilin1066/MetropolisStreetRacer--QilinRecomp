@@ -5,6 +5,7 @@
 // The guest is little-endian, as every host is: loads and stores are plain.
 #pragma once
 
+#include <atomic>
 #include <bit>
 #include <cfenv>
 #include <chrono>
@@ -476,9 +477,32 @@ inline uint32_t get_sr(const Context& c, uint32_t t) {
 }
 // ldc sr (and rte, from SSR): a change of RB swaps r0-r7 with the other bank.
 // User mode and a disabled FPU stop: the game never asks for either.
+// ---- interrupts (the runtime delivers them; dreamcast/src/interrupts.cpp) ----
+// Raising an interrupt sets g_irq_pending (from any thread). Lifted code polls
+// g_irq_pending at its loops' heads (one relaxed load) and calls poll_irq,
+// which passes the stack pointer (the handler's frame goes below it) and runs
+// g_irq_service. The service runs the handlers on the context and puts every
+// register back afterwards, as an interrupt's return does. g_irq_waiting:
+// something is pending that IMASK holds back; lowering IMASK makes it pending
+// again. (Toy Commander's runtime's design, kept in step.)
+inline std::atomic<bool> g_irq_pending{false};
+inline bool g_irq_waiting = false;
+inline void (*g_irq_service)(Context&) = nullptr;
+inline void poll_irq(Context& c, uint32_t r15) {
+    g_irq_pending.store(false, std::memory_order_relaxed);
+    if (!g_irq_service) return;
+    c.r[15] = r15;
+    g_irq_service(c);
+}
+#define QILIN_POLL_IRQ(r15)                                                                                          \
+    do {                                                                                                             \
+        if (::qilin::rt::g_irq_pending.load(std::memory_order_relaxed)) [[unlikely]] ::qilin::rt::poll_irq(c, (r15)); \
+    } while (0)
+
 inline void set_sr(Context& c, uint32_t v, uint32_t pc) {
     v &= kSrBits;
     if (!(v & kSrMd) || (v & kSrFd)) throw Stop{Stop::Unsupported, pc, v};
+    if (g_irq_waiting && ((v >> 4) & 15u) < ((c.sr >> 4) & 15u)) g_irq_pending.store(true, std::memory_order_relaxed);
     if ((v ^ c.sr) & kSrRb)
         for (unsigned i = 0; i < 8; ++i) std::swap(c.r[i], c.rbank[i]);
     c.t = v & 1, c.s = v >> 1 & 1, c.q = v >> 8 & 1, c.m = v >> 9 & 1;

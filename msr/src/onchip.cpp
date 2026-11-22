@@ -27,11 +27,14 @@ struct Register {
     const char* name;
     uint32_t reset;  // its value at power-on
     uint32_t value;
+    uint32_t forbid = 0;  // bits whose setting the port can't follow: a write with any of them stops
 };
 
 // SH7750 hardware manual, by address. Only what the game touches.
 std::array g_registers{
     // CCR: the caches' enables, write-back and invalidate bits. There are no caches here.
+    // MMUCR: address translation stays off (AT, bit 0): the port has no MMU.
+    Register{0xFF000010u, 4, Kind::Stored, "MMUCR (MMU control)", 0, 0, 1u},
     Register{0xFF00001Cu, 4, Kind::Stored, "CCR (cache control)", 0, 0},
     // PDTRA: port A's data. On the Dreamcast bits 9-8 read the video cable: 0 is VGA, which the
     // port shows (640x480, progressive, 60 Hz: docs/roadmap-and-design-targets.md).
@@ -64,7 +67,7 @@ uint32_t read(uint32_t a, unsigned n) {
 
 void write(uint32_t a, uint32_t v, unsigned n) {
     Register* r = find(a);
-    if (!r || r->size != n || r->kind == Kind::Fixed) unknown(a, true, v, n);
+    if (!r || r->size != n || r->kind == Kind::Fixed || (v & r->forbid)) unknown(a, true, v, n);
     r->value = v;
 }
 

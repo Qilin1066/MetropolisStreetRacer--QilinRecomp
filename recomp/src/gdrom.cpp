@@ -265,6 +265,31 @@ std::expected<GdRom, std::string> GdRom::open(const std::filesystem::path& image
     return disc;
 }
 
+std::expected<std::vector<int16_t>, std::string> GdRom::read_audio(uint32_t sector, uint32_t count) const {
+    std::vector<int16_t> out;
+    out.reserve(size_t{count} * (kRawSector / 2));
+    const GdTrack* track = nullptr;
+    std::ifstream f;
+    uint8_t raw[kRawSector];
+    for (uint32_t n = 0; n < count; ++n, ++sector) {
+        const std::string name = "sector " + std::to_string(sector);
+        if (!track || sector < track->start || sector >= track->end()) {
+            track = nullptr;
+            for (const GdTrack& t : tracks)
+                if (sector >= t.start && sector < t.end()) track = &t;
+            if (!track) return fail(name + " is not on the disc");
+            if (track->data) return fail(name + " is in data track " + std::to_string(track->number));
+            f = std::ifstream(track->file, std::ios::binary);
+            if (!f) return fail("cannot open " + track->file.string());
+            f.seekg(static_cast<std::streamoff>(track->file_offset + uint64_t(sector - track->start) * kRawSector));
+        }
+        f.read(reinterpret_cast<char*>(raw), kRawSector);
+        if (!f) return fail("cannot read " + name + " from " + track->file.filename().string());
+        for (uint32_t k = 0; k < kRawSector; k += 2) out.push_back(static_cast<int16_t>(raw[k] | raw[k + 1] << 8));
+    }
+    return out;
+}
+
 std::expected<void, std::string> GdRom::read(uint32_t sector, uint32_t count, std::span<uint8_t> out) const {
     if (out.size() != uint64_t(count) * kSectorData) return fail("GdRom::read: buffer size doesn't match the count");
     const GdTrack* track = nullptr;

@@ -64,6 +64,11 @@ public:
     // sector (raw tracks).
     std::expected<void, std::string> read(uint32_t sector, uint32_t count, std::span<uint8_t> out) const;
 
+    // `count` sectors of an audio track from `sector`: 588 frames each of
+    // 16-bit left and right samples (interleaved, CD audio's 44.1 kHz). An
+    // error for a sector outside an audio track.
+    std::expected<std::vector<int16_t>, std::string> read_audio(uint32_t sector, uint32_t count) const;
+
     // IP.BIN: the 16 sectors at the start of the high-density area.
     std::expected<std::vector<uint8_t>, std::string> system_area() const;
 

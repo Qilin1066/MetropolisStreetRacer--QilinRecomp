@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(MetropolisStreetRacerQilinRecomp VERSION 0.9.0 LANGUAGES CXX)
+project(MetropolisStreetRacerQilinRecomp VERSION 0.9.0 LANGUAGES C CXX)  # C: SDL3 and volk
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -100,9 +100,126 @@ if(WIN32)
     target_link_libraries(qilin_platform PRIVATE onecore)  # VirtualAlloc2, MapViewOfFile3 (Windows 10 1803+)
 endif()
 
+enable_testing()
+
+# ---- The host platform: window, input and audio (SDL3), Vulkan ----
+# The sister projects' host layer (host/, from Toy Commander--QilinRecomp,
+# which has it from PunchOutWii--QilinRecomp), kept in step. Fetched at
+# configure time, pinned, built statically: SDL3, the Vulkan headers and volk
+# (which loads Vulkan at run time, so no SDK is needed to build or run).
+option(QILIN_HOST "Build the host platform layer (window, Vulkan, input, audio)" ON)
+if(QILIN_HOST)
+    include(FetchContent)
+    set(FETCHCONTENT_QUIET ON)
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+    set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+    set(SDL_INSTALL OFF CACHE BOOL "" FORCE)
+    set(SDL_X11_XTEST OFF CACHE BOOL "" FORCE)  # synthetic input: not needed
+    FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL GIT_TAG release-3.4.20 GIT_SHALLOW ON)
+    FetchContent_Declare(VulkanHeaders GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers
+                         GIT_TAG vulkan-sdk-1.4.363.0 GIT_SHALLOW ON)
+    # volk is one C file: fetched without its own CMake project (SOURCE_SUBDIR points nowhere).
+    FetchContent_Declare(volk GIT_REPOSITORY https://github.com/zeux/volk GIT_TAG vulkan-sdk-1.4.363.0 GIT_SHALLOW ON
+                         SOURCE_SUBDIR no-cmake)
+    FetchContent_MakeAvailable(SDL3 VulkanHeaders volk)
+    add_library(qilin_volk STATIC ${volk_SOURCE_DIR}/volk.c)
+    target_include_directories(qilin_volk PUBLIC ${volk_SOURCE_DIR})
+    target_link_libraries(qilin_volk PUBLIC Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_compile_definitions(qilin_volk PUBLIC VK_NO_PROTOTYPES)
+
+    # Dear ImGui (MIT) for the settings menu, as the other Qilin recomps draw
+    # theirs: the same commit (v1.93.0), its core and its SDL3 and Vulkan
+    # backends, fetched and pinned. Its Vulkan backend loads its functions
+    # through volk (no prototypes). Where a proxy refuses the archive, clone it
+    # at that commit and configure with -DFETCHCONTENT_SOURCE_DIR_IMGUI=<clone>.
+    FetchContent_Declare(imgui
+        URL https://github.com/ocornut/imgui/archive/c1aaac65e896a45f81f47a4d68f9959e0f86c859.tar.gz
+        URL_HASH SHA256=b3d8f99838bb3ff05e14185562345f85e00c032da4d8fc277608d7898d847114)
+    FetchContent_MakeAvailable(imgui)
+    add_library(qilin_imgui STATIC
+        ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_vulkan.cpp)
+    target_include_directories(qilin_imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+    target_compile_definitions(qilin_imgui PUBLIC IMGUI_IMPL_VULKAN_NO_PROTOTYPES VK_NO_PROTOTYPES IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+    target_link_libraries(qilin_imgui PUBLIC SDL3::SDL3-static Vulkan::Headers)
+    if(MSVC)
+        target_compile_options(qilin_imgui PRIVATE /W0)  # third-party code: its warnings aren't ours
+    else()
+        target_compile_options(qilin_imgui PRIVATE -w)
+    endif()
+
+    # The host layer and the settings menu: the game's name in messages, the
+    # window's title, the data folder (qilin/msr) and the settings file (msr.ini).
+    add_library(qilin_host STATIC host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp)
+    target_include_directories(qilin_host PUBLIC host/include)
+    target_compile_definitions(qilin_host PUBLIC QILIN_APP="msr" QILIN_APP_TITLE="Metropolis Street Racer")
+    target_link_libraries(qilin_host PUBLIC qilin_volk PRIVATE SDL3::SDL3-static qilin_warnings)
+    add_library(dreamcast_menu STATIC dreamcast/src/settings.cpp dreamcast/src/menu.cpp dreamcast/src/save_history.cpp)
+    target_include_directories(dreamcast_menu PUBLIC dreamcast/src recomp/runtime)
+    target_link_libraries(dreamcast_menu PUBLIC qilin_host qilin_imgui PRIVATE SDL3::SDL3-static qilin_warnings)
+    target_compile_definitions(dreamcast_menu PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
+    # The Dreamcast's hardware as the port provides it (Toy Commander's dreamcast/ layer, kept in
+    # step): the PowerVR2 and system bus registers, video memory, the tile accelerator, the
+    # renderer, the SH-4's timer and DMA units, guest time, interrupts, the Maple bus, the
+    # sound chip's channels and flash memory. Built without the game, so CI compiles it.
+    add_library(dreamcast_hw STATIC dreamcast/src/pvr.cpp dreamcast/src/texture.cpp dreamcast/src/renderer.cpp
+        dreamcast/src/video.cpp dreamcast/src/maple.cpp dreamcast/src/sh4.cpp dreamcast/src/clock.cpp dreamcast/src/ta.cpp
+        dreamcast/src/interrupts.cpp dreamcast/src/sound.cpp dreamcast/src/flash.cpp)
+    target_include_directories(dreamcast_hw PUBLIC dreamcast/src)
+    target_link_libraries(dreamcast_hw PUBLIC qilin_runtime dreamcast_menu qilin_disc PRIVATE SDL3::SDL3-static qilin_warnings)
+    target_compile_definitions(dreamcast_hw PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
+    # Vulkan structures are written {sType} with the rest zeroed: that's the idiom, not a mistake.
+    if(NOT MSVC)
+        set_source_files_properties(host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp host/tests/vktest.cpp
+                                    dreamcast/src/renderer.cpp dreamcast/src/menu.cpp dreamcast/src/video.cpp dreamcast/tests/render_test.cpp
+                                    PROPERTIES COMPILE_OPTIONS -Wno-missing-field-initializers)
+    endif()
+
+    # The Vulkan layer's own test: a device, an offscreen frame, read back. Skips
+    # (exit 77) where there's no Vulkan 1.3 device.
+    add_executable(qilin_vktest host/tests/vktest.cpp)
+    target_link_libraries(qilin_vktest PRIVATE qilin_host qilin_warnings)
+    add_test(NAME qilin_vktest COMMAND qilin_vktest)
+    set_tests_properties(qilin_vktest PROPERTIES SKIP_RETURN_CODE 77)
+    # Controllers reach the game (SDL's virtual joysticks).
+    add_executable(qilin_padtest host/tests/padtest.cpp)
+    target_link_libraries(qilin_padtest PRIVATE qilin_host SDL3::SDL3-static qilin_warnings)
+    add_test(NAME qilin_padtest COMMAND qilin_padtest)
+    set_tests_properties(qilin_padtest PROPERTIES SKIP_RETURN_CODE 77)
+    # The texture decoder and the renderer, without the game.
+    add_executable(dreamcast_render_test dreamcast/tests/render_test.cpp dreamcast/src/texture.cpp dreamcast/src/renderer.cpp)
+    target_include_directories(dreamcast_render_test PRIVATE dreamcast/src recomp/runtime)
+    target_link_libraries(dreamcast_render_test PRIVATE qilin_host qilin_warnings)
+    add_test(NAME dreamcast_render_test COMMAND dreamcast_render_test)
+    set_tests_properties(dreamcast_render_test PROPERTIES SKIP_RETURN_CODE 77)
+    # The settings file's reader and writer, and the saves' history.
+    add_executable(dreamcast_settings_test dreamcast/tests/settings_test.cpp dreamcast/src/settings.cpp)
+    target_include_directories(dreamcast_settings_test PRIVATE dreamcast/src recomp/runtime host/include)
+    target_link_libraries(dreamcast_settings_test PRIVATE qilin_warnings)
+    target_compile_definitions(dreamcast_settings_test PRIVATE QILIN_APP="msr" QILIN_APP_TITLE="Metropolis Street Racer")
+    add_test(NAME dreamcast_settings_test COMMAND dreamcast_settings_test)
+    add_executable(dreamcast_save_history_test dreamcast/tests/save_history_test.cpp dreamcast/src/save_history.cpp)
+    target_include_directories(dreamcast_save_history_test PRIVATE dreamcast/src recomp/runtime)
+    target_link_libraries(dreamcast_save_history_test PRIVATE qilin_warnings)
+    add_test(NAME dreamcast_save_history_test COMMAND dreamcast_save_history_test)
+    add_executable(qilin_frame_times_test host/tests/frame_times_test.cpp)
+    target_include_directories(qilin_frame_times_test PRIVATE host/include)
+    target_link_libraries(qilin_frame_times_test PRIVATE qilin_warnings)
+    add_test(NAME qilin_frame_times_test COMMAND qilin_frame_times_test)
+    # The sound queue under SDL's real callbacks (its dummy device).
+    add_executable(qilin_audio_callback_test host/tests/audio_callback_test.cpp)
+    target_link_libraries(qilin_audio_callback_test PRIVATE qilin_host SDL3::SDL3-static qilin_warnings)
+    add_test(NAME qilin_audio_callback_test COMMAND qilin_audio_callback_test)
+    set_tests_properties(qilin_audio_callback_test PROPERTIES ENVIRONMENT "SDL_AUDIODRIVER=dummy;SDL_AUDIO_DEVICE_SAMPLE_FRAMES=128" TIMEOUT 25)
+endif()
+
 # ---- The port: the hardware and system software the game runs on (msr/src),
 # built without the lifted code too, so CI compiles it ----
-add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp)
+add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp)
 target_include_directories(msr_port PUBLIC msr/src)
 target_link_libraries(msr_port PUBLIC qilin_runtime PRIVATE qilin_warnings)
 
@@ -139,15 +256,17 @@ if(QILIN_GEN_DIR)
     if(QILIN_BRINGUP)
         target_compile_definitions(qilin_gen PUBLIC QILIN_BRINGUP)
     endif()
-    add_executable(msr msr/src/main.cpp)
-    target_link_libraries(msr PRIVATE msr_port qilin_gen qilin_disc qilin_warnings)
+    if(NOT QILIN_HOST)
+        message(FATAL_ERROR "msr needs the host layer (QILIN_HOST)")
+    endif()
+    add_executable(msr msr/src/main.cpp msr/src/game.cpp)
+    target_link_libraries(msr PRIVATE msr_port dreamcast_hw qilin_gen qilin_disc SDL3::SDL3-static qilin_warnings)
     if(MSVC)
         target_link_options(msr PRIVATE /STACK:8388608)  # guest recursion runs on the host stack
     endif()
 endif()
 
 # ---- Tests (no game files needed) ----
-enable_testing()
 add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/dispatch.cpp recomp/runtime/system.cpp
     recomp/runtime/bus.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_platform qilin_warnings)

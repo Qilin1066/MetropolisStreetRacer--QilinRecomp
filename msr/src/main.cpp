@@ -20,6 +20,10 @@
 #include "guest.hpp"
 #include "memory.hpp"
 #include "onchip.hpp"
+#include "pvr.hpp"
+#include "rtc.hpp"
+#include "sh4.hpp"
+#include "ta.hpp"
 #include "sha256.hpp"
 #include "system.hpp"
 
@@ -92,12 +96,17 @@ int main(int argc, char** argv) {
     if (!disc.ip_bin.empty()) std::memcpy(rt::g_mem + kIpBin, disc.ip_bin.data(), std::min<size_t>(disc.ip_bin.size(), 0x8000u));
 
     msr::map_onchip();
+    dreamcast::map_pvr();
+    dreamcast::ta::map();
+    dreamcast::map_sh4_peripherals();
+    msr::map_rtc();
     msr::install_bios();
 
     rt::g_guest_threads = true;
     rt::Context c;
     c.r[15] = kStackTop;
     c.fpscr = 0x00040000u;  // DN = 1: denormals flushed, as the console starts
+    c.vbr = 0x8C000000u;    // the boot ROM's: start-up copies its exception code there (0x8C130918)
     try {
         rt::call_guest(c, kProgram);
     } catch (const rt::Stop& s) {

@@ -12,6 +12,13 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ## [Unreleased]
 
 ### Added
+- **Toy Commander's `dreamcast/` and `host/` layers**, kept in step:
+  - the PowerVR2 and system bus registers, video memory, the tile accelerator and the Vulkan renderer;
+  - the SH-4's timer and DMA units, guest time, interrupt delivery and the Maple bus;
+  - the sound chip's channels and CD audio, flash memory;
+  - the settings, the menu and the saves' history;
+  - the SDL3 window, Vulkan, audio and pads, with their tests (graphical ones under Xvfb in CI).
+- **The real-time clock**, and MMUCR; `msr` starts with VBR where the boot ROM leaves it, and runs to the boot ROM's GD-ROM initialisation.
 - **`msr`, the game's program** (bring-up stage):
   - reads `MSR.BIN` and IP.BIN from the player's disc image, checks the file is the one the build was lifted from, and loads both where the boot ROM would;
   - runs the lifted game until something isn't provided, then reports where, with the registers and a backtrace from the guest stack;
