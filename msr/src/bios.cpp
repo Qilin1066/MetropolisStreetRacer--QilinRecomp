@@ -118,11 +118,13 @@ Request g_last;
 // stream reader 0x8C120C72 with a sector count). The data then comes out in
 // pieces the driver asks for with call 6, {buffer, bytes} (0x8C12E466), each
 // a DMA ending with event 0xA40; call 7 gives the bytes of the piece still to
-// come (0x8C12E5EC). Call 1 answers, as the library's stream server
-// (0x8C11F512) reads it: 1, processing, with the fourth status word 1 when
-// the drive is ready for the next piece (the file system waits for that,
-// 0x8C120ED6); 3, streaming, while a piece is being moved (the server then
-// asks call 7); 2, complete, once the stream has no data left. Abort (call 8)
+// come. The library's stream server (0x8C11F512) and reader (0x8C120C72,
+// 0x8C120D50) read the answers so: call 1 answers 3, streaming, while the
+// stream has data left, then 2, complete; on 3 the server asks call 7, whose
+// word is the stream's data not yet transferred (KallistiOS documents it as
+// the remaining amount). More than 0 marks the stream ready for the next
+// piece (its state word 0x4A goes 0), none marks its end (2); the reader
+// waits for that word to leave 1 (open, or a piece asked for). Abort (call 8)
 // ends it.
 struct Stream {
     uint32_t id = 0;
@@ -131,7 +133,6 @@ struct Stream {
     uint64_t sent = 0;       // bytes handed out so far
     uint8_t buffer[2048];    // the sector being handed out
     uint32_t in_buffer = 0;  // bytes of it not yet handed out
-    bool moving = false;     // a piece asked for with call 6 and not yet seen done with call 7
 };
 Stream g_stream;
 uint32_t g_next_id = 1;
@@ -240,9 +241,8 @@ void gd_check_command(rt::Context& c) {
     if (id != 0 && id == g_stream.id) {
         const uint32_t sent = static_cast<uint32_t>(g_stream.sent);
         rt::st32(status, 0), rt::st32(status + 4, 0), rt::st32(status + 8, sent), rt::st32(status + 12, 0);
-        rt::st32(status + 12, g_stream.moving ? 0 : 1);  // ready for the next piece
-        c.r[0] = g_stream.moving ? 3 : g_stream.left ? 1 : 2;
-        if (!g_stream.left && !g_stream.moving) g_stream.id = 0;
+        c.r[0] = g_stream.left ? 3 : 2;  // streaming, then complete
+        if (!g_stream.left) g_stream.id = 0;
         return;
     }
     if (id == 0) {  // no request: nothing active (the stream server asks once its stream has ended)
@@ -279,16 +279,15 @@ void gd_dma_transfer(rt::Context& c) {
     }
     g_dma_end_pending = true;
     deliver_pending(c);
-    g_stream.moving = true;
     c.r[0] = 0;
 }
 
-// Call 7: the bytes of stream r4's current transfer still to come, to the word at r5: none.
+// Call 7: the bytes of stream r4 not yet transferred, to the word at r5 (each piece moves at
+// once, so none of it is in flight).
 void gd_dma_check(rt::Context& c) {
     if (c.r[4] == 0 || c.r[4] != g_stream.id) gd_stop(c, "the progress of a stream that isn't open", c.r[4]);
     deliver_pending(c);
-    rt::st32(c.r[5], 0);
-    g_stream.moving = false;
+    rt::st32(c.r[5], static_cast<uint32_t>(g_stream.left));
     c.r[0] = 0;
 }
 
