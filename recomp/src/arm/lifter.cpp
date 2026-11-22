@@ -377,7 +377,9 @@ std::string ArmLifter::emit(const ArmFunction& f) const {
             break;
         }
         }
-        out += std::format("    if ({}) {{ {} }}  // {:06x} {}\n", cond_expr(in.cond), body, pc, describe(in, pc));
+        // Unconditional ones without an if (MSVC warns on a constant condition).
+        if (in.cond == 14) out += std::format("    {{ {} }}  // {:06x} {}\n", body, pc, describe(in, pc));
+        else out += std::format("    if ({}) {{ {} }}  // {:06x} {}\n", cond_expr(in.cond), body, pc, describe(in, pc));
         // After an unconditional jump nothing falls through.
         if (in.cond == 14 && (in.op == Op::b || (in.writes_pc() && in.op != Op::bl && !is_call_jump(pc))))
             expected = 0xFFFFFFFFu;
