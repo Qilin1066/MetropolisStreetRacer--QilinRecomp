@@ -33,6 +33,11 @@ void vblank();
 // pad buttons). As of the last poll; nothing while the settings menu is open.
 maple::Controls controls(unsigned port);
 
+// Called at each vertical blank, before anything else (the port's progress
+// report, msr/src/main.cpp); and the pictures shown so far.
+void on_blank(void (*hook)());
+uint64_t pictures_shown();
+
 // Shows a picture the port made itself (the intro movie: msr/src/movie.cpp),
 // `rgba` width x height, after polling the window; nothing without one.
 void show(uint32_t width, uint32_t height, const uint8_t* rgba);

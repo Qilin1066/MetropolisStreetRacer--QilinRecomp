@@ -44,6 +44,12 @@
 #include "sound_cpu.hpp"
 #include "system.hpp"
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 namespace rt = qilin::rt;
 
 namespace {
@@ -134,6 +140,40 @@ Disc read_disc(const std::filesystem::path& path) {
     return d;
 }
 
+// Bring-up: every five seconds of guest time, a line saying where the game is (the instruction
+// of its last access outside the CPU's registers) and how many pictures it has shown, so a
+// run that shows nothing still says whether the game is running and where.
+void progress() {
+    static uint64_t blanks = 0;
+    if (++blanks % 300 != 0) return;
+#ifdef QILIN_BRINGUP
+    const uint32_t pc = rt::g_pc;
+    std::fprintf(stderr, "msr: %llu s: at %08X (in fn_%08X), %llu pictures shown\n",
+                 static_cast<unsigned long long>(blanks / 60), pc, rt::function_containing(pc),
+                 static_cast<unsigned long long>(dreamcast::video::pictures_shown()));
+#else
+    std::fprintf(stderr, "msr: %llu s: %llu pictures shown\n", static_cast<unsigned long long>(blanks / 60),
+                 static_cast<unsigned long long>(dreamcast::video::pictures_shown()));
+#endif
+    std::fflush(stderr);
+}
+
+#ifdef _WIN32
+// A crash in native code (no stop report): its code and, in bring-up builds, the game's last
+// noted instruction, before Windows ends the program.
+LONG WINAPI crashed(EXCEPTION_POINTERS* e) {
+#ifdef QILIN_BRINGUP
+    std::fprintf(stderr, "msr: crashed: exception %08lX at host %p; the game was at %08X\n",
+                 e->ExceptionRecord->ExceptionCode, e->ExceptionRecord->ExceptionAddress, rt::g_pc);
+#else
+    std::fprintf(stderr, "msr: crashed: exception %08lX at host %p\n", e->ExceptionRecord->ExceptionCode,
+                 e->ExceptionRecord->ExceptionAddress);
+#endif
+    std::fflush(stderr);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -141,6 +181,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: msr <disc image (.cue or .gdi), or a folder of the extracted disc>\n");
         return 1;
     }
+#ifdef _WIN32
+    SetUnhandledExceptionFilter(crashed);
+#endif
     dreamcast::set_command_line(argc, argv);  // for the menu's "Restore and restart"
     Disc disc = read_disc(argv[1]);
     // The game this build was lifted from, and nothing else: lifted code is that file's.
@@ -170,6 +213,7 @@ int main(int argc, char** argv) {
     // A GD-ROM DMA's end is the system bus's normal event 14 (0xA40), delivered at the next poll.
     msr::set_bus_event([](rt::Context&, uint32_t event) { dreamcast::raise_event((event - 0xA00u) / 0x20u + 12u); });
 
+    dreamcast::video::on_blank(progress);
     dreamcast::start_interrupts();
 
     rt::g_guest_threads = true;

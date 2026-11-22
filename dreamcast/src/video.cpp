@@ -256,7 +256,12 @@ void run_menu() {
     pause_guest_time(false);
 }
 
+void (*g_blank_hook)() = nullptr;
+void on_blank(void (*hook)()) { g_blank_hook = hook; }
+uint64_t pictures_shown() { return g_pictures; }
+
 void vblank() {
+    if (g_blank_hook) g_blank_hook();
     if (!g_renderer) return;
     poll();
     run_menu();
