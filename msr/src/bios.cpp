@@ -272,7 +272,14 @@ void gd_dma_transfer(rt::Context& c) {
     uint32_t to = (rt::ld32(c.r[5]) & 0x1FFFFFFFu) | 0x80000000u;  // DMA addresses are physical
     uint32_t bytes = rt::ld32(c.r[5] + 4);
     if ((bytes & 3u) || (to & 3u)) gd_stop(c, "a stream transfer of an odd size or to an odd address", bytes);
-    if (bytes > g_stream.left) gd_stop(c, "a stream transfer past the stream's end", bytes);
+    if (bytes > g_stream.left) {
+        // The game's loader asks for the next piece from its DMA-end callback without looking at
+        // what is left (0x8C02E114 -> 0x8C120D50), so after the stream's last piece it asks once
+        // more. The request fails (-1; the library makes that -24) and the loader sees the end
+        // through call 7.
+        c.r[0] = static_cast<uint32_t>(-1);
+        return;
+    }
     while (bytes) {
         if (g_stream.in_buffer == 0) {
             if (!g_drive->read(g_stream.sector++, g_stream.buffer)) rt::fatal("GD-ROM: %s", g_drive->error().c_str());
