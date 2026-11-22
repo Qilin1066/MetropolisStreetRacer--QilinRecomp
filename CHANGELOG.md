@@ -12,6 +12,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ## [Unreleased]
 
 ### Added
+- **The graphics pieces Kamui 2 uses** in `pvr.cpp`: PVR-DMA between RAM and video memory, G2 DMA to and from the sound chip, and the tile accelerator's texture path at `0x11000000`, including channel 2's DMA on the 32-bit path. The Maple bus was already in Toy Commander's layer, which this game shares through Shinobi. Written and compiled, not run.
 - **The launcher's native replacement** (`msr/src/launcher.cpp`). The game's start-a-program (`0x8C02F68A`) is now native code, not lifted: a new `replaced` list in the known-build table makes `qilin lift` emit such functions as calls to the port (`rt::replaced`). When the game hands back to `1st_read.bin` for its attract loop, `msr` restarts it. The restart ends the guest threads (`rt::end_guest_threads`), clears the drive's state, reloads the image and RAM as on a first start, and writes `-DEMO=-1` plus the game's arguments into its argument block. A request for the browser's loader or any other program stops, saying what it was. The cold start's intro movie (`MSR.SFD`) is skipped with a message until there is a Sofdec decoder. Written and compiled, not run.
 - **Toy Commander's `dreamcast/` and `host/` layers**, kept in step:
   - the PowerVR2 and system bus registers, video memory, the tile accelerator and the Vulkan renderer;

@@ -46,6 +46,16 @@ uint32_t read(uint32_t a, unsigned n) {
 }
 
 void vram_block(uint32_t a, const uint8_t* data, unsigned n);
+uint32_t vram_read(uint32_t a, unsigned n);
+
+// The tile accelerator's texture path, 0x11000000-0x11FFFFFF (and through
+// channel 2's DMA): the lower half goes to video memory by the path LMMODE0
+// (0x005F6884) chooses, the upper half by LMMODE1 (0x005F6888); 0 is the
+// 64-bit path (0x04000000), 1 the 32-bit one (0x05000000). Kamui 2 sets them.
+uint32_t texture_path(uint32_t a) {
+    const uint32_t mode = reg((a & 0x00800000u) ? 0x005F6888u : 0x005F6884u) & 1u;
+    return (mode ? 0x05000000u : 0x04000000u) | (a & 0x007FFFFFu);
+}
 
 // TA_LIST_INIT (0x005F8144): bit 31 starts a new scene's lists.
 // STARTRENDER (0x005F8014): renders the scene the lists built. For now the
@@ -75,7 +85,6 @@ void dma_to_chip() {
     const uint32_t area = to & 0x03800000u;
     const bool to_ta = area == 0, to_texture = (area & 0x03000000u) == 0x01000000u;
     if (!to_ta && !to_texture) throw rt::Stop{rt::Stop::Unsupported, 0, to};
-    if (to_texture && (reg(0x005F6884u) & 1u)) throw rt::Stop{rt::Stop::Unsupported, 0, to};  // LMMODE0: the 32-bit path
     uint8_t block[32];
     for (uint32_t k = 0; k < bytes; k += 32) {
         for (uint32_t i = 0; i < 32; i += 4) {
@@ -83,16 +92,76 @@ void dma_to_chip() {
             std::memcpy(block + i, &w, 4);
         }
         if (to_ta) ta::feed(block, 32);
-        else vram_block(0x04000000u | ((to + k) & 0x00FFFFFFu), block, 32);
+        else vram_block(texture_path(to + k), block, 32);
     }
     end_dma_channel2(bytes);
     reg(kC2Dst) = 0;
     raise_event(19);
 }
 
+// PVR-DMA, between RAM and video memory (Kamui 2's texture loads): PDSTAP
+// (0x005F7C00) the video memory address, PDSTAR (0x005F7C04) the RAM address,
+// PDLEN (0x005F7C08) bytes, PDDIR (0x005F7C0C) 0 to video memory and 1 from
+// it, PDTSEL (0x005F7C10) 0 for a start by PDST, PDEN (0x005F7C14), and PDST
+// (0x005F7C18) starts it. Done at once; then PDST reads 0 and normal event 11
+// (PVR-DMA end) is raised. Anything else stops.
+constexpr uint32_t kPdstap = 0x005F7C00u, kPdstar = 0x005F7C04u, kPdlen = 0x005F7C08u, kPddir = 0x005F7C0Cu,
+                   kPdtsel = 0x005F7C10u, kPden = 0x005F7C14u, kPdst = 0x005F7C18u;
+void pvr_dma() {
+    const uint32_t to = reg(kPdstap), ram = reg(kPdstar), bytes = reg(kPdlen);
+    const bool from_vram = reg(kPddir) & 1u;
+    if (!(reg(kPden) & 1u) || (reg(kPdtsel) & 1u) || bytes == 0 || bytes % 32 || (to & 0x1C000000u) != 0x04000000u)
+        throw rt::Stop{rt::Stop::Unsupported, 0, to};
+    if (!rt::in_ram(0xA0000000u | (ram & 0x1FFFFFFFu)) || !rt::in_ram(0xA0000000u | ((ram + bytes - 1) & 0x1FFFFFFFu)))
+        throw rt::Stop{rt::Stop::Unsupported, 0, ram};
+    uint8_t* mem = rt::g_mem + (0x8C000000u | (ram & 0x00FFFFFFu));
+    if (from_vram)
+        for (uint32_t k = 0; k < bytes; k += 4) {
+            const uint32_t w = vram_read(to + k, 4);
+            std::memcpy(mem + k, &w, 4);
+        }
+    else
+        vram_block(to, mem, bytes);
+    reg(kPdst) = 0;
+    raise_event(11);
+}
+
+// G2 DMA, channels 0-3 at 0x005F7800 + 0x20 n: STAG (+0x00) the G2 bus
+// address (the sound chip's memory and registers), STAR (+0x04) the RAM
+// address, LEN (+0x08) bytes (bit 31: enable cleared at the end), DIR (+0x0C)
+// 0 from RAM and 1 to it, TSEL (+0x10) 0 for a start by ST, EN (+0x14), ST
+// (+0x18) starts it. Done at once, a word at a time through the bus; then ST
+// reads 0 and normal event 15 + n (its end) is raised. Anything else stops.
+constexpr uint32_t kG2Lo = 0x005F7800u, kG2Hi = 0x005F7880u;
+void g2_dma(uint32_t base) {
+    const uint32_t g2 = reg(base), ram = reg(base + 4), len = reg(base + 8);
+    const uint32_t bytes = len & 0x7FFFFFFFu;
+    const bool to_ram = reg(base + 0x0C) & 1u;
+    if (!(reg(base + 0x14) & 1u) || (reg(base + 0x10) & 7u) || bytes == 0 || bytes % 32 || (g2 & 0x1FFFFFFFu) < 0x00700000u ||
+        (g2 & 0x1FFFFFFFu) + bytes > 0x01000000u)
+        throw rt::Stop{rt::Stop::Unsupported, 0, g2};
+    if (!rt::in_ram(0xA0000000u | (ram & 0x1FFFFFFFu)) || !rt::in_ram(0xA0000000u | ((ram + bytes - 1) & 0x1FFFFFFFu)))
+        throw rt::Stop{rt::Stop::Unsupported, 0, ram};
+    const uint32_t from = 0xA0000000u | ((to_ram ? g2 : ram) & 0x1FFFFFFFu);
+    const uint32_t dest = 0xA0000000u | ((to_ram ? ram : g2) & 0x1FFFFFFFu);
+    for (uint32_t k = 0; k < bytes; k += 4) rt::st32(dest + k, rt::ld32(from + k));
+    if (len & 0x80000000u) reg(base + 0x14) = 0;
+    reg(base + 0x18) = 0;
+    raise_event(15 + (base - kG2Lo) / 0x20u);
+}
+
 void write(uint32_t a, uint32_t v, unsigned n) {
     if (n != 4 || (a & 3u)) throw rt::Stop{rt::Stop::Unsupported, 0, a};
+    if (a >= kG2Lo && a < kG2Hi && (a & 0x1Fu) == 0x18u) {  // a G2 channel's ST
+        reg(a) = v & 1u;
+        if (v & 1u) g2_dma(a - 0x18u);
+        return;
+    }
     switch (a) {
+    case kPdst:
+        reg(a) = v & 1u;
+        if (v & 1u) pvr_dma();
+        return;
     case kC2Dst:
         reg(a) = v & 1u;
         if (v & 1u) dma_to_chip();
@@ -153,11 +222,17 @@ void vram_block(uint32_t a, const uint8_t* data, unsigned n) {
     }
 }
 
+// The tile accelerator's texture path (texture_path): written, never read.
+uint32_t texture_read(uint32_t a, unsigned) { throw rt::Stop{rt::Stop::Unsupported, 0, a}; }
+void texture_write(uint32_t a, uint32_t v, unsigned n) { vram_write(texture_path(a), v, n); }
+void texture_block(uint32_t a, const uint8_t* data, unsigned n) { vram_block(texture_path(a), data, n); }
+
 }  // namespace
 
 void map_pvr() {
     rt::map({kLo, kHi, "PowerVR2 and system bus registers", read, write});
     rt::map({0x04000000u, 0x08000000u, "video memory", vram_read, vram_write, vram_block});
+    rt::map({0x11000000u, 0x12000000u, "tile accelerator texture path", texture_read, texture_write, texture_block});
 }
 
 const uint8_t* vram() { return g_vram; }

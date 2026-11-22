@@ -95,6 +95,7 @@ Each step: run `msr`, read where it stops, provide what it needs, run again.
     - **The sound driver** is lifted too (`docs/sound.md`): `qilin armlift` beside the game's code, and the sound CPU (`msr/src/sound_cpu.cpp`) runs it when the SH-4 releases the sound CPU's reset.
     - **Before that, the finding:** the game loads `SOUND\MANATEE.DRV` (Sega's later driver, with MLT sound banks), not `AUDIO64.DRV`, which is also on the disc. Toy Commander's stand-in is for AUDIO64 (versions 1.80 and 1.90) and stops on any other driver when the game releases the sound CPU. This disc's AUDIO64 is version 1.90f.2, with the interface table `0xAAC`, `0xAEC`, `0xB34`. A stand-in for Manatee comes next.
 15. **The launcher's replacement** (written, not yet run; `docs/disc-and-boot-analysis.md`, "The hand-over"). `msr` runs the game in a loop. Start-a-program (`0x8C02F68A`, replaced natively) given `1st_read.bin` throws `msr::StartGame`. That exception unwinds the guest frames: a guest thread passes it to its resumer, so it reaches the host stack. Then `rt::end_guest_threads()` makes each suspended thread unwind its own frames, as a thread whose stack is taken over does. The drive forgets its requests, the image and RAM are loaded again, the argument block is written, and the game is entered afresh. The devices run on as the console's do: the game's start-up sets them up again.
+16. **The game's graphics and Maple bus** (written, not yet run). `qilin hardware --list` shows the devices the game's code names. Most are already in Toy Commander's layers: the tile accelerator's input, channel 2's DMA, the render start, the palette, the fog table, Maple's DMA and its controllers, memory card and Jump Pack (both games use Shinobi's peripheral library). Three were missing: PVR-DMA (Kamui 2's functions `0x8C13A420` and `0x8C13D2A0`), G2 DMA (`0x8C131180`), and the texture path at `0x11000000` (store queues through `0xE1000000`/`0xE1800000`, `0x8C130ECC`). `pvr.cpp` now does all three. The Maple bus needs no code of this game's own until a run shows a device or command the layer stops on.
 
 ## The Dreamcast and host layers
 
@@ -102,6 +103,12 @@ Each step: run `msr`, read where it stops, provide what it needs, run again.
 - `sound.cpp` reads CD audio through `qilin::GdRom` (`read_audio`, added to `recomp/src/gdrom`). Its tracks start at the file's first sector, pregap included, where Toy Commander's start at index 1.
 - `guest.hpp` gained the interrupt hooks (`g_irq_pending`, `g_irq_waiting`, `g_irq_service`, `QILIN_POLL_IRQ`) and `set_sr`'s re-raise when IMASK drops. The lifter doesn't poll yet.
 - `aica.cpp` is built: its sound RAM and registers are the game's; its driver stand-in is for AUDIO64 (versions 1.80 and 1.90) and stops on this game's Manatee driver. `map_aica` and `sound::attach` take the disc image by pointer, null for a folder (CD audio then stops).
+- `pvr.cpp` has what Kamui 2 uses and Toy Commander's library doesn't. These are worth offering back to Toy Commander:
+  - **PVR-DMA** (`0x005F7C00`-`0x005F7C18`) between RAM and video memory, with its end event (11);
+  - **G2 DMA** (`0x005F7800` + 0x20 n) between RAM and the sound chip, with end events 15-18;
+  - the tile accelerator's **texture path** (`0x11000000`-`0x11FFFFFF`, written directly or through store queues) and channel 2's DMA to it, by the path `LMMODE0`/`LMMODE1` choose. Channel 2 used to stop on the 32-bit path.
+
+  Each stops on a mode it doesn't do: another trigger, a length that isn't whole 32-byte blocks, or an address outside RAM, video memory or the sound chip. Written, not yet run.
 
 The game's side of `game.hpp` is `msr/src/game.cpp`. No interrupt handler is known yet, so the interrupt service holds every event back, and a system bus event that needs delivering stops.
 
