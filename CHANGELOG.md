@@ -18,6 +18,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **Guest threads**: a `longjmp` to a site armed in a suspended thread switches to it; one to a `setjmp` site or a function that no frame holds starts a new thread there, on its own fiber (the libraries' tasks start so). A suspended thread whose guest stack a new one starts in is ended, its frames unwound; a stop on any thread reaches the thread that switched to it. Off in the differential test.
 
 ### Checked
+- The generated code and the difftest harness build under MSVC 19.44 (Visual Studio 2022 Build Tools) with warnings as errors.
 - The generated code under UBSan (GCC 14), full differential test with a second seed: no undefined behaviour, 0 failures. Over seeds 1 and 2, 5 functions have no conclusive trial.
 
 ### Fixed
