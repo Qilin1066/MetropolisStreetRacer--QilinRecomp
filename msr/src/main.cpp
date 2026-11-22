@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 
+#include "aica.hpp"
 #include "bios.hpp"
 #include "drive.hpp"
 #include "game.hpp"
@@ -26,8 +27,11 @@
 #include "interrupts.hpp"
 #include "pvr.hpp"
 #include "rtc.hpp"
+#include "save_history.hpp"
+#include "sound.hpp"
 #include "sh4.hpp"
 #include "ta.hpp"
+#include "video.hpp"
 #include "sha256.hpp"
 #include "system.hpp"
 
@@ -89,9 +93,10 @@ Disc read_disc(const std::filesystem::path& path) {
 
 int main(int argc, char** argv) {
     if (argc != 2) {
-        std::fprintf(stderr, "usage: msr <disc image (.cue or .gdi)>\n");
+        std::fprintf(stderr, "usage: msr <disc image (.cue or .gdi), or a folder of the extracted disc>\n");
         return 1;
     }
+    dreamcast::set_command_line(argc, argv);  // for the menu's "Restore and restart"
     Disc disc = read_disc(argv[1]);
     // The game this build was lifted from, and nothing else: lifted code is that file's.
     const std::string sha = qilin::sha256_hex(disc.program);
@@ -111,6 +116,9 @@ int main(int argc, char** argv) {
     dreamcast::ta::map();
     dreamcast::map_sh4_peripherals();
     msr::map_rtc();
+    dreamcast::map_aica(disc.image ? &*disc.image : nullptr);
+    dreamcast::video::start();
+    dreamcast::sound::start();
     msr::install_bios(*disc.drive);
     // A GD-ROM DMA's end is the system bus's normal event 14 (0xA40), delivered at the next poll.
     msr::set_bus_event([](rt::Context&, uint32_t event) { dreamcast::raise_event((event - 0xA00u) / 0x20u + 12u); });

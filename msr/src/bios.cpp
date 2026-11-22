@@ -1,10 +1,13 @@
 // Runtime code: no std::format.
 #include "bios.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 
 #include "drive.hpp"
+#include "flash.hpp"
 #include "guest.hpp"
 #include "system.hpp"
 
@@ -46,8 +49,42 @@ void sysinfo(rt::Context& c) {
     }
 }
 
-void rom_font(rt::Context& c) { unknown("ROMFONT (0x8C0000B4)", c); }
-void flash(rt::Context& c) { unknown("FLASHROM (0x8C0000B8)", c); }
+// ROMFONT (vector 0x8C0000B4), r1 the function: 0 the font's address, 1 lock it (for the
+// caller's use), 2 unlock. The font is the boot ROM's own, which this project doesn't have: a
+// request for it stops. Locking and unlocking succeed (nothing else uses it).
+void rom_font(rt::Context& c) {
+    switch (c.r[1]) {
+    case 1: c.r[0] = 0; return;
+    case 2: return;
+    default:
+        rt::log("msr: the game asks for the boot ROM's font (ROMFONT, r1 = %u), which the port doesn't have", c.r[1]);
+        throw rt::Stop{rt::Stop::Unsupported, c.pr, c.r[1]};
+    }
+}
+
+// FLASHROM (vector 0x8C0000B8), r7 the function, over the console's flash memory
+// (dreamcast/src/flash.cpp, a file in the data folder): 0 a partition's place and size (r4 the
+// partition, two words at r5), 1 read (r4 offset, r5 to, r6 bytes), 2 write (r4 offset, r5
+// from, r6 bytes), 3 erase the partition at offset r4. The calls return what the boot ROM's do:
+// 0 or the bytes, -1 on a bad argument.
+void flash(rt::Context& c) {
+    switch (c.r[7]) {
+    case 0: {
+        uint32_t offset = 0, size = 0;
+        if (!dreamcast::flash::info(c.r[4], offset, size)) {
+            c.r[0] = static_cast<uint32_t>(-1);
+            return;
+        }
+        rt::st32(c.r[5], offset), rt::st32(c.r[5] + 4, size);
+        c.r[0] = 0;
+        return;
+    }
+    case 1: c.r[0] = static_cast<uint32_t>(dreamcast::flash::read(c.r[4], c.r[5], c.r[6])); return;
+    case 2: c.r[0] = static_cast<uint32_t>(dreamcast::flash::write(c.r[4], c.r[5], c.r[6])); return;
+    case 3: c.r[0] = static_cast<uint32_t>(dreamcast::flash::erase(c.r[4])); return;
+    default: unknown("FLASHROM (0x8C0000B8)", c);
+    }
+}
 
 // ---- GDROM (vector 0x8C0000BC, r6 = 0): the drive, r7 the function ----
 // From Toy Commander--QilinRecomp's replacement of the same calls (its
@@ -65,6 +102,8 @@ enum Command : uint32_t {
     kPause = 22,
     kRelease = 23,
     kInit = 24,     // the drive's initialisation
+    kSeek = 27,     // {frame address, 0}: move the head there
+    kDmaStream = 28,  // {frame address, sectors}: a streaming read (calls 6 and 7)
     kSubcode = 34,  // the sub-channel's data
     kVersion = 40,  // the drive's version string, to the address in the first parameter
 };
@@ -73,6 +112,23 @@ struct Request {
     uint32_t id = 0, bytes = 0;
 };
 Request g_last;
+
+// A streaming read (command 28, CD_CMD_DMAREAD_STREAM): sent with {frame
+// address, sectors} (the driver's 0x8C12E44A, called by the file system's
+// stream reader 0x8C120C72 with a sector count). The data then comes out in
+// pieces the driver asks for with call 6, {buffer, bytes} (0x8C12E466), each
+// a DMA ending with event 0xA40; call 7 gives the bytes of the piece still to
+// come (0x8C12E5EC). While the stream has data left, call 1 answers 3,
+// streaming; then 2, complete. Abort (call 8) ends it.
+struct Stream {
+    uint32_t id = 0;
+    uint32_t sector = 0;     // the next one to read from the disc
+    uint64_t left = 0;       // bytes still to come out of the stream
+    uint64_t sent = 0;       // bytes handed out so far
+    uint8_t buffer[2048];    // the sector being handed out
+    uint32_t in_buffer = 0;  // bytes of it not yet handed out
+};
+Stream g_stream;
 uint32_t g_next_id = 1;
 // The GD-ROM DMA's end (event 0xA40), raised by a DMA read and delivered at the next call that
 // can take it: on the console it comes a moment after the read is sent, never inside that call.
@@ -136,12 +192,21 @@ void gd_send_command(rt::Context& c) {
     Request r{g_next_id++, 0};
     switch (command) {
     case kInit: break;
+    case kSeek: break;  // the drive seeks instantly
     case kToc: write_toc(c, rt::ld32(c.r[5]), rt::ld32(c.r[5] + 4)); break;
     case kPioRead:
     case kDmaRead:
         r.bytes = read_sectors(c, rt::ld32(c.r[5]), rt::ld32(c.r[5] + 4), rt::ld32(c.r[5] + 8));
         if (command == kDmaRead) g_dma_end_pending = true;
         break;
+    case kDmaStream: {
+        const uint32_t frame = rt::ld32(c.r[5]), sectors = rt::ld32(c.r[5] + 4);
+        if (frame < kFrameOffset || sectors == 0) gd_stop(c, "a stream from before the disc's start, or of nothing", frame);
+        if (g_stream.left) gd_stop(c, "a second stream while one is open", frame);
+        g_stream.id = r.id, g_stream.sector = frame - kFrameOffset, g_stream.in_buffer = 0, g_stream.sent = 0;
+        g_stream.left = uint64_t(sectors) * 2048;
+        break;
+    }
     case kVersion: {
         static constexpr char kText[] = "GDC Version 1.00";
         const uint32_t to = rt::ld32(c.r[5]);
@@ -162,9 +227,57 @@ void gd_send_command(rt::Context& c) {
 void gd_check_command(rt::Context& c) {
     deliver_pending(c);
     const uint32_t id = c.r[4], status = c.r[5];
+    if (id != 0 && id == g_stream.id) {
+        const uint32_t sent = static_cast<uint32_t>(g_stream.sent);
+        rt::st32(status, 0), rt::st32(status + 4, 0), rt::st32(status + 8, sent), rt::st32(status + 12, 0);
+        c.r[0] = g_stream.left ? 3 : 2;  // streaming, then complete
+        if (!g_stream.left) g_stream.id = 0;
+        return;
+    }
     if (id == 0 || id != g_last.id) gd_stop(c, "the state of a request never sent", id);
     rt::st32(status, 0), rt::st32(status + 4, 0), rt::st32(status + 8, g_last.bytes), rt::st32(status + 12, 0);
     c.r[0] = 2;
+}
+
+// Call 6: the next `bytes` of stream r4 to the buffer, {buffer, bytes} at r5, by DMA (ending
+// with event 0xA40). Returns 0, started (here: done).
+void gd_dma_transfer(rt::Context& c) {
+    if (c.r[4] == 0 || c.r[4] != g_stream.id) gd_stop(c, "a transfer from a stream that isn't open", c.r[4]);
+    uint32_t to = (rt::ld32(c.r[5]) & 0x1FFFFFFFu) | 0x80000000u;  // DMA addresses are physical
+    uint32_t bytes = rt::ld32(c.r[5] + 4);
+    if ((bytes & 3u) || (to & 3u)) gd_stop(c, "a stream transfer of an odd size or to an odd address", bytes);
+    if (bytes > g_stream.left) gd_stop(c, "a stream transfer past the stream's end", bytes);
+    while (bytes) {
+        if (g_stream.in_buffer == 0) {
+            if (!g_drive->read(g_stream.sector++, g_stream.buffer)) rt::fatal("GD-ROM: %s", g_drive->error().c_str());
+            g_stream.in_buffer = 2048;
+        }
+        const uint32_t n = std::min(bytes, g_stream.in_buffer);
+        const uint8_t* from = g_stream.buffer + (2048 - g_stream.in_buffer);
+        for (uint32_t i = 0; i < n; i += 4) {
+            uint32_t w;
+            std::memcpy(&w, from + i, 4);
+            rt::st32(to + i, w);
+        }
+        to += n, bytes -= n, g_stream.in_buffer -= n, g_stream.left -= n, g_stream.sent += n;
+    }
+    g_dma_end_pending = true;
+    c.r[0] = 0;
+}
+
+// Call 7: the bytes of stream r4's current transfer still to come, to the word at r5: none.
+void gd_dma_check(rt::Context& c) {
+    if (c.r[4] == 0 || c.r[4] != g_stream.id) gd_stop(c, "the progress of a stream that isn't open", c.r[4]);
+    deliver_pending(c);
+    rt::st32(c.r[5], 0);
+    c.r[0] = 0;
+}
+
+// Call 8: abandons request r4: a stream ends; anything else is already done.
+void gd_abort(rt::Context& c) {
+    deliver_pending(c);
+    if (c.r[4] != 0 && c.r[4] == g_stream.id) g_stream = Stream{};
+    c.r[0] = 0;
 }
 
 // Call 4: the drive's state into r4's two words: 1 (paused: a disc in, idle) and 0x80 (a GD-ROM).
@@ -184,12 +297,19 @@ void gdrom(rt::Context& c) {
     case 3: return;                     // initialise: nothing queued after it
     case 4: return gd_check_drive(c);
     case 5: c.r[0] = 0; return;         // the DMA's end, reported: nothing to do
-    case 8: deliver_pending(c), c.r[0] = 0; return;  // abort: nothing is in progress
-    case 9: deliver_pending(c), c.r[0] = 0; return;  // reset: nothing is in progress
+    case 6: return gd_dma_transfer(c);
+    case 7: return gd_dma_check(c);
+    case 8: return gd_abort(c);
+    case 9: deliver_pending(c), g_stream = Stream{}, c.r[0] = 0; return;  // reset: a stream ends
     default: unknown("GDROM (0x8C0000BC)", c);
     }
 }
-void system(rt::Context& c) { unknown("SYSTEM (0x8C0000E0)", c); }
+// SYSTEM (vector 0x8C0000E0): the console's reset and its own menus, r4 saying which. The game
+// leaves through it (the soft reset, A + B + X + Y + Start, or its exit): the program ends.
+void system(rt::Context& c) {
+    rt::log("msr: the game hands back to the console (SYSTEM, r4 = %d): exiting", static_cast<int>(c.r[4]));
+    std::exit(0);
+}
 
 constexpr std::array<rt::Provided, 5> kCalls{{
     {kSysinfo, "boot ROM: SYSINFO", sysinfo},

@@ -15,8 +15,9 @@ class GdRom;
 
 namespace dreamcast {
 
-// The disc: CD audio's samples (sound.cpp).
-void map_aica(const qilin::GdRom& disc);
+// The disc: CD audio's samples (sound.cpp); null where there is no image (a folder in
+// development: CD audio then stops).
+void map_aica(const qilin::GdRom* disc);
 // Sound RAM, 2 MB.
 uint8_t* sound_ram();
 

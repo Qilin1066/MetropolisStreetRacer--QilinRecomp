@@ -30,7 +30,7 @@ constexpr unsigned kRate = 44100;  // the chip's output rate
 // The lock, and the chip's state under it. `registers` is the sound chip's
 // register file (64 KB, aica.cpp), `ram` its 2 MB of sound RAM.
 std::unique_lock<std::mutex> lock();
-void attach(const uint8_t* registers, const uint8_t* ram, const qilin::GdRom& disc);
+void attach(const uint8_t* registers, const uint8_t* ram, const qilin::GdRom* disc);
 
 // With the lock held:
 void sync();          // render up to the present guest time

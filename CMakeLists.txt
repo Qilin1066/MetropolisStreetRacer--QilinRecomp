@@ -168,7 +168,7 @@ if(QILIN_HOST)
     # sound chip's channels and flash memory. Built without the game, so CI compiles it.
     add_library(dreamcast_hw STATIC dreamcast/src/pvr.cpp dreamcast/src/texture.cpp dreamcast/src/renderer.cpp
         dreamcast/src/video.cpp dreamcast/src/maple.cpp dreamcast/src/sh4.cpp dreamcast/src/clock.cpp dreamcast/src/ta.cpp
-        dreamcast/src/interrupts.cpp dreamcast/src/sound.cpp dreamcast/src/flash.cpp)
+        dreamcast/src/interrupts.cpp dreamcast/src/sound.cpp dreamcast/src/flash.cpp dreamcast/src/aica.cpp)
     target_include_directories(dreamcast_hw PUBLIC dreamcast/src)
     target_link_libraries(dreamcast_hw PUBLIC qilin_runtime dreamcast_menu qilin_disc PRIVATE SDL3::SDL3-static qilin_warnings)
     target_compile_definitions(dreamcast_hw PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
@@ -222,6 +222,11 @@ endif()
 add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp msr/src/drive.cpp)
 target_include_directories(msr_port PUBLIC msr/src)
 target_link_libraries(msr_port PUBLIC qilin_runtime qilin_disc PRIVATE qilin_warnings)
+if(QILIN_HOST)
+    target_link_libraries(msr_port PUBLIC dreamcast_hw)  # flash memory (the boot ROM's FLASHROM calls)
+else()
+    target_include_directories(msr_port PRIVATE dreamcast/src)
+endif()
 
 # ---- Lifted code (optional): the output of `qilin lift`, which is derived
 # from the game and so lives outside the repository ----

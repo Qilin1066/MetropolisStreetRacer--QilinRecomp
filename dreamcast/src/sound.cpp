@@ -239,8 +239,8 @@ void wav_header() {
 
 std::unique_lock<std::mutex> lock() { return std::unique_lock<std::mutex>(g_mutex); }
 
-void attach(const uint8_t* registers, const uint8_t* ram, const qilin::GdRom& disc) {
-    g_regs = registers, g_ram = ram, g_disc = &disc;
+void attach(const uint8_t* registers, const uint8_t* ram, const qilin::GdRom* disc) {
+    g_regs = registers, g_ram = ram, g_disc = disc;
 }
 
 void set_tick(void (*tick)()) { g_tick = tick; }
@@ -274,6 +274,7 @@ void cd_play(unsigned first, unsigned last, uint32_t repeats) {
     sync();
     const qilin::GdTrack* from = nullptr;
     const qilin::GdTrack* to = nullptr;
+    if (!g_disc) rt::fatal("sound: CD audio needs the disc image (this run reads a folder)");
     for (const auto& t : g_disc->tracks) {
         if (t.number == first) from = &t;
         if (t.number == last) to = &t;

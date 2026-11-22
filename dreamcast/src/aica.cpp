@@ -456,7 +456,7 @@ void reg_write(uint32_t a, uint32_t v, unsigned n) {
 
 }  // namespace
 
-void map_aica(const qilin::GdRom& disc) {
+void map_aica(const qilin::GdRom* disc) {
     sound::attach(g_regs, g_ram, disc);
     sound::set_tick(driver_frame);
     rt::map({kRamLo, kRamLo + kRamBytes, "sound RAM", ram_read, ram_write, ram_block});

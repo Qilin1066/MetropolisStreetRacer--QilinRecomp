@@ -78,13 +78,28 @@ Each step: run `msr`, read where it stops, provide what it needs, run again.
     - A DMA read's end is raised as normal event 14 and delivered at the next poll. The vertical blank runs at 60 Hz.
 12. **The libraries' scheduler returning into a task's entry** (`0x8C13190C`, an entry stub: `bra common; mov #n,r4`, seven of them, and one that falls in, `0x8C131978`). The CFG now takes such stubs as functions (`recompiler-core.md`). The scheduler then starts the tasks as guest threads: the first real use of the fibers.
 13. **The game proper**: tasks run, the file system reads files, and the game's code runs deep (frames from `0x8C0307CE` down through the file system). It stops at **GD-ROM command 28** (`CD_CMD_DMAREAD_STREAM`, from `0x8C120C72`, the file system's streaming read), which the drive doesn't do yet. Command 28 streams data until it reaches the end or is aborted. The game then moves the data with calls 6 and 7 (transfer, then the bytes still to come), and while the stream lasts `check_command` returns 3, "streaming" (the KallistiOS documentation of the same calls). Next: what this game's driver sends and expects there, read from its code.
+14. **Written, not yet run** (the author, 2026-11-22: coding for now, no testing).
+    - **Streaming reads:**
+      - command 28 is sent with {frame address, sectors} (the driver's `0x8C12E44A`); the file system's stream reader `0x8C120C72` counts in sectors;
+      - call 6, {buffer, bytes}, hands out the next bytes by DMA, ending with event 0xA40 (`0x8C12E466`);
+      - call 7 gives the bytes of that piece still to come (`0x8C12E5EC`): none here;
+      - call 1 answers 3, streaming, while data is left, then 2;
+      - abort and reset end a stream.
+
+      From the driver's own wrappers (`0x8C12E2B8` + 0x14 n for calls 0–10, `0x8C12E394` and `0x8C12E3A8` for MISC 0 and 1) and from what the KallistiOS documentation says about the same calls.
+    - **Seek** (command 27).
+    - **FLASHROM:** info, read, write and erase over `dreamcast/src/flash.cpp`.
+    - **ROMFONT:** lock and unlock succeed; a request for the font stops, since the boot ROM's font isn't here.
+    - **SYSTEM** (`0x8C0000E0`): the game handing back to the console, so the program ends.
+    - **`msr` now starts the window, the renderer and the settings menu** (`video::start`) **and the sound output** (`sound::start`), and maps the sound chip (`map_aica`). CD audio needs the disc image; with a folder it stops.
+    - **The sound driver:** the game loads `SOUND\MANATEE.DRV` (Sega's later driver, with MLT sound banks), not `AUDIO64.DRV`, which is also on the disc. Toy Commander's stand-in is for AUDIO64 (versions 1.80 and 1.90) and stops on any other driver when the game releases the sound CPU. This disc's AUDIO64 is version 1.90f.2, with the interface table `0xAAC`, `0xAEC`, `0xB34`. A stand-in for Manatee comes next.
 
 ## The Dreamcast and host layers
 
 `dreamcast/` and `host/` are Toy Commander--QilinRecomp's (2026-11-22, its commit `085a3fd`), kept in step. The changes made to fit this runtime:
 - `sound.cpp` reads CD audio through `qilin::GdRom` (`read_audio`, added to `recomp/src/gdrom`). Its tracks start at the file's first sector, pregap included, where Toy Commander's start at index 1.
 - `guest.hpp` gained the interrupt hooks (`g_irq_pending`, `g_irq_waiting`, `g_irq_service`, `QILIN_POLL_IRQ`) and `set_sr`'s re-raise when IMASK drops. The lifter doesn't poll yet.
-- `aica.cpp` isn't built: it is Toy Commander's stand-in for its sound driver (`AUDIO64.DRV`, versions 1.80 and 1.90). This disc has an `AUDIO64.DRV` too, whose version is to be checked.
+- `aica.cpp` is built: its sound RAM and registers are the game's; its driver stand-in is for AUDIO64 (versions 1.80 and 1.90) and stops on this game's Manatee driver. `map_aica` and `sound::attach` take the disc image by pointer, null for a folder (CD audio then stops).
 
 The game's side of `game.hpp` is `msr/src/game.cpp`. No interrupt handler is known yet, so the interrupt service holds every event back, and a system bus event that needs delivering stops.
 
