@@ -341,10 +341,11 @@ int cmd_trial(const Args& a) {
 int cmd_lift(const Args& a) {
     if (!a.out_dir) throw Failure{"lift needs --out <dir>"};
     const BootFile boot = must(BootFile::load(a.input), a.input);
-    if (!known_build(boot.sha256)) throw Failure{std::format("{}: not a supported program (SHA-256 {})", a.input, boot.sha256)};
+    const KnownBuild* build = known_build(boot.sha256);
+    if (!build) throw Failure{std::format("{}: not a supported program (SHA-256 {})", a.input, boot.sha256)};
     Cfg cfg(boot);
     cfg.run();
-    const Lifter lifter(cfg);
+    const Lifter lifter(cfg, build->setjmp);
     const std::filesystem::path dir(*a.out_dir);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -361,6 +362,7 @@ int cmd_lift(const Args& a) {
     std::string stubs = std::format("{}#include \"functions.hpp\"\nnamespace qilin::gen {{\n", kHead);
     std::string chunk, report;
     std::set<std::pair<uint32_t, uint32_t>> folded;  // literals compiled as constants
+    std::map<uint32_t, std::string> jump_sites;      // setjmp call returns, and the function each is in
     std::map<std::string, size_t> reasons;
     size_t lifted = 0, in_chunk = 0, chunks = 0, instructions = 0;
     const auto flush = [&] {
@@ -378,6 +380,7 @@ int cmd_lift(const Args& a) {
                              result.keeps_mode || !result.ok ? "true" : "false");
         if (result.ok) {
             folded.insert(result.folded.begin(), result.folded.end());
+            for (const uint32_t r : result.jump_sites) jump_sites.emplace(r, name);
             chunk += result.code + "\n";
             ++lifted;
             instructions += f.insns.size();
@@ -392,8 +395,15 @@ int cmd_lift(const Args& a) {
     flush();
     write_text((dir / "functions.hpp").string(), decls + "}  // namespace qilin::gen\n");
     write_text((dir / "table.cpp").string(),
-               table + std::format("}};\nextern const size_t g_function_count = {};\n}}  // namespace qilin::rt\n",
-                                   cfg.functions().size()));
+               table + std::format("}};\nextern const size_t g_function_count = {};\n", cfg.functions().size()) +
+                   [&] {
+                       // Where a longjmp may come back to (sorted), with a placeholder when there are none.
+                       std::string s = "extern const JumpSiteEntry g_jump_sites[] = {\n";
+                       for (const auto& [r, fn] : jump_sites) s += std::format("    {{0x{:08x}u, gen::{}}},\n", r, fn);
+                       if (jump_sites.empty()) s += "    {0u, nullptr},\n";
+                       return s + std::format("}};\nextern const size_t g_jump_site_count = {};\n}}  // namespace qilin::rt\n",
+                                              jump_sites.size());
+                   }());
     write_text((dir / "stubs.cpp").string(), stubs + "}  // namespace qilin::gen\n");
     // The literals compiled as constants, sorted: checked builds stop on a store into one.
     std::string lits = std::format("{}#include \"guest.hpp\"\nnamespace qilin::rt {{\nextern const Region g_folded[] = {{\n", kHead);

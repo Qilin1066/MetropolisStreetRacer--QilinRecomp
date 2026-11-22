@@ -418,6 +418,14 @@ What is still not tested, by design: the arithmetic of `fipr`, `ftrv`, `fsca` an
 ### Next
 
 - A second lifting for the FR = 1 interrupt path, or the runtime's native interrupt delivery in its place.
-- `setjmp`/`longjmp` across recompiled frames (unwinding to the `setjmp` call site).
+- `setjmp`/`longjmp` across recompiled frames (unwinding to the `setjmp` call site; done within a guest thread, below).
 - The RAM mirrors at `0x8D000000`–`0x8FFFFFFF` in the runtime.
 - Flycast or a console for the vector instructions.
+
+## Runtime: address space, guest threads, longjmp (unreleased)
+
+The first runtime pieces, outside the generated code (`recomp/runtime/`, library `qilin_platform`).
+
+- **Address space** (`memory.hpp`). One 16 MiB block of shared memory is mapped at every address main RAM answers to: `0x0C000000`, `0x0D000000`, `0x0E000000` and `0x0F000000` (the area and its three mirrors) in each of P0, P1, P2 and P3, sixteen views inside a 4 GiB reservation. A guest address is then the host offset, and an access needs no address arithmetic; everything else faults. Linux uses `memfd_create`, macOS `shm_open`, Windows placeholders (`VirtualAlloc2` and `MapViewOfFile3`, Windows 10 1803 or later). The compiler doesn't know two views are one byte: it may reorder accesses at constant addresses in different views (the arm64 CI build of the test did). Canonical addresses for constants in the lifted code are an open point.
+- **Guest threads** (`fiber.hpp`). The game's libraries run cooperative threads by `setjmp` into the current thread's context and `longjmp` into the next one's, on its own stack. Each guest thread is a fiber: a host stack (1 MiB, with a guard page) and a switch of the callee-saved registers, in assembly for x86-64 and AArch64 (System V and Apple) and with the Windows fiber API on Windows. AddressSanitizer is told about each switch. Not yet driven by the game.
+- **`longjmp` across lifted frames.** The program's `setjmp` (`0x8C0EE5BC`, in the known-build table) has 4 call sites, in the libraries' thread code (`0x8C147A70`, `0x8C147B06`, `0x8C147D36`, `0x8C147D78`). The lifter makes the functions with one resumable there: each site is an `rt::JumpSite` object in the frame, armed with the stack pointer `setjmp` sees when the call runs, and the body is inside a loop and a `try` with a `switch` that can enter at the instruction after the call. A callee that returns somewhere other than the instruction after its call (`rt::returned_to`) goes to `rt::nonlocal_return`: the innermost armed site of the running thread with that return address and stack pointer is the one the `longjmp` meant, and an `rt::Unwind` thrown to it takes the stack down to that frame, which reloads its registers and goes on after the call. A site no frame of the thread holds (another thread's, or a thread starting there) stops as unsupported until the runtime switches guest threads; any other return elsewhere stops as before. `qilin lift` writes the sites, with their functions, in `table.cpp`. A unit test runs a hand-written frame through the unwind; the differential test passes the four functions, `setjmp`, `longjmp` and `0x8C0F1668`.

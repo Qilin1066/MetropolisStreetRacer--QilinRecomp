@@ -27,7 +27,55 @@ const FnEntry& find(uint32_t target, uint32_t from) {
     if (it == end || it->addr != a) bad_jump(from, target);
     return *it;
 }
+// The setjmp sites armed in the guest thread running (innermost first). One
+// list for now: switching between the guest's threads (fibers) comes with the
+// runtime; until then a longjmp into another thread, or to start one, stops.
+thread_local JumpSite* t_sites = nullptr;
+thread_local uint32_t t_resume = 0;
+int t_thread_tag;  // what `JumpSite::thread` points at for this list
+
+bool is_jump_site(uint32_t ret) {
+    const JumpSiteEntry* end = g_jump_sites + g_jump_site_count;
+    const JumpSiteEntry* it =
+        std::lower_bound(g_jump_sites, end, ret, [](const JumpSiteEntry& e, uint32_t x) { return e.ret < x; });
+    return it != end && it->ret == ret;
+}
 }  // namespace
+
+void JumpSite::arm(uint32_t sp_) {
+    sp = sp_;
+    if (thread) return;  // armed again (a loop): already registered
+    next = t_sites;
+    t_sites = this;
+    thread = &t_thread_tag;
+}
+
+JumpSite::~JumpSite() {
+    if (!thread) return;
+    // Frames end innermost first, so this is nearly always the head.
+    for (JumpSite** p = &t_sites; *p; p = &(*p)->next)
+        if (*p == this) {
+            *p = next;
+            return;
+        }
+}
+
+uint32_t take_resume() {
+    const uint32_t r = t_resume;
+    t_resume = 0;
+    return r;
+}
+
+void nonlocal_return(const Context& c, uint32_t from) {
+    // A longjmp restores the stack pointer setjmp saw and returns to its caller:
+    // the innermost frame with that site and stack pointer is the one it meant.
+    for (const JumpSite* s = t_sites; s; s = s->next)
+        if (s->ret == c.ret && s->sp == c.r[15]) throw Unwind{s};
+    // A setjmp site no frame of this thread holds: another guest thread's, or a
+    // new one starting there. Not yet (cooperative threads come with the runtime).
+    if (is_jump_site(c.ret)) throw Stop{Stop::Unsupported, from, c.ret};
+    throw Stop{Stop::BadReturn, from, c.ret};
+}
 
 // The code after an indirect call goes on in the program's mode (PR, SZ and
 // FR clear): a callee that may return in another checks it.

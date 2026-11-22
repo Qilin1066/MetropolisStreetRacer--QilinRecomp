@@ -46,6 +46,8 @@ struct LiftResult {
     bool keeps_mode = true;  // returns in the program's mode (else an indirect call checks it after)
     // Literals compiled as constants: (address, size). Checked builds stop on a store into one.
     std::vector<std::pair<uint32_t, uint32_t>> folded;
+    // The return addresses of its calls to setjmp: a longjmp may resume it there.
+    std::vector<uint32_t> jump_sites;
 };
 
 // Whether a function is lifted with the floating-point mode read at run time:
@@ -56,11 +58,14 @@ bool any_mode(const Function& f);
 
 class Lifter {
 public:
-    explicit Lifter(const Cfg& cfg);
+    // setjmp: the program's setjmp, if it has one (from the known-build table): its call sites are
+    // where a longjmp may come back to, so the functions with one are lifted to be resumable there.
+    explicit Lifter(const Cfg& cfg, uint32_t setjmp = 0);
     LiftResult lift(const Function& f) const;
 
 private:
     const Cfg& cfg_;
+    uint32_t setjmp_ = 0;
     // Words some code takes the address of with mova: a literal there may be written (hand-written
     // code keeps variables in its pools), so it is loaded from memory, not compiled as a constant.
     std::set<uint32_t> mova_words_;

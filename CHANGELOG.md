@@ -11,6 +11,14 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Added
+- **The guest address space** in the runtime: main RAM mapped at all sixteen of its addresses (the area and its mirrors, in P0 to P3), so an access needs no address arithmetic. Linux, macOS and Windows.
+- **Fibers** for the guest's cooperative threads: switching in assembly on x86-64 and AArch64, the Windows fiber API on Windows; AddressSanitizer is told about each switch.
+- **`longjmp` across lifted frames**: the functions that call the program's `setjmp` are lifted to be resumable after the call, and a return to an armed `setjmp` site unwinds the host stack to its frame. `setjmp`'s address is in the known-build table; `table.cpp` lists the sites.
+
+### Fixed
+- The memory test on arm64: the compiler reordered accesses at two views of the same byte (now fenced; the hazard is documented).
+
 ## [0.9.0] - 2026-11-22
 Every function lifts (5,252 of 5,252), and every trial of the differential test ends in a comparison, at the end or where the lifted code stopped: 5,241 of 5,252 functions have a conclusive trial (4,431 to the end, 810 to a stop), with no failures. 11 remain: the SH-4 exception and interrupt machinery the runtime replaces, loops walking random data off the end of RAM, and start-up, which doesn't reach its stop in QEMU in time.
 

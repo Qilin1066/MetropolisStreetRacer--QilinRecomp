@@ -42,8 +42,8 @@ uint16_t gpr_uses(const Insn& in) {
 // One function being lifted.
 class Emit {
 public:
-    Emit(const Cfg& cfg, const Function& f, const std::set<uint32_t>& mova_words)
-        : cfg_(cfg), f_(f), mova_words_(mova_words) {
+    Emit(const Cfg& cfg, const Function& f, const std::set<uint32_t>& mova_words, uint32_t setjmp)
+        : cfg_(cfg), f_(f), mova_words_(mova_words), setjmp_(setjmp) {
         for (const auto& [pc, mode] : f.fp_modes) modes_[pc] = mode;
     }
 
@@ -92,8 +92,21 @@ public:
         for (unsigned r = 0; r < 16; ++r)
             if (used_ >> r & 1) code += std::format("    QILIN_REG r{} = c.r[{}];\n", r, r);
         code += "    QILIN_REG t = c.t;\n";
+        if (sites_.empty()) return code + body + "}\n";
 
-        return code + body + "}\n";
+        // Resumable at its setjmp sites: a longjmp to one of them unwinds to this frame (rt::Unwind,
+        // caught below) or, as a new guest thread, enters a new frame there (rt::take_resume).
+        for (const uint32_t r : sites_) code += std::format("    rt::JumpSite site_{:08x}({});\n", r, hex(r));
+        code += "    for (uint32_t resume = rt::take_resume();;) {\n        try {\n";
+        code += "            switch (resume) {\n";
+        for (const uint32_t r : sites_)
+            code += std::format("            case {}: {}goto {};\n", hex(r), sync_in(), label(r));
+        code += "            default: break;\n            }\n";
+        code += body + "            return;\n";
+        code += "        } catch (const rt::Unwind& u) {\n";
+        for (const uint32_t r : sites_) code += std::format("            if (u.site == &site_{:08x}) {{ resume = {}; continue; }}\n", r, hex(r));
+        code += "            throw;\n        }\n    }\n}\n";
+        return code;
     }
 
 private:
@@ -102,6 +115,15 @@ private:
         // A function whose floating-point mode isn't proven everywhere is lifted with the mode read
         // at run time (see fp_statement), and checks it where it calls out or returns.
         dynamic_ = is_dynamic(f_);
+        // Calls to setjmp: a longjmp may come back to the instruction after each, in this frame or
+        // (another guest thread starting there) in a new one. They need labels, and r15.
+        if (setjmp_)
+            for (const auto& [pc, target] : f_.calls)
+                if (target == setjmp_) {
+                    sites_.push_back(pc + 4);
+                    targets_.insert(pc + 4);
+                    used_ |= 1u << 15;
+                }
         if (!f_.bad.empty()) throw Fail{f_.bad[0], "reaches a word that isn't an instruction"};
         if (!f_.bad_slots.empty()) throw Fail{f_.bad_slots[0], "a delayed branch without a legal delay slot"};
         // A branch into a delay slot (hand-written code does this): the slot's instruction is
@@ -544,8 +566,11 @@ private:
                                          : std::format("const uint32_t target = {} + {}; ", hex(pc + 4), rn);
             }
             // An indirect call checks the callee's needs itself (rt::call_any_mode).
-            body += std::format("c.pr = {}; {}{}{}", ret, slot,
-                                direct != f_.calls.end() ? mode_check_out(pc, direct->second) : std::string{}, sync_out());
+            body += std::format("c.pr = {}; {}{}", ret, slot,
+                                direct != f_.calls.end() ? mode_check_out(pc, direct->second) : std::string{});
+            if (direct != f_.calls.end() && setjmp_ && direct->second == setjmp_)
+                body += std::format("site_{:08x}.arm(r15); ", pc + 4);  // the stack pointer setjmp saves
+            body += sync_out();
             if (direct != f_.calls.end()) body += std::format("{}(c); ", callee(pc, direct->second));
             else body += std::format("rt::call{}(c, target, {}); ", dynamic_ ? "_any_mode" : "", hex(pc));
             body += std::format("rt::returned_to(c, {}, {}); {}}}\n", ret, hex(pc), sync_in());
@@ -604,6 +629,7 @@ public:
     bool synced() const { return sync_; }
     bool dynamic() const { return dynamic_; }
     const std::vector<std::pair<uint32_t, uint32_t>>& folded() const { return folded_; }
+    const std::vector<uint32_t>& sites() const { return sites_; }
 
 private:
     const Cfg& cfg_;
@@ -615,6 +641,8 @@ private:
     bool dynamic_ = false;                 // the floating-point mode is read at run time
     mutable std::optional<uint8_t> forced_;  // the mode fp_statement is lifting for
     const std::set<uint32_t>& mova_words_;
+    uint32_t setjmp_ = 0;
+    std::vector<uint32_t> sites_;  // return addresses of this function's calls to setjmp
     mutable std::vector<std::pair<uint32_t, uint32_t>> folded_;
 };
 
@@ -630,7 +658,7 @@ bool any_mode(const Function& f) {
            (f.fp_modes.empty() && f.calls.empty() && f.tails.empty() && f.icalls.empty() && f.itails.empty() && !f.falls_into);
 }
 
-Lifter::Lifter(const Cfg& cfg) : cfg_(cfg) {
+Lifter::Lifter(const Cfg& cfg, uint32_t setjmp) : cfg_(cfg), setjmp_(setjmp) {
     // Pool words code may write: one a mova points at, or one whose address is itself a constant in
     // some pool (cached or uncached alias), as the libraries' handler table is (0x8C130B24).
     std::set<uint32_t> pool;
@@ -648,12 +676,13 @@ Lifter::Lifter(const Cfg& cfg) : cfg_(cfg) {
 LiftResult Lifter::lift(const Function& f) const {
     LiftResult result;
     try {
-        Emit emit(cfg_, f, mova_words_);
+        Emit emit(cfg_, f, mova_words_, setjmp_);
         const std::string code = emit.run();
         result.code = emit.sync_macros() + code;
         result.dynamic = emit.dynamic();
         result.any_mode = any_mode(f);
         result.folded = emit.folded();
+        result.jump_sites = emit.sites();
         result.keeps_mode = f.fp_exit_known == kFpAll && f.fp_exit == cfg_.entry_mode();
         if (emit.synced()) result.code += "#undef QILIN_OUT\n#undef QILIN_IN\n";
         result.ok = true;

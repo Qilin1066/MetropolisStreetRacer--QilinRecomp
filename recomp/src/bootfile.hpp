@@ -66,6 +66,7 @@ struct KnownBuild {
     std::string_view product_number;
     std::string_view version;
     std::string_view title;           // the disc's title and what this program is
+    uint32_t setjmp = 0;              // its C library's setjmp, if known (0: none)
 };
 const KnownBuild* known_build(std::string_view sha256_hex);
 

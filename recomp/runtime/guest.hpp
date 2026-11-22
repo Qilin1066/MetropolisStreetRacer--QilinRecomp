@@ -447,6 +447,13 @@ inline void lds_fpscr(uint32_t& fpscr, uint32_t v, uint32_t pc);
 // ---- calls ----
 
 using Fn = void (*)(Context&);
+// The functions that call setjmp, by the return address of each call (generated, sorted).
+struct JumpSiteEntry {
+    uint32_t ret;
+    Fn fn;
+};
+extern const JumpSiteEntry g_jump_sites[];
+extern const size_t g_jump_site_count;
 struct FnEntry {
     uint32_t addr;
     Fn fn;
@@ -465,8 +472,35 @@ void call_any_mode(Context& c, uint32_t target, uint32_t from);
 [[noreturn]] inline void bad_jump(uint32_t from, uint32_t target) { throw Stop{Stop::BadJump, from, target}; }
 [[noreturn]] inline void not_lifted(uint32_t fn) { throw Stop{Stop::NotLifted, fn, fn}; }
 // After a call: the callee must have returned to the instruction after it.
+// ---- setjmp and longjmp across lifted frames (dispatch.cpp) ----
+// A call to setjmp in a lifted frame: while the frame lives, a longjmp may
+// come back to the instruction after it (`ret`) with the stack pointer it had
+// then. Armed when the call runs; registered with the guest thread running.
+struct JumpSite {
+    explicit JumpSite(uint32_t ret_) : ret(ret_) {}
+    ~JumpSite();
+    JumpSite(const JumpSite&) = delete;
+    JumpSite& operator=(const JumpSite&) = delete;
+    void arm(uint32_t sp_);
+    uint32_t ret, sp = 0;
+    JumpSite* next = nullptr;
+    void* thread = nullptr;  // the guest thread it is registered with, once armed
+};
+// Thrown to unwind to the frame holding `site` (a longjmp to it).
+struct Unwind {
+    const JumpSite* site;
+};
+// A new guest thread entering a function at a setjmp site: the site's return
+// address, once (0 otherwise).
+uint32_t take_resume();
+// A callee returned somewhere other than the instruction after its call: a
+// longjmp, to a live setjmp site of this thread (unwind), of another (switch
+// to it) or to one no frame holds (a new guest thread starts there). Anything
+// else stops.
+[[noreturn]] void nonlocal_return(const Context& c, uint32_t from);
 inline void returned_to(const Context& c, uint32_t expected, uint32_t from) {
-    if (c.ret != expected) throw Stop{Stop::BadReturn, from, c.ret};
+    if (c.ret != expected) [[unlikely]]
+        nonlocal_return(c, from);
 }
 [[noreturn]] inline void trap(uint32_t pc, uint32_t number) { throw Stop{Stop::Trap, pc, number}; }
 

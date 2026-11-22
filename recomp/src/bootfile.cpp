@@ -17,7 +17,7 @@ constexpr std::array<KnownBuild, 2> kKnownBuilds{{
     {"b5515a96ba7e67dc2dfe08b6adf7d99a4d6c95e7e9fb015fe1f70dffa59af0e9", "1ST_READ.BIN", "MK-51012", "V1.010",
      "Metropolis Street Racer (USA): launcher"},
     {"7780f031bc7124dd68e2b411daf5e6fb636589ab4ea9b36427531d95517d9888", "MSR.BIN", "MK-51012", "V1.010",
-     "Metropolis Street Racer (USA): game"},
+     "Metropolis Street Racer (USA): game", 0x8C0EE5BCu},
 }};
 
 std::unexpected<std::string> fail(std::string message) { return std::unexpected(std::move(message)); }

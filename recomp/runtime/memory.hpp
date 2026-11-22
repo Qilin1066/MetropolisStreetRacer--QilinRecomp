@@ -5,6 +5,12 @@
 // and P3: sixteen views of one block, so a guest load or store stays one host
 // access with no address arithmetic. Everything not mapped faults.
 //
+// The compiler doesn't know that two of these addresses are one byte: where
+// it can prove two accesses use different offsets from the base (constant
+// addresses at two aliases in one function), it may reorder them. Lifted code
+// that writes through one alias and reads through another has to be lifted
+// with that in mind (an open point: canonical addresses for constants).
+//
 // Runtime code: no std::format.
 #pragma once
 

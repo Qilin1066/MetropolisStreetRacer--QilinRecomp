@@ -92,11 +92,12 @@ else()
 endif()
 
 # ---- The guest address space (recomp/runtime/memory.hpp) ----
-add_library(qilin_memory STATIC recomp/runtime/memory.cpp)
-target_include_directories(qilin_memory PUBLIC recomp/runtime)
-target_link_libraries(qilin_memory PRIVATE qilin_warnings)
+# and fibers (recomp/runtime/fiber.hpp): the platform layer, independent of guest.hpp.
+add_library(qilin_platform STATIC recomp/runtime/memory.cpp recomp/runtime/fiber.cpp)
+target_include_directories(qilin_platform PUBLIC recomp/runtime)
+target_link_libraries(qilin_platform PRIVATE qilin_warnings)
 if(WIN32)
-    target_link_libraries(qilin_memory PRIVATE onecore)  # VirtualAlloc2, MapViewOfFile3 (Windows 10 1803+)
+    target_link_libraries(qilin_platform PRIVATE onecore)  # VirtualAlloc2, MapViewOfFile3 (Windows 10 1803+)
 endif()
 
 # ---- Lifted code (optional): the output of `qilin lift`, which is derived
@@ -124,7 +125,7 @@ endif()
 
 # ---- Tests (no game files needed) ----
 enable_testing()
-add_executable(qilin_tests recomp/tests/tests.cpp)
-target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_memory qilin_warnings)
+add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/dispatch.cpp)
+target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_platform qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)

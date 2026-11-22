@@ -3,6 +3,7 @@
 // temporary folder. No game files required (runs in CI).
 #include <algorithm>
 #include <bit>
+#include <atomic>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -19,6 +20,7 @@
 #include "decoder.hpp"
 #include "gdrom.hpp"
 #include "guest.hpp"
+#include "fiber.hpp"
 #include "memory.hpp"
 #include "lifter.hpp"
 #include "report.hpp"
@@ -580,6 +582,18 @@ void test_lifter() {
         CHECK(code.contains("#define QILIN_IN r0 = c.r[0]; r1 = c.r[1]; r4 = c.r[4]; r5 = c.r[5]; r15 = c.r[15]; t = c.t;\n"));
         CHECK(!code.contains("    ;\n"));  // nops leave nothing behind
     }
+    // With the callee as setjmp: resumable after the call (a longjmp back), the site armed with the
+    // stack pointer setjmp sees, and the site's return in the result.
+    if (cfg.functions().contains(B)) {
+        const LiftResult r = Lifter(cfg, B + 0x1C).lift(cfg.functions().at(B));
+        CHECK(r.ok);
+        CHECK(r.jump_sites == std::vector<uint32_t>{B + 8});
+        CHECK(r.code.contains("rt::JumpSite site_8c010008(0x8c010008u);"));
+        CHECK(r.code.contains("{ c.pr = 0x8c010008u; r1 = r4; site_8c010008.arm(r15); QILIN_OUT fn_8c01001c(c); "));
+        CHECK(r.code.contains("case 0x8c010008u: QILIN_IN goto L_8c010008;"));
+        CHECK(r.code.contains("if (u.site == &site_8c010008) { resume = 0x8c010008u; continue; }"));
+        CHECK(Lifter(cfg).lift(cfg.functions().at(B)).jump_sites.empty());
+    }
     // The compiler's switch becomes a switch on the target, and a tail call a call and return.
     {
         const BootFile sw = program({0x0009, 0x0009, 0x6043, 0xE103, 0x3012, 0x890B, 0x4000, 0x6103, 0xC701, 0x001D, 0x0023, 0x0009,
@@ -671,6 +685,9 @@ void test_lifter() {
             CHECK(memory.ram() == g + 0x8C000000u);
             const uint32_t word = 0x12345678u;
             std::memcpy(g + 0x8C010000u, &word, 4);  // cached
+            // The compiler can't know two addresses are one byte: without a barrier it may read the
+            // aliases before the write (GCC does on ARM64).
+            std::atomic_signal_fence(std::memory_order_seq_cst);
             bool same = true;
             for (unsigned i = 0; i < rt::GuestMemory::kRamViews; ++i) {
                 uint32_t v = 0;
@@ -679,9 +696,42 @@ void test_lifter() {
             }
             CHECK(same);
             g[0xAD010004u] = 0xAB;  // through the uncached mirror
+            std::atomic_signal_fence(std::memory_order_seq_cst);
             CHECK(g[0x8C010004u] == 0xAB && g[0x0F010004u] == 0xAB);
             CHECK(rt::GuestMemory::ram_view(0) == 0x0C000000u && rt::GuestMemory::ram_view(15) == 0xCF000000u);
         }
+    }
+
+    // ---- fibers: two stacks passing control back and forth, with an exception on one ----
+    {
+        struct Ping {
+            rt::Fiber* main = nullptr;
+            rt::Fiber* other = nullptr;
+            std::vector<int> log;
+        } ping;
+        ping.main = &rt::Fiber::current();
+        rt::Fiber other(
+            [](void* p) {
+                auto* state = static_cast<Ping*>(p);
+                for (int i = 0;; ++i) {
+                    try {
+                        if (i == 1) throw i;  // caught on this fiber's own stack
+                        state->log.push_back(10 + i);
+                    } catch (int k) {
+                        state->log.push_back(100 + k);
+                    }
+                    state->main->switch_to();
+                }
+            },
+            &ping, 64u << 10);
+        ping.other = &other;
+        CHECK(other.ok());
+        for (int i = 0; i < 3; ++i) {
+            ping.log.push_back(i);
+            other.switch_to();
+        }
+        CHECK((ping.log == std::vector<int>{0, 10, 1, 101, 2, 12}));
+        CHECK(&rt::Fiber::current() == ping.main);
     }
 
     // ---- the helpers generated code calls ----
@@ -1144,7 +1194,83 @@ void test_gdrom() {
     fs::remove_all(dir);
 }
 
+// A longjmp across frames, by hand in the shape the lifter generates: `outer`
+// calls setjmp (here, a site armed by hand), then `middle`, which calls
+// `inner`, which "returns" to the site with the stack pointer it had.
+namespace jumps {
+using namespace qilin;
+constexpr uint32_t kSite = 0x8C000108u, kSp = 0x8C00F000u;
+int middle_done = 0;
+void inner(rt::Context& c) {
+    c.r[15] = kSp;
+    c.ret = kSite;  // longjmp: back to setjmp's caller
+}
+void middle(rt::Context& c) {
+    c.r[15] = kSp - 64;
+    inner(c);
+    rt::returned_to(c, 0x8C000204u, 0x8C000200u);
+    ++middle_done;  // never: the frame is unwound
+}
+// Returns how it came back from setjmp: 0 the first time, then r0.
+uint32_t outer(rt::Context& c, std::vector<uint32_t>& seen) {
+    rt::JumpSite site(kSite);
+    for (uint32_t resume = rt::take_resume();;) {
+        try {
+            if (resume == kSite) goto after;
+            site.arm(kSp);
+            c.r[0] = 0;  // setjmp returns 0
+        after:
+            seen.push_back(c.r[0]);
+            if (c.r[0] != 0) return c.r[0];
+            c.r[0] = 7;  // longjmp's value
+            middle(c);
+            return 0;
+        } catch (const rt::Unwind& u) {
+            if (u.site == &site) {
+                resume = kSite;
+                continue;
+            }
+            throw;
+        }
+    }
+}
+}  // namespace jumps
+
+void test_nonlocal_return() {
+    using namespace jumps;
+    rt::Context c{};
+    std::vector<uint32_t> seen;
+    CHECK(outer(c, seen) == 7);
+    CHECK((seen == std::vector<uint32_t>{0, 7}));
+    CHECK(middle_done == 0);
+    // Out of the frame, the site is gone: the same return stops, as a site no frame holds (a
+    // known setjmp site: another thread's), and a return anywhere else as a bad return.
+    c.r[15] = kSp;
+    c.ret = kSite;
+    try {
+        rt::returned_to(c, 0x8C000204u, 0x8C000200u);
+        CHECK(false);
+    } catch (const rt::Stop& e) {
+        CHECK(e.kind == rt::Stop::Unsupported);
+    }
+    c.ret = 0x8C000300u;
+    try {
+        rt::returned_to(c, 0x8C000204u, 0x8C000200u);
+        CHECK(false);
+    } catch (const rt::Stop& e) {
+        CHECK(e.kind == rt::Stop::BadReturn);
+    }
+}
+
 }  // namespace
+
+// The tables `qilin lift` generates, for dispatch.cpp: no functions, one setjmp site.
+namespace qilin::rt {
+extern const FnEntry g_functions[] = {{0u, nullptr, false, false}};
+extern const size_t g_function_count = 0;
+extern const JumpSiteEntry g_jump_sites[] = {{jumps::kSite, nullptr}};
+extern const size_t g_jump_site_count = 1;
+}  // namespace qilin::rt
 
 int main() {
     test_sha256();
@@ -1156,6 +1282,7 @@ int main() {
     test_floating_point();
     test_lifter_floating_point();
     test_gdrom();
+    test_nonlocal_return();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;
