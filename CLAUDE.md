@@ -25,7 +25,7 @@ Static recompilation of **Metropolis Street Racer** (Dreamcast, North American r
 - `tools/difftest/`: `difftest.py` + `harness.cpp`: lifted code against the original under `qemu-system-sh4`.
 - `recomp/tests/tests.cpp`: unit tests (`ctest`), on a synthetic disc image.
 - `tools/check/verify_decoder.py`: compares the decoder with binutils objdump on all 65,536 words.
-- `recomp/src/arm/`: the sound CPU's (ARM7DI) decoder, for lifting the sound driver (`docs/sound.md`); `qilin armdis`, checked by `tools/check/verify_arm.py --qilin build/qilin [files]` against `arm-none-eabi-objdump -m armv4` (0 unexplained; needs `binutils-arm-none-eabi`).
+- `recomp/src/arm/`: the sound CPU's (ARM7DI) decoder and lifter (`docs/sound.md`); `qilin armlift disc/SOUND/MANATEE.DRV --out gen` writes `arm_*.cpp` beside the game's lifted code, over `recomp/runtime/arm_guest.hpp`; `qilin armdis`, checked by `tools/check/verify_arm.py --qilin build/qilin [files]` against `arm-none-eabi-objdump -m armv4` (0 unexplained; needs `binutils-arm-none-eabi`).
 - `docs/`: design and results. Keep them current. `roadmap-and-design-targets.md` is the roadmap; `disc-and-boot-analysis.md` covers the disc and what to record from it; `recompiler-core.md` the decoder and the CFG (later the lifter and difftest).
 
 ## Build and check

@@ -22,7 +22,7 @@ Every instruction can be conditional.
 
 The plan, in the order it will be written:
 1. ✅ **An ARM decoder** (`recomp/src/arm/`), table-driven like the SH-4 one, checked against `arm-none-eabi-objdump` over the driver's words. The full 32-bit encoding space is too large to sweep, so the check covers every word of the drivers and a random sample of the rest.
-2. **Discovery and lifting**:
+2. ✅ (first version) **Discovery and lifting**:
    - functions from the reset and FIQ vectors and from `BL` targets;
    - literal pools (`LDR rN,[pc,#k]`);
    - jump tables (`ADD PC,PC,rN,LSL #2` and `LDR PC,[...]` forms);
@@ -44,3 +44,15 @@ The driver is the game's data: like `MSR.BIN`, it is lifted from the player's di
   - `qilin armdis <file>` prints each word decoded.
   - `tools/check/verify_arm.py` compares the operation and condition with `arm-none-eabi-objdump -m armv4`. Over both drivers on the disc and 300,000 random words (313,700 in all) there are **0 unexplained differences**. The known ones are encodings objdump prints as later architectures' instructions or marks undefined itself.
   - CI runs the random part; unit tests cover the driver's start-up instructions.
+- **Discovery and lifting** (2026-11-22). `recomp/src/arm/lifter.{hpp,cpp}` and `qilin armlift MANATEE.DRV --out gen` write `arm_functions.hpp`, `arm_lifted_NN.cpp` and `arm_table.cpp` (every function sorted, and the driver's SHA-256). The runtime side is `recomp/runtime/arm_guest.hpp`: the context with the banked registers per mode, sound RAM from address 0 and the chip's registers from `0x800000` through hooks, the shifter with its carry, the flags, MSR/MRS, mode changes and exception returns, calls through the function table, and the FIQ poll.
+  - **Where functions come from**:
+    - the eight vectors and every `BL` target;
+    - the entries of tables of addresses (`ldr rT,[pc,#k]; ldr rT,[rT,rN,lsl #2]; mov pc,rT`);
+    - after that, data words that point at code. Those are kept only if everything their code reaches is an instruction this core runs.
+  - **The driver's switches**: tables of branches, written `add pc,pc,rN,lsl #2`, or `add rP,pc,#k` then `add rT,rP,rN` and `mov pc,rT` (or `add pc,rP,rN`). They become `switch`es over the branches' addresses. The instruction after a conditional jump is its default.
+  - **Writes to the pc**:
+    - after `mov lr,pc` they are calls through a register;
+    - any other write leaves the function with the address in `ret`, which the caller checks. A "return" to a function's start is a jump to it, a tail call through a register, and the caller runs it.
+  - **Lifting**: every instruction is lifted under its condition. The registers live in the context for now; locals synced at calls, as for the SH-4, would be faster. Loads give an unaligned word rotated, as this core does. `stm`/`ldm` with `^` and no pc (the user bank) stop. Halfword transfers, long multiplies, `swi` and the coprocessor space stop too.
+  - **Result**: 186 functions, 18,144 lifted instructions (shared code is lifted in each function that reaches it), 4,751 distinct words of the driver's 9,032. The rest is data: the header text, tables and the literal pools (253 words). 4 places reach something that isn't code here, and stop. It compiles with `-Wall -Wextra -Werror` under GCC 14 and Clang 19.
+  - Not run yet: that needs step 3.
