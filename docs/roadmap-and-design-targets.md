@@ -68,7 +68,42 @@ All enhancements live behind a settings file with presets, e.g.:
 - *Low-end:* 1× resolution, no AF, no MSAA, original aspect and frame rate.
 - *Desktop:* scaled resolution, 16× AF, MSAA, widescreen, high refresh rate.
 
-The enhancements menu is the sister projects' menu, with the same entries and layout. Its specification is copied here when roadmap step 6 starts; as of v0.1.0 none of the sister repositories has written it down yet.
+All enhancements live in `msr.ini` with the same presets as the sister projects: `original`, `low-end`, `desktop`.
+
+### The settings menu
+The same menu as the other recomps, found on 2026-11-22. Its model is Punch-Out's `punchout/src/menu.cpp`, and the Dreamcast version is Toy Commander's `dreamcast/src/settings.*` and `menu.*`. It uses Dear ImGui, and the projects are kept in step.
+- **Opening:** F1 or Esc; on a controller, Back + Start. It pauses the game and saves the settings on close. **Close** and **Quit the game** sit top right.
+- **Controls:** the controllers found, rumble, and every button of the Dreamcast controller, set by pressing it (kept in `[controls]`), with a way back to the defaults.
+- **Display:**
+  - the window: full screen with F11 or Alt+Enter, and which display;
+  - the picture: whole multiples, fit or fill the window; plain or CRT television with scanlines and phosphor stripes; smooth;
+  - vsync, and frame times (F3);
+  - refresh rate: full screen at a multiple of 60 Hz, or variable refresh;
+  - "look at the picture": the menu hidden while held.
+- **Game:**
+  - the enhancements: internal resolution, AF, MSAA, widescreen to 21:9 and high refresh, each as its roadmap step arrives;
+  - the graphics device;
+  - the console's own settings (language, sound mode), read the next time the game starts;
+  - sound;
+  - about.
+- **Conventions around it:**
+  - the window is named after the game and opens at the largest whole multiple of 640×480 that fits;
+  - every gamepad is opened and their buttons added up;
+  - the data folder is `<per-user data>/qilin/msr`.
+
+The menu arrives with the playable build (step 5), as in the sister projects. The enhancements behind it are steps 6 to 8.
+
+### The Dreamcast layer from Toy Commander
+Toy Commander--QilinRecomp (same owner, also GPL-3.0) already has what a Dreamcast port needs under the game, with no guest addresses in it:
+- `dreamcast/src/`:
+  - hardware: the PowerVR2 and tile accelerator, the timer unit, guest time, interrupts, sound RAM and the sound chip, the Maple bus (controller, memory card, Jump Pack), flash memory;
+  - the Vulkan renderer;
+  - the settings and the menu;
+  - the save history;
+  - `game.hpp`, what each game's program supplies.
+- `host/`: the window, Vulkan, audio, pads, paths and frame times, on SDL3. It is shared by all the recomps.
+
+This runtime takes those layers rather than writing new ones, and keeps them in step with Toy Commander's. What differs is above them: here the libraries' system code is lifted (`recompiler-core.md`) and interrupts must be delivered to it natively.
 
 ## Roadmap
 1. **Analysis:** 🔨 in progress (`disc-and-boot-analysis.md`, `recompiler-core.md`). ✅ GD-ROM image reader (Redump CUE and GDI, raw and cooked sectors, the high-density area's ISO 9660 file system; every raw sector's own address checked against the track layout); ✅ IP.BIN's fields; ✅ boot-file loader; ✅ `qilin disc`, `extract`, `info`, `insns`, `disasm`, `profile`; ✅ SH-4 decoder, 209 forms, 0 unexplained disagreements with binutils on all 65,536 words; ✅ CI on six configurations, warnings as errors, plus the decoder sweep (v0.1.0); 🔨 function discovery and CFG: constant propagation for calls through the literal pool, delay slots, literals, the Hitachi compiler's jump tables with proven sizes, `qilin cfg`, `coverage`, `suspects`, tested on synthetic programs and on another game's boot file (v0.2.0). ✅ the disc read and recorded: build, both programs' hashes, the system layer (Sega's libraries, not Windows CE), the file list; the decoder cross-check on every word of both programs, 0 unexplained; function discovery run on both (the game: 5,209 functions, all 21 jump tables, 83% of bytes accounted for) (v0.3.0). ✅ the hand-over between launcher and game read from both programs, and the launcher's replacement decided. ✅ data runs, pointer tables in data, tail calls after PR is restored, dead bytes: 99.2% of the game's bytes accounted for, 5,247 functions (v0.4.0). ✅ the floating-point mode analysis: PR, SZ and FR proven at 66,433 of the game's 66,561 mode-dependent instructions, none in the wrong precision, nine functions left (v0.5.0). To do: confirm the hand-over's open points against the original running; identify each library; the 43 spans still unknown; the floating-point mode analysis; the hardware-access profile (store queues, Tile Accelerator, other registers, mirrors, boot ROM calls); asset, sound and video formats; the frame and audio timing model.

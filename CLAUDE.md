@@ -13,7 +13,7 @@ Static recompilation of **Metropolis Street Racer** (Dreamcast, North American r
 - No GPL code. Flycast and binutils are run as references; nothing is copied from them.
 - Never commit game data or anything derived from it: disc images, `1ST_READ.BIN`, `IP.BIN`, `disc/`, `gen/`, `disc.json`, `cfg.json`. These are gitignored.
 - Runtime code (anything players run) avoids `std::format` (macOS 10.15); developer tools may use it.
-- **Enhancements** are the sister projects' set, behind a settings file with presets and the same in-game menu: resolution, AF, MSAA, widescreen to 21:9, high refresh. The menu's specification isn't in any sister repo yet; ask the author for it before building it (roadmap step 6).
+- **Enhancements** are the sister projects' set, behind a settings file (`msr.ini`, presets `original`, `low-end`, `desktop`) and the same in-game menu: resolution, AF, MSAA, widescreen to 21:9, high refresh. The menu's specification is in `docs/roadmap-and-design-targets.md` ("The settings menu"). Its model is Punch-Out's `punchout/src/menu.cpp`; the Dreamcast version is Toy Commander's `dreamcast/src/settings.*` and `menu.*` (Dear ImGui), kept in step.
 
 ## Layout
 
@@ -57,7 +57,7 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - Delay-slot order: the branch reads its condition/target/PR, a call sets PR, then the slot runs. `rts` with `lds.l @r15+,pr` or a pop in the slot is real code.
 - The cloud workspace's file bridge has a 400 MB per-file limit: the disc image can't be staged. The extracted disc is at `D:\Recompilation Projects\MSR Project\disc` on the author's PC (with `qilin.exe` and `read-disc.cmd` beside it); stage `disc\MSR.BIN`, `1ST_READ.BIN`, `IP.BIN` and other small files from there. There is no shell on that PC from the cloud session: programs there are run by the author, or through computer use (File Explorer, double-click).
 - **The launcher (`1ST_READ.BIN`) is replaced natively, not lifted** (author's decision, 2026-11-21). Only `MSR.BIN` is lifted. The hand-over is a command line in a 512-byte argument block at `0x8C1101F0` in the game's image; the game takes `-DEMO=`, `-ZONE=`, `-SPEED=`, `-playable`, `-autodemo`, and starts `1st_read.bin -DEMO=.. -ZONE=.. -SPEED=..` for its attract loop (the launcher then restarts it with `-DEMO=-1` plus those). Game main is `0x8C010202`; start-a-program is `0x8C02F68A`. The game has debug strings (`cblCable = %d`, `Here we go - %s`), useful for naming.
-- The enhancements menu: the author says it is the same across all the recomp projects. It isn't in the Ghoulies, Beat the Beat or APB repos; the other project folders haven't been read.
+- The enhancements menu is the same across all the recomp projects. It is written down in Toy Commander's roadmap and built in PunchOutWii, ToyCommander, WindWakerHD and BarbieWildHorseRescue. **Toy Commander--QilinRecomp is a Dreamcast recomp by the same owner (GPL-3.0)**: its `dreamcast/` layer (PowerVR2/TA, Vulkan renderer, AICA, Maple, interrupts, timers, flash, settings, menu) and `host/` (SDL3 window, Vulkan, audio, pads) are the runtime's starting point. Take them and keep them in step rather than writing new ones.
 
 ## Status (v0.9.0)
 
@@ -75,7 +75,7 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 2. **A better reference for floating point**: Flycast or a console, for `fipr`/`ftrv`/`fsca`/`fsrra` (QEMU 8.2 can't run them) and to confirm the 64-bit `fmov` pair order and denormal input flushing (QEMU differs from the hardware on both; the difftest build uses `QILIN_REFERENCE_QEMU`).
 3. **Review the prior art** (`docs/prior-art.md`): the two Dreamcast static recompilations, and the Sonic Adventure decomp as a naming source for Sega's libraries (licence first).
 4. **Confirm the hand-over's open points** (`docs/disc-and-boot-analysis.md`) when the original can be traced under Flycast; read `GINXFER.BIN`.
-5. Hardware-access profile, library boundaries, timing model; then the runtime.
+5. Hardware-access profile, library boundaries, timing model; then the runtime, on Toy Commander's `dreamcast/` and `host/` layers.
 
 ## Conventions
 
