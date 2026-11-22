@@ -106,11 +106,4 @@ bool write_argument_block(std::span<uint8_t> block, const std::vector<std::strin
     return at + 1 < block.size();
 }
 
-void play_intro() {
-    // The launcher's front part plays MSR.SFD (Sofdec: MPEG-1 video, ADX sound) before the game
-    // starts. The port has no Sofdec decoder yet (docs/disc-and-boot-analysis.md): the movie is
-    // one the player may skip, so the start goes on as if they had, and says so.
-    rt::log("msr: the intro movie (MSR.SFD) isn't played: the port has no Sofdec decoder yet");
-}
-
 }  // namespace msr

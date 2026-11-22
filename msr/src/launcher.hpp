@@ -2,7 +2,7 @@
 // 2026-11-21; docs/disc-and-boot-analysis.md, "The hand-over"). Only the game
 // (MSR.BIN) is lifted. What the launcher did, the port does here:
 //
-// - A cold start plays the intro movie (MSR.SFD) and starts the game with its
+// - A cold start plays the intro movie (MOVIES/MSR.SFD: movie.hpp) and starts the game with its
 //   argument block as the file has it (one string, `\manifest.bin`).
 // - The game's start-a-program (0x8C02F68A, replaced, not lifted) given
 //   `1st_read.bin <args>` restarts the game: its image and RAM as on a first
@@ -39,9 +39,6 @@ std::vector<std::string> launcher_arguments(const std::string& command_line, std
 // program's own name (`\manifest.bin`, as the file has it). False when they
 // don't fit.
 bool write_argument_block(std::span<uint8_t> block, const std::vector<std::string>& args);
-
-// The cold start's intro movie (MSR.SFD), which the player may skip.
-void play_intro();
 
 inline constexpr uint32_t kArgumentBlock = 0x8C1101F0u;
 inline constexpr uint32_t kArgumentBlockSize = 512;

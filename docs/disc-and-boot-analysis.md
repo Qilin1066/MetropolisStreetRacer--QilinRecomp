@@ -76,7 +76,7 @@ Read from the disassembly of both programs (`qilin insns`, with the function bou
 
   `sg_dpldr.bin` and anything else stop with the command line in the message.
 - The block's format comes from the game's readers. Argument by index (`0x8C02FA72`) counts from 0, and the game's main reads from index 1, so the first string is the program's own name. Argument count (`0x8C02FA54`) steps over the byte after each string's NUL. That means a one-character argument would cut the count short, and the block must hold two NULs after the last string. The writer refuses both cases.
-- The cold start leaves the block as the file has it. The intro movie isn't played: there is no Sofdec (MPEG-1 video and ADX sound) decoder in the port yet, so the start goes on as if the player had skipped it, and says so. A permissively licensed MPEG-1 decoder is the likely route; adding a library is the author's decision.
+- The cold start leaves the block as the file has it. Before that, the intro movie plays (`msr/src/movie.cpp`). It is `MOVIES/MSR.SFD`: the launcher has the strings `/Movies` and `MSR.SFD`. The file is an MPEG-1 system stream. pl_mpeg (MIT; the author's choice, 2026-11-22) separates the streams and decodes the video (0xE0). The sound (0xC0) is CRI ADX, decoded by `msr/src/adx.cpp` from the format's public description. A, B, X, Y or Start skips it.
 
 **Still to confirm** (by tracing the original under Flycast, and by reading `GINXFER.BIN`):
 

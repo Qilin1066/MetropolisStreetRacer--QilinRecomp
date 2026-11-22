@@ -4,6 +4,8 @@
 // shows the frame buffer the display reads.
 #pragma once
 
+#include <cstdint>
+
 #include "maple.hpp"
 
 namespace dreamcast::video {
@@ -30,6 +32,10 @@ void vblank();
 // pads, as they are connected (their buttons as the settings bind port A's
 // pad buttons). As of the last poll; nothing while the settings menu is open.
 maple::Controls controls(unsigned port);
+
+// Shows a picture the port made itself (the intro movie: msr/src/movie.cpp),
+// `rgba` width x height, after polling the window; nothing without one.
+void show(uint32_t width, uint32_t height, const uint8_t* rgba);
 
 // The window's events, from the thread that opened it (a call from any other
 // does nothing). Ends the program when the player closes the window.

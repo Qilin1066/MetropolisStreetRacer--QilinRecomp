@@ -21,6 +21,7 @@
 #include "arm/decoder.hpp"
 #include "decoder.hpp"
 #include "drive.hpp"
+#include "adx.hpp"
 #include "launcher.hpp"
 #include "gdrom.hpp"
 #include "guest.hpp"
@@ -1379,6 +1380,25 @@ void test_launcher() {
     CHECK(!msr::write_argument_block(block, {std::string(600, 'a')}));      // doesn't fit
 }
 
+// ADX decoding: one mono frame of 32 samples, each error 1 at scale 100.
+void test_adx() {
+    std::vector<uint8_t> adx = {0x80, 0x00, 0x00, 0x10, 3, 18, 4, 1, 0, 0, 0xAC, 0x44, 0, 0, 0, 32, 0x01, 0xF4, 4, 0};
+    adx.resize(0x14, 0);
+    // The data starts at the copyright offset (0x10) + 4 = 0x14.
+    adx.push_back(0), adx.push_back(100);
+    for (int i = 0; i < 16; ++i) adx.push_back(0x11);
+    msr::Pcm pcm;
+    std::string why;
+    CHECK(msr::decode_adx(adx, pcm, why));
+    CHECK(pcm.rate == 44100 && pcm.left_right.size() == 64);
+    CHECK(pcm.left_right[0] == 100 && pcm.left_right[1] == 100);  // mono, doubled
+    CHECK(pcm.left_right[2] > 100);                               // the prediction adds to the next
+    adx[4] = 4;                                                    // the exponential-scale encoding
+    CHECK(!msr::decode_adx(adx, pcm, why));
+    adx[4] = 3, adx[15] = 64;                                      // more samples than the data holds
+    CHECK(!msr::decode_adx(adx, pcm, why));
+}
+
 // A folder served as a disc: the file system a GD-ROM driver reads.
 // The sound CPU's instructions (docs/sound.md).
 void test_arm_decoder() {
@@ -1517,6 +1537,7 @@ int main() {
     test_guest_threads();
     test_folder_drive();
     test_launcher();
+    test_adx();
     test_arm_decoder();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);

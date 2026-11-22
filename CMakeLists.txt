@@ -154,6 +154,19 @@ if(QILIN_HOST)
         target_compile_options(qilin_imgui PRIVATE -w)
     endif()
 
+    # pl_mpeg (MIT, one header) decodes the intro movie's MPEG-1 video and
+    # separates its streams (msr/src/movie.cpp); pinned to a commit.
+    FetchContent_Declare(pl_mpeg GIT_REPOSITORY https://github.com/phoboslab/pl_mpeg
+                         GIT_TAG c871f2be022ece7ef4f64230b4fb8e1fb9eb6023 SOURCE_SUBDIR no-cmake)
+    FetchContent_MakeAvailable(pl_mpeg)
+    add_library(qilin_pl_mpeg STATIC msr/src/pl_mpeg.c)
+    target_include_directories(qilin_pl_mpeg PUBLIC ${pl_mpeg_SOURCE_DIR})
+    if(MSVC)
+        target_compile_options(qilin_pl_mpeg PRIVATE /W0)  # third-party code: its warnings aren't ours
+    else()
+        target_compile_options(qilin_pl_mpeg PRIVATE -w)
+    endif()
+
     # The host layer and the settings menu: the game's name in messages, the
     # window's title, the data folder (qilin/msr) and the settings file (msr.ini).
     add_library(qilin_host STATIC host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp)
@@ -221,7 +234,7 @@ endif()
 
 # ---- The port: the hardware and system software the game runs on (msr/src),
 # built without the lifted code too, so CI compiles it ----
-add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp msr/src/drive.cpp msr/src/launcher.cpp)
+add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp msr/src/drive.cpp msr/src/launcher.cpp msr/src/adx.cpp)
 target_include_directories(msr_port PUBLIC msr/src)
 target_link_libraries(msr_port PUBLIC qilin_runtime qilin_disc PRIVATE qilin_warnings)
 if(QILIN_HOST)
@@ -270,8 +283,8 @@ if(QILIN_GEN_DIR)
     if(NOT EXISTS "${QILIN_GEN_DIR}/arm_table.cpp")
         message(FATAL_ERROR "${QILIN_GEN_DIR} has no lifted sound driver: run qilin armlift <disc>/SOUND/MANATEE.DRV --out ${QILIN_GEN_DIR}")
     endif()
-    add_executable(msr msr/src/main.cpp msr/src/game.cpp msr/src/sound_cpu.cpp)
-    target_link_libraries(msr PRIVATE msr_port dreamcast_hw qilin_gen qilin_disc SDL3::SDL3-static qilin_warnings)
+    add_executable(msr msr/src/main.cpp msr/src/game.cpp msr/src/sound_cpu.cpp msr/src/movie.cpp)
+    target_link_libraries(msr PRIVATE msr_port dreamcast_hw qilin_pl_mpeg qilin_gen qilin_disc SDL3::SDL3-static qilin_warnings)
     if(MSVC)
         target_link_options(msr PRIVATE /STACK:8388608)  # guest recursion runs on the host stack
     endif()

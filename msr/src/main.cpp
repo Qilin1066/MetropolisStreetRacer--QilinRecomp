@@ -8,14 +8,18 @@
 //
 // Runtime code: no std::format.
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "aica.hpp"
@@ -28,6 +32,7 @@
 #include "onchip.hpp"
 #include "interrupts.hpp"
 #include "launcher.hpp"
+#include "movie.hpp"
 #include "pvr.hpp"
 #include "rtc.hpp"
 #include "save_history.hpp"
@@ -65,8 +70,27 @@ std::optional<std::vector<uint8_t>> read_whole(const std::filesystem::path& p) {
 struct Disc {
     std::optional<qilin::GdRom> image;  // the player's disc image, when that's what was given
     std::unique_ptr<msr::Drive> drive;
-    std::vector<uint8_t> program, ip_bin;
+    std::vector<uint8_t> program, ip_bin, movie;  // movie: MOVIES/MSR.SFD, the launcher's intro
 };
+
+// A file in an extracted disc folder, its path's parts matched without regard to case (the
+// disc's names are upper case; a copy's may not be).
+std::optional<std::vector<uint8_t>> read_in_folder(const std::filesystem::path& folder, std::initializer_list<std::string_view> parts) {
+    std::filesystem::path at = folder;
+    for (const std::string_view part : parts) {
+        std::error_code ec;
+        bool found = false;
+        for (const auto& e : std::filesystem::directory_iterator(at, ec)) {
+            const std::string name = e.path().filename().string();
+            if (std::ranges::equal(name, part, [](char x, char y) { return std::toupper(static_cast<unsigned char>(x)) == y; })) {
+                at = e.path(), found = true;
+                break;
+            }
+        }
+        if (!found) return std::nullopt;
+    }
+    return read_whole(at);
+}
 
 // The game and IP.BIN from the player's disc image (.cue or .gdi), or, for
 // development, from a folder of the extracted disc (served as a disc too).
@@ -78,6 +102,9 @@ Disc read_disc(const std::filesystem::path& path) {
         if (!program) rt::fatal("%s: no MSR.BIN in this folder", path.string().c_str());
         d.program = std::move(*program);
         if (auto ip = read_whole(path / "IP.BIN")) d.ip_bin = std::move(*ip);
+        auto movie = read_in_folder(path, {"MOVIES", "MSR.SFD"});
+        if (!movie) rt::fatal("%s: no MOVIES/MSR.SFD in this folder", path.string().c_str());
+        d.movie = std::move(*movie);
         std::string why;
         d.drive = msr::Drive::of_folder(path, why);
         if (!d.drive) rt::fatal("%s: %s", path.string().c_str(), why.c_str());
@@ -93,8 +120,13 @@ Disc read_disc(const std::filesystem::path& path) {
             auto bytes = d.image->read_file(f);
             if (!bytes) rt::fatal("%s: MSR.BIN: %s", path.string().c_str(), bytes.error().c_str());
             d.program = std::move(*bytes);
+        } else if (f.path == "MOVIES/MSR.SFD") {
+            auto bytes = d.image->read_file(f);
+            if (!bytes) rt::fatal("%s: MOVIES/MSR.SFD: %s", path.string().c_str(), bytes.error().c_str());
+            d.movie = std::move(*bytes);
         }
     if (d.program.empty()) rt::fatal("%s: no MSR.BIN on this disc (is it Metropolis Street Racer?)", path.string().c_str());
+    if (d.movie.empty()) rt::fatal("%s: no MOVIES/MSR.SFD on this disc", path.string().c_str());
     auto ip = d.image->system_area();
     if (!ip) rt::fatal("%s: IP.BIN: %s", path.string().c_str(), ip.error().c_str());
     d.ip_bin = std::move(*ip);
@@ -131,6 +163,7 @@ int main(int argc, char** argv) {
     msr::sound_cpu::install();  // the driver runs lifted, not through the AUDIO64 stand-in
     dreamcast::map_aica(disc.image ? &*disc.image : nullptr);
     dreamcast::video::start();
+    msr::play_intro(std::move(disc.movie));  // the launcher's cold start, before the game's sound starts
     dreamcast::sound::start();
     msr::install_bios(*disc.drive);
     msr::install_launcher();
@@ -140,7 +173,6 @@ int main(int argc, char** argv) {
     dreamcast::start_interrupts();
 
     rt::g_guest_threads = true;
-    msr::play_intro();  // the launcher's cold start; the game then starts with the block as the file has it
     for (;;) {
         rt::Context c;
         c.r[15] = kStackTop;

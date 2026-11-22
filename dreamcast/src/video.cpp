@@ -277,6 +277,12 @@ void vblank() {
     g_display->present_image(p.image, p.view, p.width, p.height, 4.0f / 3.0f, p.height / g_scale);
 }
 
+void show(uint32_t width, uint32_t height, const uint8_t* rgba) {
+    if (!g_display) return;
+    poll();
+    g_display->present(width, height, rgba, 4.0f / 3.0f, height);
+}
+
 namespace {
 // QILIN_PRESS=<button>@<picture>[,...]: presses a button for ten pictures from
 // the given one (button: a, b, x, y, start, up, down, left, right, lt, rt),
