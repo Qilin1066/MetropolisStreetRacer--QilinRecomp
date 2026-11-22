@@ -235,12 +235,13 @@ inline void returned_to(Context& c, uint32_t expected, uint32_t pc) {
 }
 
 // ---- interrupts: FIQ, delivered at loops' heads ----
-inline bool g_fiq_pending = false;  // set by the sound chip's side (timers, the SH-4's interrupt)
-inline void (*g_fiq)(Context&) = nullptr;  // the runtime's delivery: the FIQ vector, called as the core enters it
-#define QILIN_ARM_POLL()                                                                                       \
-    do {                                                                                                       \
-        if (::qilin::arm_rt::g_fiq_pending && !(c.control & ::qilin::arm_rt::kFiqDisable) && ::qilin::arm_rt::g_fiq) \
-            ::qilin::arm_rt::g_fiq(c);                                                                         \
+// The runtime's poll (msr/src/sound_cpu.cpp): the chip's timers and
+// interrupts brought up to the present, FIQ taken if one is due and the core
+// takes it, and the thread put to sleep while the driver only waits.
+inline void (*g_poll)(Context&) = nullptr;
+#define QILIN_ARM_POLL()                                       \
+    do {                                                       \
+        if (::qilin::arm_rt::g_poll) ::qilin::arm_rt::g_poll(c); \
     } while (0)
 
 }  // namespace qilin::arm_rt

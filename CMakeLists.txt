@@ -266,7 +266,11 @@ if(QILIN_GEN_DIR)
     if(NOT QILIN_HOST)
         message(FATAL_ERROR "msr needs the host layer (QILIN_HOST)")
     endif()
-    add_executable(msr msr/src/main.cpp msr/src/game.cpp)
+    # The sound CPU's driver, lifted too (qilin armlift: docs/sound.md).
+    if(NOT EXISTS "${QILIN_GEN_DIR}/arm_table.cpp")
+        message(FATAL_ERROR "${QILIN_GEN_DIR} has no lifted sound driver: run qilin armlift <disc>/SOUND/MANATEE.DRV --out ${QILIN_GEN_DIR}")
+    endif()
+    add_executable(msr msr/src/main.cpp msr/src/game.cpp msr/src/sound_cpu.cpp)
     target_link_libraries(msr PRIVATE msr_port dreamcast_hw qilin_gen qilin_disc SDL3::SDL3-static qilin_warnings)
     if(MSVC)
         target_link_options(msr PRIVATE /STACK:8388608)  # guest recursion runs on the host stack

@@ -29,7 +29,7 @@ The plan, in the order it will be written:
    - every byte accounted for, as for the game.
 
    Registers are host locals, flags are four `bool`s, and the banked registers are kept per mode (FIQ has its own r8–r14).
-3. **The sound CPU's side of the AICA**:
+3. ✅ (written, not run) **The sound CPU's side of the AICA**:
    - its view of sound RAM (address 0 up) and of the chip's registers (`0x00800000` up, its own addresses for the same registers `sound.cpp` reads);
    - the timers and the interrupt controller that raise FIQ;
    - the main-CPU interrupt it can raise (the SH-4's level-4 `0xB20` event, through the system bus).
@@ -56,3 +56,17 @@ The driver is the game's data: like `MSR.BIN`, it is lifted from the player's di
   - **Lifting**: every instruction is lifted under its condition. The registers live in the context for now; locals synced at calls, as for the SH-4, would be faster. Loads give an unaligned word rotated, as this core does. `stm`/`ldm` with `^` and no pc (the user bank) stop. Halfword transfers, long multiplies, `swi` and the coprocessor space stop too.
   - **Result**: 186 functions, 18,144 lifted instructions (shared code is lifted in each function that reaches it), 4,751 distinct words of the driver's 9,032. The rest is data: the header text, tables and the literal pools (253 words). 4 places reach something that isn't code here, and stop. It compiles with `-Wall -Wextra -Werror` under GCC 14 and Clang 19.
   - Not run yet: that needs step 3.
+- **The sound CPU** (2026-11-22, written and compiled, not run). `msr/src/sound_cpu.cpp`:
+  - **The chip's sound-CPU registers:**
+    - timers A, B and C, counted from guest time at 44.1 kHz with their prescale; a wrap sets the source's pending bit;
+    - SCIEB/SCIPD/SCIRE and SCILV0–2, the sound CPU's interrupt controller;
+    - MCIEB/MCIPD/MCIRE, the interrupt to the SH-4, which raises the system bus's external event 1;
+    - INTREQ and INTCLEAR.
+  - **Who sees them:** both sides. A hook added to `aica.cpp` (`set_sound_cpu`) routes those offsets to it, and starts the lifted driver instead of the AUDIO64 stand-in when the SH-4 releases the sound CPU's reset.
+  - **The driver's thread:** it runs from the reset vector on a thread of its own, so its main loop is the thread's loop. At each loop's head the poll brings the timers up to now and takes FIQ if a source is due: SPSR_fiq is CPSR, FIQ mode is entered with both interrupts masked, the vector runs, and it returns through its exception return.
+  - **Idling:** a driver that only waits (256 polls in a row with nothing due) sleeps until the next timer's wrap, at most a millisecond, so it doesn't hold a host core.
+  - **The build:** `msr` needs the lifted driver in `QILIN_GEN_DIR`; CMake stops with the `qilin armlift` command to run if it isn't there.
+  - **Open:**
+    - which pending source wins when several are due (the lowest-numbered here);
+    - byte and halfword accesses to the chip's other registers (they stop);
+    - the SH-4 putting the sound CPU back into reset while it runs (a second start stops).

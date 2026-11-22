@@ -407,7 +407,13 @@ void ram_block(uint32_t a, const uint8_t* data, unsigned n) {
 
 // The registers are 32-bit words on the G2 bus, of which the chip uses the
 // low 16 bits; accesses are 4 bytes wide.
+SoundCpu g_cpu{};
+
 uint32_t reg_read(uint32_t a, unsigned n) {
+    if (g_cpu.access) {
+        uint32_t v = 0;
+        if (g_cpu.access(a - kRegLo, false, v, n)) return v;
+    }
     if (n != 4 || (a & 3u)) throw rt::Stop{rt::Stop::Unsupported, 0, a};
     auto held = sound::lock();
     uint32_t v;
@@ -444,6 +450,7 @@ void start_driver() {
 }
 
 void reg_write(uint32_t a, uint32_t v, unsigned n) {
+    if (g_cpu.access && g_cpu.access(a - kRegLo, true, v, n)) return;
     if (n != 4 || (a & 3u)) throw rt::Stop{rt::Stop::Unsupported, 0, a};
     auto held = sound::lock();
     const uint32_t off = a - kRegLo;
@@ -451,7 +458,10 @@ void reg_write(uint32_t a, uint32_t v, unsigned n) {
     std::memcpy(&old, g_regs + off, 4);
     std::memcpy(g_regs + off, &v, 4);
     if (off < 0x2000u && (off & 0x7Fu) == 0 && (v & 0x8000u)) sound::key_execute();  // the SH-4 keying channels itself
-    if (a == kArmReset && (old & 1u) && !(v & 1u)) start_driver();
+    if (a == kArmReset && (old & 1u) && !(v & 1u)) {
+        if (g_cpu.start) g_cpu.start();
+        else start_driver();
+    }
 }
 
 }  // namespace
@@ -464,5 +474,7 @@ void map_aica(const qilin::GdRom* disc) {
 }
 
 uint8_t* sound_ram() { return g_ram; }
+uint8_t* sound_registers() { return g_regs; }
+void set_sound_cpu(const SoundCpu& cpu) { g_cpu = cpu; }
 
 }  // namespace dreamcast

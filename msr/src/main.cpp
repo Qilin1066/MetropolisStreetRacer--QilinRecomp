@@ -33,6 +33,7 @@
 #include "ta.hpp"
 #include "video.hpp"
 #include "sha256.hpp"
+#include "sound_cpu.hpp"
 #include "system.hpp"
 
 namespace rt = qilin::rt;
@@ -116,6 +117,7 @@ int main(int argc, char** argv) {
     dreamcast::ta::map();
     dreamcast::map_sh4_peripherals();
     msr::map_rtc();
+    msr::sound_cpu::install();  // the driver runs lifted, not through the AUDIO64 stand-in
     dreamcast::map_aica(disc.image ? &*disc.image : nullptr);
     dreamcast::video::start();
     dreamcast::sound::start();

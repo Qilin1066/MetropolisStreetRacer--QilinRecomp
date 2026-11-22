@@ -92,7 +92,8 @@ Each step: run `msr`, read where it stops, provide what it needs, run again.
     - **ROMFONT:** lock and unlock succeed; a request for the font stops, since the boot ROM's font isn't here.
     - **SYSTEM** (`0x8C0000E0`): the game handing back to the console, so the program ends.
     - **`msr` now starts the window, the renderer and the settings menu** (`video::start`) **and the sound output** (`sound::start`), and maps the sound chip (`map_aica`). CD audio needs the disc image; with a folder it stops.
-    - **The sound driver:** the game loads `SOUND\MANATEE.DRV` (Sega's later driver, with MLT sound banks), not `AUDIO64.DRV`, which is also on the disc. Toy Commander's stand-in is for AUDIO64 (versions 1.80 and 1.90) and stops on any other driver when the game releases the sound CPU. This disc's AUDIO64 is version 1.90f.2, with the interface table `0xAAC`, `0xAEC`, `0xB34`. A stand-in for Manatee comes next.
+    - **The sound driver** is lifted too (`docs/sound.md`): `qilin armlift` beside the game's code, and the sound CPU (`msr/src/sound_cpu.cpp`) runs it when the SH-4 releases the sound CPU's reset.
+    - **Before that, the finding:** the game loads `SOUND\MANATEE.DRV` (Sega's later driver, with MLT sound banks), not `AUDIO64.DRV`, which is also on the disc. Toy Commander's stand-in is for AUDIO64 (versions 1.80 and 1.90) and stops on any other driver when the game releases the sound CPU. This disc's AUDIO64 is version 1.90f.2, with the interface table `0xAAC`, `0xAEC`, `0xB34`. A stand-in for Manatee comes next.
 
 ## The Dreamcast and host layers
 
