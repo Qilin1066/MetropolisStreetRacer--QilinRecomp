@@ -10,7 +10,7 @@ Static recompilation of **Metropolis Street Racer** (Dreamcast, North American r
 - **Static recompilation only.** No interpreter, JIT or emulator at runtime, not even as a fallback.
 - Targets: 64-bit **Windows, Linux, macOS** on **x86-64 and ARM64**. The low-end reference is ARM boards like the **Raspberry Pi 4**. No iPadOS, no 32-bit.
 - Compiler minimums: GCC 14, Clang 19, Apple Clang (Xcode 16), MSVC 2022 17.10.
-- No GPL code. Flycast and binutils are run as references; nothing is copied from them.
+- **No emulation, and everything legal** (the author, 2026-11-22). No interpreter or emulator code in the port. No code copied from emulators or other projects: Flycast, QEMU and binutils are only run as references. Third-party libraries must have a licence compatible with this project's GPL-3.0, be pinned to a version, and be listed in `THIRD_PARTY.md`. Where a format or piece of hardware is implemented from public documentation, name the source. The owner's own projects (Toy Commander) may be reused.
 - Never commit game data or anything derived from it: disc images, `1ST_READ.BIN`, `IP.BIN`, `disc/`, `gen/`, `disc.json`, `cfg.json`. These are gitignored.
 - Runtime code (anything players run) avoids `std::format` (macOS 10.15); developer tools may use it.
 - **Enhancements** are the sister projects' set, behind a settings file (`msr.ini`, presets `original`, `low-end`, `desktop`) and the same in-game menu: resolution, AF, MSAA, widescreen to 21:9, high refresh. The menu's specification is in `docs/roadmap-and-design-targets.md` ("The settings menu"). Its model is Punch-Out's `punchout/src/menu.cpp`; the Dreamcast version is Toy Commander's `dreamcast/src/settings.*` and `menu.*` (Dear ImGui), kept in step.
