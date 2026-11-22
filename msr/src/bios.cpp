@@ -148,9 +148,11 @@ uint32_t g_next_id = 1;
 // held here until a later GDROM call with level 4 unmasked; the library's stream server makes
 // its calls masked, so it never came.)
 bool g_dma_end_pending = false;
+bool g_dma_end_unreported = false;  // ended, and call 5 (gd_dma_end) not yet told
 void deliver_pending(rt::Context& c) {
     if (!g_dma_end_pending) return;
     g_dma_end_pending = false;
+    g_dma_end_unreported = true;
     if (!g_raise_bus_event) throw rt::Stop{rt::Stop::Unsupported, c.pr, 0xA40u};
     g_raise_bus_event(c, 0xA40u);
 }
@@ -308,6 +310,22 @@ void gd_abort(rt::Context& c) {
     c.r[0] = 0;
 }
 
+// Call 5 (Shinobi's gdGdcG1DmaEnd; KallistiOS's syscall_gdrom_dma_callback): the game's handler
+// for the GD-ROM DMA's end (event 0xA40) reports it, with a function r4 and its argument r5; the
+// system software then calls r4(r5). That callback is how the game's loader learns a stream's
+// piece has arrived (0x8C02E114, setting the flag 0x8C02DD28 waits for). Called once for each
+// DMA that has ended; other calls (the handler runs for other events too) do nothing.
+void gd_dma_end(rt::Context& c) {
+    const uint32_t fn = c.r[4], arg = c.r[5];
+    c.r[0] = 0;
+    if (!g_dma_end_unreported || fn == 0) return;
+    g_dma_end_unreported = false;
+    const uint32_t r4 = c.r[4], r5 = c.r[5];
+    c.r[4] = arg;
+    rt::call_guest(c, fn);
+    c.r[4] = r4, c.r[5] = r5, c.r[0] = 0;
+}
+
 // Call 4: the drive's state into r4's two words: 1 (paused: a disc in, idle) and 0x80 (a GD-ROM).
 void gd_check_drive(rt::Context& c) {
     rt::st32(c.r[4], 1), rt::st32(c.r[4] + 4, 0x80);
@@ -352,7 +370,7 @@ void gdrom_call(rt::Context& c) {
     case 2: return deliver_pending(c);  // the main loop: commands are done as sent
     case 3: return;                     // initialise: nothing queued after it
     case 4: return gd_check_drive(c);
-    case 5: c.r[0] = 0; return;         // the DMA's end, reported: nothing to do
+    case 5: return gd_dma_end(c);
     case 6: return gd_dma_transfer(c);
     case 7: return gd_dma_check(c);
     case 8: return gd_abort(c);
@@ -382,6 +400,7 @@ void set_vector(uint32_t vector, uint32_t target) { std::memcpy(rt::g_mem + vect
 void set_bus_event(void (*raise)(rt::Context& c, uint32_t event)) { g_raise_bus_event = raise; }
 
 void restart_bios() {
+    g_dma_end_unreported = false;
     g_last = Request{};
     g_stream = Stream{};
     g_dma_end_pending = false;
