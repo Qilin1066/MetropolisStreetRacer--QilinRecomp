@@ -80,7 +80,7 @@ std::vector<uint32_t> ArmLifter::address_table(uint32_t pc) const {
           load.pre && load.up && !load.writeback))
         return {};
     if (!(lit.op == Op::ldr && lit.rd == in.rm && lit.rn == 15 && lit.imm && lit.pre && !lit.writeback)) return {};
-    const uint32_t pool = pc - 8 + 8 + (lit.up ? lit.value : -lit.value);
+    const uint32_t pool = pc - 8 + 8 + (lit.up ? lit.value : 0u - lit.value);
     if (!image_.mapped(pool)) return {};
     const uint32_t table = image_.u32(pool);
     std::vector<uint32_t> t;
@@ -139,7 +139,7 @@ ArmFunction ArmLifter::explore(uint32_t start) {
         };
         // Literals the code loads.
         if ((in.op == Op::ldr || in.op == Op::ldrb) && in.rn == 15 && in.imm && in.pre && !in.writeback) {
-            const uint32_t a = pc + 8 + (in.up ? in.value : -in.value);
+            const uint32_t a = pc + 8 + (in.up ? in.value : 0u - in.value);
             literals_.insert(a & ~3u);
         }
         if (in.op == Op::b) {
