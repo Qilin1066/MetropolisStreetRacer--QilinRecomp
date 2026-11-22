@@ -70,7 +70,14 @@ Each step: run `msr`, read where it stops, provide what it needs, run again.
 
    CD audio commands stop for now. The drive (`drive.cpp`) is the disc image, or, for development, a folder of the extracted files served as an ISO 9660 file system built in memory. A unit test reads one back.
 10. **A jump into an unrolled copy** (`0x8C0DE3D2`, from the C library's `0x8C0DE3A4`). The copy goes through a table of absolute addresses (`mov.l Ltab,rT; mov.l @(r0,rT),rT; add #-4,r0; jmp @rT`), into the unrolled loads and stores after it (Duff's device). The CFG resolves such tables now (`recompiler-core.md`).
-11. **The GD-ROM DMA's end** (system bus event `0xA40`), which the file system waits for after a DMA read (`0x8C12E6AA`): the next stop, the first interrupt to deliver.
+11. **The GD-ROM DMA's end** (system bus event `0xA40`), which the file system waits for after a DMA read (`0x8C12E6AA`): **interrupt delivery**.
+    - The lifter polls at every loop's head (`QILIN_POLL_IRQ`, 2,939 places; nothing in checked builds).
+    - Toy Commander's interrupt service (`dreamcast/src/interrupts.cpp`) calls the game's own handlers as the libraries' entry at VBR + 0x600 would (`msr/src/game.cpp`): from the table at VBR + 0x200 + (INTEVT − 0x200) / 8, with INTEVT in r4, IMASK 15, and the registers put back after. Level 6 is INTEVT 0x320 (entry 0x224), level 4 is 0x360 (0x22C).
+    - Start-up fills the table with `0x8C122F1C`, the unhandled-exception reporter, which counts as no handler.
+    - The service acknowledges a level-4 event before handing it on (Toy Commander's native chain needs that). This game's handler reads and acknowledges the status itself, so the event is raised again for it.
+    - A DMA read's end is raised as normal event 14 and delivered at the next poll. The vertical blank runs at 60 Hz.
+12. **The libraries' scheduler returning into a task's entry** (`0x8C13190C`, an entry stub: `bra common; mov #n,r4`, seven of them, and one that falls in, `0x8C131978`). The CFG now takes such stubs as functions (`recompiler-core.md`). The scheduler then starts the tasks as guest threads: the first real use of the fibers.
+13. **The game proper**: tasks run, the file system reads files, and the game's code runs deep (frames from `0x8C0307CE` down through the file system). It stops at **GD-ROM command 28** (`CD_CMD_DMAREAD_STREAM`, from `0x8C120C72`, the file system's streaming read), which the drive doesn't do yet. Command 28 streams data until it reaches the end or is aborted. The game then moves the data with calls 6 and 7 (transfer, then the bytes still to come), and while the stream lasts `check_command` returns 3, "streaming" (the KallistiOS documentation of the same calls). Next: what this game's driver sends and expects there, read from its code.
 
 ## The Dreamcast and host layers
 

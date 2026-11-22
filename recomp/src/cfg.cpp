@@ -622,6 +622,52 @@ bool Cfg::acceptable(const Function& f, const std::vector<Kind>& kinds) const {
     return true;
 }
 
+bool Cfg::acceptable_stub(uint32_t c, const std::vector<Kind>& kinds) const {
+    const uint32_t base = boot_.base();
+    if ((c & 1u) || !boot_.mapped(c, 2) || kinds[c - base] != Kind::Unknown) return false;
+    // Unclaimed bytes, up to claimed code or the end of the run.
+    uint32_t stop = c;
+    while (boot_.mapped(stop, 2) && kinds[stop - base] == Kind::Unknown) stop += 2;
+    // An instruction of a known function (not a delay slot), or a function's start.
+    const auto known_code = [&](uint32_t t) {
+        if (starts_.contains(t)) return true;
+        const auto owner = funcs_.upper_bound(t);
+        if (owner == funcs_.begin()) return false;
+        const Function& o = std::prev(owner)->second;
+        return std::ranges::binary_search(o.insns, t) && !o.slots.contains(t);
+    };
+    const Function trial = explore(c, stop);
+    if (!trial.clean() || trial.insns.empty() || trial.insns.size() > 8) return false;  // a few instructions
+    for (const uint32_t pc : trial.insns)
+        if (kinds[pc - base] != Kind::Unknown) return false;
+    if (trial.tails.empty() && !trial.falls_into) return false;
+    for (const auto& [site, target] : trial.tails)
+        if (!known_code(target)) return false;
+    if (trial.falls_into && (trial.falls_into != stop || !known_code(stop))) return false;
+    return trial.calls.empty() && trial.icalls.empty() && trial.itails.empty() && trial.jtabs.empty();
+}
+
+// Rejected literal pointers that are entry stubs (acceptable_stub), once everything else is found.
+bool Cfg::seed_stubs() {
+    const std::vector<Kind> kinds = claims();
+    bool changed = false;
+    for (auto it = rejected_.begin(); it != rejected_.end();) {
+        const uint32_t c = *it;
+        if (!starts_.contains(c) && acceptable_stub(c, kinds)) {
+            // Its targets become functions when its owner is explored again, now bounded by it.
+            add_start(c, Origin::Literal);
+            const Function f = explore(c, bound_of(c));
+            for (const auto& [site, target] : f.tails) add_start(target, Origin::TailCall);
+            if (f.falls_into) add_start(f.falls_into, Origin::TailCall);
+            it = rejected_.erase(it);
+            changed = true;
+        } else {
+            ++it;
+        }
+    }
+    return changed;
+}
+
 // A weak candidate vouches for what it calls and jumps to: accepting it makes
 // those function starts with strong evidence. So each target that isn't a
 // known function must be clean on trial too (one level down; theirs are
@@ -805,7 +851,8 @@ void Cfg::run() {
         explore_all();
         if (seed_literals()) continue;
         if (seed_data_pointers()) continue;
-        if (!seed_gaps()) break;
+        if (seed_gaps()) continue;
+        if (!seed_stubs()) break;
     }
     // A start that later evidence put inside this function's old range moved
     // its bound; explore_all has redone those. Starts with no function left

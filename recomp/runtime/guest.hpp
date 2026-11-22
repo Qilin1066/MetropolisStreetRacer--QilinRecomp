@@ -170,6 +170,8 @@ inline void check_store(uint32_t a, uint32_t n) {
 #define QILIN_REG [[maybe_unused]] uint32_t&
 // At every label (so in every loop): the time limit, for loops that touch no memory.
 #define QILIN_TICK(a) (::qilin::rt::g_pc = (a), ::qilin::rt::count_access(0))
+// Interrupts aren't delivered in checked builds (the differential test runs one function).
+#define QILIN_POLL_IRQ(r15) ((void)0)
 // The last longword loads (address, value): when an access faults, the
 // differential test looks here for where the bad pointer came from.
 inline constexpr unsigned kLoadTrace = 64;
@@ -494,10 +496,12 @@ inline void poll_irq(Context& c, uint32_t r15) {
     c.r[15] = r15;
     g_irq_service(c);
 }
+#ifndef QILIN_CHECKED_MEMORY
 #define QILIN_POLL_IRQ(r15)                                                                                          \
     do {                                                                                                             \
         if (::qilin::rt::g_irq_pending.load(std::memory_order_relaxed)) [[unlikely]] ::qilin::rt::poll_irq(c, (r15)); \
     } while (0)
+#endif
 
 inline void set_sr(Context& c, uint32_t v, uint32_t pc) {
     v &= kSrBits;

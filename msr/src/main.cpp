@@ -23,6 +23,7 @@
 #include "guest.hpp"
 #include "memory.hpp"
 #include "onchip.hpp"
+#include "interrupts.hpp"
 #include "pvr.hpp"
 #include "rtc.hpp"
 #include "sh4.hpp"
@@ -111,7 +112,10 @@ int main(int argc, char** argv) {
     dreamcast::map_sh4_peripherals();
     msr::map_rtc();
     msr::install_bios(*disc.drive);
-    msr::set_bus_event(dreamcast::game::raise_bus_event);
+    // A GD-ROM DMA's end is the system bus's normal event 14 (0xA40), delivered at the next poll.
+    msr::set_bus_event([](rt::Context&, uint32_t event) { dreamcast::raise_event((event - 0xA00u) / 0x20u + 12u); });
+
+    dreamcast::start_interrupts();
 
     rt::g_guest_threads = true;
     rt::Context c;

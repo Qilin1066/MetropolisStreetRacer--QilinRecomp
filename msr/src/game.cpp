@@ -1,23 +1,83 @@
 // What this game's port gives the shared Dreamcast code (dreamcast/src/game.hpp).
 //
+// Interrupts. The game's libraries (Shinobi's) take every interrupt through
+// one entry at VBR + 0x600 (copied there by start-up, 0x8C130918). It saves
+// the registers, sets IMASK to 15, and calls the handler in a table at
+// VBR + 0x200 + (INTEVT - 0x200) / 8 as an ordinary function, with INTEVT in
+// r4. Start-up fills that table with 0x8C122F1C, the unhandled-exception
+// reporter; libraries put their own handlers in. The entry itself isn't run
+// here (it saves state the lifted code keeps elsewhere, and changes the
+// floating-point bank under the handlers); the port's interrupt service
+// (dreamcast/src/interrupts.cpp) calls the handlers as the entry would.
+//
 // Runtime code: no std::format.
 #include "game.hpp"
 
+#include <array>
+
+#include "guest.hpp"
+#include "pvr.hpp"
 #include "system.hpp"
 
 namespace dreamcast::game {
 
 namespace rt = qilin::rt;
 
-// The game's interrupts are taken by its libraries' own exception code
-// (lifted; VBR + 0x600), not by a table the port knows yet: none until the
-// delivery is written (docs/runtime.md). The interrupt service treats 0 as
-// "held back", so nothing is delivered and nothing is lost.
-uint32_t interrupt_handler(uint32_t) { return 0; }
+namespace {
 
+constexpr uint32_t kVbr = 0x8C000000u;      // the boot ROM's; the game doesn't move it
+constexpr uint32_t kUnhandled = 0x8C122F1Cu;  // start-up's default for every entry
+
+uint32_t table_handler(uint32_t intevt) {
+    const uint32_t h = rt::ld32(kVbr + 0x200u + (intevt - 0x200u) / 8u);
+    return h == kUnhandled ? 0 : h;
+}
+
+// The entry's call: IMASK 15, INTEVT in r4, the registers put back after.
+void call_handler(rt::Context& c, uint32_t handler, uint32_t intevt) {
+    const rt::Context saved = c;
+    c.sr |= 0xF0u;
+    c.r[4] = intevt;
+    rt::call_guest(c, handler);
+    c = saved;
+}
+
+// The level-6 interrupt (IRL 9, INTEVT 0x320): the graphics chip's events.
+// The interrupt service calls the address interrupt_handler gives; this
+// native code there calls the game's handler as the entry would.
+constexpr uint32_t kLevel6 = 0x80000200u;
+void level6(rt::Context& c) {
+    const uint32_t h = table_handler(0x320u);
+    if (!h) throw rt::Stop{rt::Stop::Unsupported, c.pr, 0x320u};
+    call_handler(c, h, 0x320u);
+}
+constexpr std::array<rt::Provided, 1> kNatives{{{kLevel6, "interrupt entry: level 6", level6}}};
+bool g_provided = false;
+
+}  // namespace
+
+uint32_t interrupt_handler(uint32_t offset) {
+    if (!g_provided) rt::provide(kNatives), g_provided = true;
+    if (offset != 0x224u) throw rt::Stop{rt::Stop::Unsupported, 0, offset};
+    return table_handler(0x320u) ? kLevel6 : 0;
+}
+
+// The level-4 interrupt (IRL 11, INTEVT 0x360): the system bus's DMA events
+// (GD-ROM, Maple, G2) and the sound chip's. The interrupt service takes one
+// event at a time and acknowledges it before handing it on, as Toy
+// Commander's native chain needs; this game's level-4 handler is its own
+// (lifted) and reads and acknowledges the status itself, so the event is
+// raised again for it to find.
 void raise_bus_event(rt::Context& c, uint32_t event) {
-    rt::log("msr: a system bus event (%03X) needs delivering, and the port doesn't deliver them yet", event);
-    throw rt::Stop{rt::Stop::Unsupported, c.pr, event};
+    const uint32_t h = table_handler(0x360u);
+    if (!h) {
+        rt::log("msr: system bus event %03X with no level-4 handler installed", event);
+        throw rt::Stop{rt::Stop::Unsupported, c.pr, event};
+    }
+    if (event >= 0xA00u && event < 0xB00u) raise_event((event - 0xA00u) / 0x20u + 12u);
+    else if (event >= 0xB00u && event < 0xB80u) raise_external_event((event - 0xB00u) / 0x20u);
+    else throw rt::Stop{rt::Stop::Unsupported, c.pr, event};
+    call_handler(c, h, 0x360u);
 }
 
 // The console's own settings: read by the game from flash memory, which the

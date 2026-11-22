@@ -60,7 +60,7 @@ public:
                     body += std::format("    goto {};\n", label(after));
                     targets_.insert(after);
                 }
-                body += std::format("{}:\n    QILIN_TICK({});\n", label(pc), hex(pc));
+                body += std::format("{}:\n    QILIN_TICK({});\n{}", label(pc), hex(pc), poll(pc));
                 const Insn in = cfg_.insn(pc);
                 used_ |= gpr_uses(in);
                 written_ |= sh4::gpr_writes(in);
@@ -69,7 +69,7 @@ public:
                 continue;
             }
             if (expected && expected != pc) throw Fail{pc, "internal: execution falls into bytes that aren't reached code"};
-            if (targets_.contains(pc)) body += std::format("{}:\n    QILIN_TICK({});\n", label(pc), hex(pc));
+            if (targets_.contains(pc)) body += std::format("{}:\n    QILIN_TICK({});\n{}", label(pc), hex(pc), poll(pc));
             else if (!expected) throw Fail{pc, "internal: code with no way in"};
             const Insn in = cfg_.insn(pc);
             used_ |= gpr_uses(in);
@@ -134,8 +134,10 @@ private:
             if (in.op == Op::sleep || in.op == Op::ldtlb) throw Fail{pc, std::format("privileged: {}", s.name)};
             if (f_.slots.contains(pc)) continue;
             if (!(s.flags & sh4::kBranch) || f_.tails.contains(pc)) continue;
-            if (in.op == Op::bt || in.op == Op::bf || in.op == Op::bt_s || in.op == Op::bf_s || in.op == Op::bra)
+            if (in.op == Op::bt || in.op == Op::bf || in.op == Op::bt_s || in.op == Op::bf_s || in.op == Op::bra) {
                 targets_.insert(in.branch_target(pc));
+                if (in.branch_target(pc) <= pc) loops_.insert(in.branch_target(pc));
+            }
         }
         for (const JumpTable& t : f_.jtabs) targets_.insert(t.targets.begin(), t.targets.end());
         // A constant jmp or braf back into the function (the CFG follows these as branches).
@@ -146,11 +148,19 @@ private:
                 const auto j = f_.jumps.find(pc);
                 if (j == f_.jumps.end()) throw Fail{pc, "internal: a jump inside the function with no target"};
                 targets_.insert(j->second);
+                if (j->second <= pc) loops_.insert(j->second);
             }
         }
         for (const uint32_t t : targets_)
             if (!std::ranges::binary_search(f_.insns, t) || (f_.slots.contains(t) && !slot_target(t)))
                 throw Fail{t, "internal: a branch target that isn't an instruction of the function"};
+    }
+
+    // At a loop's head: where the runtime delivers interrupts (guest.hpp), with the stack pointer
+    // the handlers' frames go below.
+    std::string poll(uint32_t pc) const {
+        if (!loops_.contains(pc)) return {};
+        return std::format("    QILIN_POLL_IRQ({});\n", used_ >> 15 & 1 ? "r15" : "c.r[15]");
     }
 
     bool slot_target(uint32_t pc) const { return std::ranges::find(f_.slot_targets, pc) != f_.slot_targets.end(); }
@@ -643,6 +653,7 @@ private:
     const std::set<uint32_t>& mova_words_;
     uint32_t setjmp_ = 0;
     std::vector<uint32_t> sites_;  // return addresses of this function's calls to setjmp
+    std::set<uint32_t> loops_;     // targets of backward branches: loops' heads
     mutable std::vector<std::pair<uint32_t, uint32_t>> folded_;
 };
 

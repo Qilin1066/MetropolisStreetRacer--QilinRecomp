@@ -192,8 +192,14 @@ private:
     void claim(const Function& f, std::vector<Kind>& kinds) const;
     std::vector<Kind> claims() const;
     bool acceptable(const Function& f, const std::vector<Kind>& kinds) const;
+    // A literal pointing at a few unclaimed instructions that branch or fall straight into known
+    // code: one of several entry stubs (`bra common; mov #n,r4`, the task entries at 0x8C131908,
+    // and `mov #7,r4` falling into the common code). Accepting it makes the code it goes into a
+    // function of its own, splitting the function that had it.
+    bool acceptable_stub(uint32_t c, const std::vector<Kind>& kinds) const;
     bool targets_acceptable(const Function& f, const std::vector<Kind>& kinds) const;
     bool seed_literals();
+    bool seed_stubs();
     bool seed_gaps();
     bool seed_data_pointers();
     void find_suspects();
