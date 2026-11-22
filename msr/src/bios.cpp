@@ -288,7 +288,33 @@ void gd_check_drive(rt::Context& c) {
     c.r[0] = 0;
 }
 
+void gdrom_call(rt::Context& c);
+
+// QILIN_TRACE_GDROM=1: every GDROM call, with its arguments and result, from the caller. For
+// finding what the game waits for. The same call repeated with the same result is counted, not
+// logged again.
 void gdrom(rt::Context& c) {
+    static const bool trace = [] {
+        const char* t = std::getenv("QILIN_TRACE_GDROM");
+        return t && *t && *t != '0';
+    }();
+    if (!trace) return gdrom_call(c);
+    const uint32_t r4 = c.r[4], r5 = c.r[5], r7 = c.r[7], from = c.pr;
+    const uint32_t w0 = r5 && rt::in_ram(r5) ? rt::ld32(r5) : 0, w1 = r5 && rt::in_ram(r5) ? rt::ld32(r5 + 4) : 0;
+    gdrom_call(c);
+    static uint32_t last[5] = {}, repeats = 0;
+    const uint32_t now[5] = {r7, r4, w0, c.r[0], from};
+    if (std::equal(now, now + 5, last)) {
+        ++repeats;
+        return;
+    }
+    if (repeats) rt::log("msr: GDROM:   (the call before, %u times more)", repeats);
+    repeats = 0;
+    std::copy(now, now + 5, last);
+    rt::log("msr: GDROM: call %u r4 %08X @r5 {%08X %08X} -> %08X, from %08X", r7, r4, w0, w1, c.r[0], from);
+}
+
+void gdrom_call(rt::Context& c) {
     if (static_cast<int32_t>(c.r[6]) == -1) unknown("MISC (0x8C0000BC, r6 = -1)", c);
     if (c.r[6] != 0) unknown("GDROM (0x8C0000BC) with r6 other than 0 or -1", c);
     if (!g_drive) rt::fatal("GD-ROM: no disc");
