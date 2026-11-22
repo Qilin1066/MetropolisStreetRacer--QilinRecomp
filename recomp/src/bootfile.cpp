@@ -10,6 +10,10 @@ namespace qilin {
 
 namespace {
 
+// MSR.BIN's start-a-program (0x8C02F68A): the launcher is replaced natively, and with it the
+// library that hands over to it (msr/src/launcher.cpp; docs/disc-and-boot-analysis.md).
+constexpr uint32_t kMsrReplaced[] = {0x8C02F68Au};
+
 // The North American disc, MK-51012 V1.010, dated 2000-11-30. Hashes
 // recorded from the Redump image in v0.3.0; docs/disc-and-boot-analysis.md
 // has what was checked.
@@ -17,7 +21,7 @@ constexpr std::array<KnownBuild, 2> kKnownBuilds{{
     {"b5515a96ba7e67dc2dfe08b6adf7d99a4d6c95e7e9fb015fe1f70dffa59af0e9", "1ST_READ.BIN", "MK-51012", "V1.010",
      "Metropolis Street Racer (USA): launcher"},
     {"7780f031bc7124dd68e2b411daf5e6fb636589ab4ea9b36427531d95517d9888", "MSR.BIN", "MK-51012", "V1.010",
-     "Metropolis Street Racer (USA): game", 0x8C0EE5BCu},
+     "Metropolis Street Racer (USA): game", 0x8C0EE5BCu, kMsrReplaced},
 }};
 
 std::unexpected<std::string> fail(std::string message) { return std::unexpected(std::move(message)); }

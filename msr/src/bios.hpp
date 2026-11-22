@@ -22,5 +22,8 @@ void install_bios(Drive& drive);
 // How the boot ROM's calls raise a system bus event (the GD-ROM DMA's end,
 // 0xA40): the port's interrupt delivery (msr/src/game.cpp).
 void set_bus_event(void (*raise)(qilin::rt::Context& c, uint32_t event));
+// A program start (msr/src/launcher.cpp): no GD-ROM request, stream or DMA end
+// carries over to the new program.
+void restart_bios();
 
 }  // namespace msr

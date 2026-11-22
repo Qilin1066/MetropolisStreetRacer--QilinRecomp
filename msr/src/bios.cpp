@@ -325,6 +325,12 @@ void set_vector(uint32_t vector, uint32_t target) { std::memcpy(rt::g_mem + vect
 
 void set_bus_event(void (*raise)(rt::Context& c, uint32_t event)) { g_raise_bus_event = raise; }
 
+void restart_bios() {
+    g_last = Request{};
+    g_stream = Stream{};
+    g_dma_end_pending = false;
+}
+
 void install_bios(Drive& drive) {
     g_drive = &drive;
     rt::provide(kCalls);

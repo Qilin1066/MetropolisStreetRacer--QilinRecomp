@@ -2,10 +2,12 @@
 //
 // Bring-up stage (docs/runtime.md): it loads the game from the player's disc
 // image into guest RAM as the console's boot ROM and the disc's launcher
-// would, runs it, and stops with a report at the first thing the port
-// doesn't provide yet.
+// would (the launcher is replaced natively: launcher.hpp), runs it, starts it
+// afresh each time the game hands back to the launcher, and stops with a
+// report at the first thing the port doesn't provide yet.
 //
 // Runtime code: no std::format.
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -25,6 +27,7 @@
 #include "memory.hpp"
 #include "onchip.hpp"
 #include "interrupts.hpp"
+#include "launcher.hpp"
 #include "pvr.hpp"
 #include "rtc.hpp"
 #include "save_history.hpp"
@@ -43,6 +46,15 @@ namespace {
 constexpr uint32_t kIpBin = 0x8C008000u;     // where the boot ROM loads IP.BIN
 constexpr uint32_t kProgram = 0x8C010000u;   // where the game is loaded and entered
 constexpr uint32_t kStackTop = 0x8C00F400u;  // r15 on entry: start-up paints the stack below it
+constexpr uint32_t kRamEnd = 0x8D000000u;
+
+// The game's image and IP.BIN in RAM, and RAM above the image cleared, as on a first start. Low
+// RAM below the image (the boot ROM's vectors and SYSINFO) is the console's and stays.
+void load_program(const std::vector<uint8_t>& program, const std::vector<uint8_t>& ip_bin) {
+    std::memcpy(rt::g_mem + kProgram, program.data(), program.size());
+    std::memset(rt::g_mem + kProgram + program.size(), 0, kRamEnd - kProgram - program.size());
+    if (!ip_bin.empty()) std::memcpy(rt::g_mem + kIpBin, ip_bin.data(), std::min<size_t>(ip_bin.size(), 0x8000u));
+}
 
 std::optional<std::vector<uint8_t>> read_whole(const std::filesystem::path& p) {
     std::ifstream f(p, std::ios::binary);
@@ -104,13 +116,12 @@ int main(int argc, char** argv) {
     if (sha != rt::g_lifted_sha256)
         rt::fatal("this disc's MSR.BIN (SHA-256 %s) isn't the one this build was made from (%s)", sha.c_str(),
                   rt::g_lifted_sha256);
-    if (disc.program.size() > 0x8D000000u - kProgram) rt::fatal("MSR.BIN is larger than RAM");
+    if (disc.program.size() > kRamEnd - kProgram) rt::fatal("MSR.BIN is larger than RAM");
 
     rt::GuestMemory memory;
     if (!memory.ok()) rt::fatal("can't map the guest's memory: %s", memory.error());
     rt::g_mem = memory.base();
-    std::memcpy(rt::g_mem + kProgram, disc.program.data(), disc.program.size());
-    if (!disc.ip_bin.empty()) std::memcpy(rt::g_mem + kIpBin, disc.ip_bin.data(), std::min<size_t>(disc.ip_bin.size(), 0x8000u));
+    load_program(disc.program, disc.ip_bin);
 
     msr::map_onchip();
     dreamcast::map_pvr();
@@ -122,23 +133,35 @@ int main(int argc, char** argv) {
     dreamcast::video::start();
     dreamcast::sound::start();
     msr::install_bios(*disc.drive);
+    msr::install_launcher();
     // A GD-ROM DMA's end is the system bus's normal event 14 (0xA40), delivered at the next poll.
     msr::set_bus_event([](rt::Context&, uint32_t event) { dreamcast::raise_event((event - 0xA00u) / 0x20u + 12u); });
 
     dreamcast::start_interrupts();
 
     rt::g_guest_threads = true;
-    rt::Context c;
-    c.r[15] = kStackTop;
-    c.fpscr = 0x00040000u;  // DN = 1: denormals flushed, as the console starts
-    c.vbr = 0x8C000000u;    // the boot ROM's: start-up copies its exception code there (0x8C130918)
-    try {
-        rt::call_guest(c, kProgram);
-    } catch (const rt::Stop& s) {
-        rt::report(stderr, s, &c);
-        rt::backtrace(stderr, c, kStackTop);
-        return 2;
+    msr::play_intro();  // the launcher's cold start; the game then starts with the block as the file has it
+    for (;;) {
+        rt::Context c;
+        c.r[15] = kStackTop;
+        c.fpscr = 0x00040000u;  // DN = 1: denormals flushed, as the console starts
+        c.vbr = 0x8C000000u;    // the boot ROM's: start-up copies its exception code there (0x8C130918)
+        try {
+            rt::call_guest(c, kProgram);
+        } catch (const rt::Stop& s) {
+            rt::report(stderr, s, &c);
+            rt::backtrace(stderr, c, kStackTop);
+            return 2;
+        } catch (const msr::StartGame& start) {
+            // The game handed back to the launcher, which starts it again with these arguments.
+            rt::end_guest_threads();
+            msr::restart_bios();
+            load_program(disc.program, disc.ip_bin);
+            if (!msr::write_argument_block({rt::g_mem + msr::kArgumentBlock, msr::kArgumentBlockSize}, start.args))
+                rt::fatal("msr: the arguments for the game's restart don't fit its argument block");
+            continue;
+        }
+        std::fprintf(stderr, "msr: the game returned to the boot ROM\n");
+        return 0;
     }
-    std::fprintf(stderr, "msr: the game returned to the boot ROM\n");
-    return 0;
 }

@@ -21,6 +21,7 @@
 #include "arm/decoder.hpp"
 #include "decoder.hpp"
 #include "drive.hpp"
+#include "launcher.hpp"
 #include "gdrom.hpp"
 #include "guest.hpp"
 #include "fiber.hpp"
@@ -1361,6 +1362,23 @@ void scheduler(rt::Context& c, int rounds) {
 }
 }  // namespace threads
 
+// The launcher's replacement: what the game is restarted with, and its argument block.
+void test_launcher() {
+    std::string program;
+    auto args = msr::launcher_arguments("1st_read.bin -DEMO=3 -ZONE=2 -SPEED=0", program);
+    CHECK(program == "1ST_READ.BIN");
+    CHECK((args == std::vector<std::string>{"-DEMO=-1", "-DEMO=3", "-ZONE=2", "-SPEED=0"}));
+    msr::launcher_arguments("\\sg_dpldr.bin", program);
+    CHECK(program == "SG_DPLDR.BIN");
+    std::vector<uint8_t> block(msr::kArgumentBlockSize, 0xEE);
+    CHECK(msr::write_argument_block(block, args));
+    const std::string expect = std::string("\\manifest.bin\0-DEMO=-1\0-DEMO=3\0-ZONE=2\0-SPEED=0\0\0\0", 50);
+    CHECK(std::equal(expect.begin(), expect.end(), block.begin()));
+    CHECK(std::all_of(block.begin() + 50, block.end(), [](uint8_t b) { return b == 0; }));
+    CHECK(!msr::write_argument_block(block, {"x"}));                        // too short for the game's count
+    CHECK(!msr::write_argument_block(block, {std::string(600, 'a')}));      // doesn't fit
+}
+
 // A folder served as a disc: the file system a GD-ROM driver reads.
 // The sound CPU's instructions (docs/sound.md).
 void test_arm_decoder() {
@@ -1463,6 +1481,14 @@ void test_guest_threads() {
     c.r[15] = kSchedStack;
     scheduler(c, 2);
     CHECK((log == std::vector<int>{101, 1, 102, 2}));
+    // A program restart: every suspended task ends, and the next start is like the first.
+    rt::end_guest_threads();
+    log.clear();
+    task_buf = {kTask, kTaskStack};
+    c.r[15] = kSchedStack;
+    scheduler(c, 1);
+    CHECK((log == std::vector<int>{101, 1}));
+    rt::end_guest_threads();
     rt::g_guest_threads = false;
 }
 
@@ -1490,6 +1516,7 @@ int main() {
     test_nonlocal_return();
     test_guest_threads();
     test_folder_drive();
+    test_launcher();
     test_arm_decoder();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);

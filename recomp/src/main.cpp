@@ -374,7 +374,7 @@ int cmd_lift(const Args& a) {
     std::set<std::pair<uint32_t, uint32_t>> folded;  // literals compiled as constants
     std::map<uint32_t, std::string> jump_sites;      // setjmp call returns, and the function each is in
     std::map<std::string, size_t> reasons;
-    size_t lifted = 0, in_chunk = 0, chunks = 0, instructions = 0;
+    size_t lifted = 0, replaced = 0, in_chunk = 0, chunks = 0, instructions = 0;
     const auto flush = [&] {
         if (chunk.empty()) return;
         write_text((dir / std::format("lifted_{:03}.cpp", chunks++)).string(),
@@ -385,6 +385,14 @@ int cmd_lift(const Args& a) {
     for (const auto& [start, f] : cfg.functions()) {
         const std::string name = fn_name(start);
         decls += std::format("void {}(rt::Context& c);\n", name);
+        if (std::ranges::contains(build->replaced, start)) {
+            // Native code in the port (KnownBuild::replaced): entered in any mode, leaves it as it was.
+            table += std::format("    {{0x{:08x}u, gen::{}, true, true}},\n", start, name);
+            chunk += std::format("void {}(rt::Context& c) {{ rt::replaced(c, 0x{:08x}u); }}\n\n", name, start);
+            ++replaced;
+            if (++in_chunk == kPerFile) flush();
+            continue;
+        }
         const LiftResult result = lifter.lift(f);
         table += std::format("    {{0x{:08x}u, gen::{}, {}, {}}},\n", start, name, result.any_mode ? "true" : "false",
                              result.keeps_mode || !result.ok ? "true" : "false");
@@ -426,6 +434,7 @@ int cmd_lift(const Args& a) {
     const size_t total = cfg.functions().size();
     std::println("{} of {} functions lifted ({}), {} instructions, into {} files in {}", lifted, total,
                  percent(lifted, total, 1), instructions, chunks, dir.string());
+    if (replaced) std::println("{} replaced by the port's native code", replaced);
     std::vector<std::pair<std::string, size_t>> sorted(reasons.begin(), reasons.end());
     std::ranges::sort(sorted, [](const auto& x, const auto& y) { return x.second > y.second; });
     for (const auto& [why, n] : sorted) std::println("{:>6}  {}", n, why);

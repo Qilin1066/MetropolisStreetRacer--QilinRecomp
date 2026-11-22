@@ -221,7 +221,7 @@ endif()
 
 # ---- The port: the hardware and system software the game runs on (msr/src),
 # built without the lifted code too, so CI compiles it ----
-add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp msr/src/drive.cpp)
+add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp msr/src/drive.cpp msr/src/launcher.cpp)
 target_include_directories(msr_port PUBLIC msr/src)
 target_link_libraries(msr_port PUBLIC qilin_runtime qilin_disc PRIVATE qilin_warnings)
 if(QILIN_HOST)

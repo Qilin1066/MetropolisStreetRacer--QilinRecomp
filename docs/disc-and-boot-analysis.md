@@ -64,6 +64,20 @@ Read from the disassembly of both programs (`qilin insns`, with the function bou
 3. When the game asks to start `sg_dpldr.bin`: there is no browser. What the menu entry does instead is to be decided; until then the runtime stops and says so.
 4. Stop loudly on a request to start anything else.
 
+**Done (written, not yet run), in `msr/src/launcher.cpp`.**
+
+- `MSR.BIN`'s start-a-program is in the known-build table's `replaced` list. `qilin lift` emits it as `rt::replaced(c, 0x8C02F68A)`, which runs the native registered at that address. It is the one function the port replaces: 5,295 of 5,296 are lifted. The game calls it from two places. One is the attract loop's hand-back, `0x8C01094C`. The other is a tail call in `0x8C02F5C0`, which starts the command at `0x8C110130` and is reached only indirectly.
+- The native reads the command line at r4. For `1st_read.bin` it throws to `msr`'s run loop, which then:
+  1. ends every guest thread;
+  2. clears the GD-ROM's request and stream state;
+  3. reloads `MSR.BIN` and `IP.BIN`, and clears RAM above the image (low RAM, with the boot ROM's vectors and SYSINFO, stays);
+  4. writes the argument block (`\manifest.bin`, `-DEMO=-1`, then the words after the program's name);
+  5. enters `0x8C010000` again with a fresh context.
+
+  `sg_dpldr.bin` and anything else stop with the command line in the message.
+- The block's format comes from the game's readers. Argument by index (`0x8C02FA72`) counts from 0, and the game's main reads from index 1, so the first string is the program's own name. Argument count (`0x8C02FA54`) steps over the byte after each string's NUL. That means a one-character argument would cut the count short, and the block must hold two NULs after the last string. The writer refuses both cases.
+- The cold start leaves the block as the file has it. The intro movie isn't played: there is no Sofdec (MPEG-1 video and ADX sound) decoder in the port yet, so the start goes on as if the player had skipped it, and says so. A permissively licensed MPEG-1 decoder is the likely route; adding a library is the author's decision.
+
 **Still to confirm** (by tracing the original under Flycast, and by reading `GINXFER.BIN`):
 
 - that the transfer program is what fills the argument block, and what the first string is on a cold start (`\manifest.bin`, or the program's name);

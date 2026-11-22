@@ -552,6 +552,12 @@ void call_any_mode(Context& c, uint32_t target, uint32_t from);
 
 [[noreturn]] inline void bad_jump(uint32_t from, uint32_t target) { throw Stop{Stop::BadJump, from, target}; }
 [[noreturn]] inline void not_lifted(uint32_t fn) { throw Stop{Stop::NotLifted, fn, fn}; }
+// A function the port replaces with native code (KnownBuild::replaced): runs the native
+// registered at its address (rt::provide), which returns to PR; none registered stops.
+void replaced(Context& c, uint32_t fn);
+// Ends every guest thread but the host thread's own, each unwinding its frames; for a
+// restart of the program. Only from the host thread's stack, with no guest frame live on it.
+void end_guest_threads();
 // After a call: the callee must have returned to the instruction after it.
 // ---- setjmp and longjmp across lifted frames (dispatch.cpp) ----
 // A call to setjmp in a lifted frame: while the frame lives, a longjmp may

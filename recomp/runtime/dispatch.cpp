@@ -188,6 +188,29 @@ JumpSite::~JumpSite() {
 
 uint32_t take_resume() { return std::exchange(t_resume, 0); }
 
+void replaced(Context& c, uint32_t fn) {
+    const Provided* p = native_at(fn);
+    if (!p) throw Stop{Stop::Unsupported, fn, fn};  // replaced in the port, and this build has no native for it
+    p->fn(c);
+    c.ret = c.pr;
+}
+
+void end_guest_threads() {
+    if (t_running && t_running != &t_first) throw Stop{Stop::Unsupported, 0, 0};  // not from a guest thread
+    while (!t_threads.empty()) {
+        GuestThread& t = *t_threads.back();
+        if (t.state != GuestThread::Suspended) {
+            t_threads.pop_back();  // ended, or never started: no frames
+            continue;
+        }
+        t.kill = true;
+        switch_to(t);  // it unwinds and comes back ended (reaped)
+    }
+    t_first = GuestThread{};
+    t_running = nullptr;
+    t_resume = 0;
+}
+
 void nonlocal_return(Context& c, uint32_t from) {
     for (;;) {
         GuestThread& me = running();
