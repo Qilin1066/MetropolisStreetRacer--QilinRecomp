@@ -118,14 +118,19 @@ Request g_last;
 // stream reader 0x8C120C72 with a sector count). The data then comes out in
 // pieces the driver asks for with call 6, {buffer, bytes} (0x8C12E466), each
 // a DMA ending with event 0xA40; call 7 gives the bytes of the piece still to
-// come. The library's stream server (0x8C11F512) and reader (0x8C120C72,
-// 0x8C120D50) read the answers so: call 1 answers 3, streaming, while the
-// stream has data left, then 2, complete; on 3 the server asks call 7, whose
-// word is the stream's data not yet transferred (KallistiOS documents it as
-// the remaining amount). More than 0 marks the stream ready for the next
-// piece (its state word 0x4A goes 0), none marks its end (2); the reader
-// waits for that word to leave 1 (open, or a piece asked for). Abort (call 8)
-// ends it.
+// come. How the library reads the answers (its stream server 0x8C11F512,
+// reader 0x8C120C72 and 0x8C120D50, closer 0x8C120ED6):
+// - call 1 answering 3, streaming, makes the server ask call 7, whose word is
+//   the stream's data not yet transferred (KallistiOS documents it as the
+//   remaining amount): more than 0 marks the stream ready for a piece (its
+//   state word 0x4A goes 0), none its end. The reader waits for that word to
+//   leave 1 after opening the stream and after each piece it asks for;
+// - call 1 answering 1, processing, with the fourth status word 1 is what the
+//   closer waits for before it aborts the stream (the drive idle between
+//   pieces).
+// So call 1 answers 3 once after the stream opens and after each piece, until
+// call 7 has been asked; 1 between pieces; 2, complete, once no data is left.
+// Abort (call 8) ends it.
 struct Stream {
     uint32_t id = 0;
     uint32_t sector = 0;     // the next one to read from the disc
@@ -133,6 +138,7 @@ struct Stream {
     uint64_t sent = 0;       // bytes handed out so far
     uint8_t buffer[2048];    // the sector being handed out
     uint32_t in_buffer = 0;  // bytes of it not yet handed out
+    bool to_report = false;  // opened, or a piece moved, and call 7 not asked since
 };
 Stream g_stream;
 uint32_t g_next_id = 1;
@@ -216,6 +222,7 @@ void gd_send_command(rt::Context& c) {
         // and a new command ends the one in progress. A later call naming the old one stops.
         g_stream.id = r.id, g_stream.sector = frame - kFrameOffset, g_stream.in_buffer = 0, g_stream.sent = 0;
         g_stream.left = uint64_t(sectors) * 2048;
+        g_stream.to_report = true;
         break;
     }
     case kVersion: {
@@ -241,7 +248,8 @@ void gd_check_command(rt::Context& c) {
     if (id != 0 && id == g_stream.id) {
         const uint32_t sent = static_cast<uint32_t>(g_stream.sent);
         rt::st32(status, 0), rt::st32(status + 4, 0), rt::st32(status + 8, sent), rt::st32(status + 12, 0);
-        c.r[0] = g_stream.left ? 3 : 2;  // streaming, then complete
+        rt::st32(status + 12, 1);
+        c.r[0] = !g_stream.left ? 2 : g_stream.to_report ? 3 : 1;
         if (!g_stream.left) g_stream.id = 0;
         return;
     }
@@ -279,6 +287,7 @@ void gd_dma_transfer(rt::Context& c) {
     }
     g_dma_end_pending = true;
     deliver_pending(c);
+    g_stream.to_report = true;
     c.r[0] = 0;
 }
 
@@ -288,6 +297,7 @@ void gd_dma_check(rt::Context& c) {
     if (c.r[4] == 0 || c.r[4] != g_stream.id) gd_stop(c, "the progress of a stream that isn't open", c.r[4]);
     deliver_pending(c);
     rt::st32(c.r[5], static_cast<uint32_t>(g_stream.left));
+    g_stream.to_report = false;
     c.r[0] = 0;
 }
 
