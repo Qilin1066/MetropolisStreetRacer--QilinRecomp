@@ -194,8 +194,10 @@ void bus_flush_store_queue(uint32_t a, uint32_t pc);
 #define QILIN_HW_LOAD(a, n) \
     if (!::qilin::rt::in_ram(a)) [[unlikely]] return ::qilin::rt::bus_read(a, n)
 #define QILIN_TRACE_LOAD(a, v, n) ((void)0)
+// The low n bytes of a store's value (n of 1, 2 or 4).
+inline uint32_t low_bytes(uint32_t v, unsigned n) { return n >= 4 ? v : v & ((1u << (8 * n)) - 1); }
 #define QILIN_HW_STORE(a, n, v) \
-    if (!::qilin::rt::in_ram(a)) [[unlikely]] return ::qilin::rt::bus_write(a, (n) < 4 ? (v) & ((1u << (8 * (n))) - 1) : (v), n)
+    if (!::qilin::rt::in_ram(a)) [[unlikely]] return ::qilin::rt::bus_write(a, ::qilin::rt::low_bytes(v, n), n)
 #ifdef QILIN_BRINGUP
 // Bring-up builds of the game: the instruction of each access is noted (one
 // store), so a stop on the bus names it.
