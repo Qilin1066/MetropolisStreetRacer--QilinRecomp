@@ -135,11 +135,14 @@ struct Stream {
 };
 Stream g_stream;
 uint32_t g_next_id = 1;
-// The GD-ROM DMA's end (event 0xA40), raised by a DMA read and delivered at the next call that
-// can take it: on the console it comes a moment after the read is sent, never inside that call.
+// The GD-ROM DMA's end (event 0xA40), raised as the DMA is done. Raising it only marks the
+// event in the system bus's interrupt status (msr/src/main.cpp): the game takes it at its next
+// poll with level 4 unmasked, after the call that started the DMA, as on the console. (It was
+// held here until a later GDROM call with level 4 unmasked; the library's stream server makes
+// its calls masked, so it never came.)
 bool g_dma_end_pending = false;
 void deliver_pending(rt::Context& c) {
-    if (!g_dma_end_pending || ((c.sr >> 4) & 15u) >= 4) return;  // level 4 masked: later
+    if (!g_dma_end_pending) return;
     g_dma_end_pending = false;
     if (!g_raise_bus_event) throw rt::Stop{rt::Stop::Unsupported, c.pr, 0xA40u};
     g_raise_bus_event(c, 0xA40u);
@@ -202,7 +205,7 @@ void gd_send_command(rt::Context& c) {
     case kPioRead:
     case kDmaRead:
         r.bytes = read_sectors(c, rt::ld32(c.r[5]), rt::ld32(c.r[5] + 4), rt::ld32(c.r[5] + 8));
-        if (command == kDmaRead) g_dma_end_pending = true;
+        if (command == kDmaRead) g_dma_end_pending = true, deliver_pending(c);
         break;
     case kDmaStream: {
         const uint32_t frame = rt::ld32(c.r[5]), sectors = rt::ld32(c.r[5] + 4);
@@ -275,6 +278,7 @@ void gd_dma_transfer(rt::Context& c) {
         to += n, bytes -= n, g_stream.in_buffer -= n, g_stream.left -= n, g_stream.sent += n;
     }
     g_dma_end_pending = true;
+    deliver_pending(c);
     g_stream.moving = true;
     c.r[0] = 0;
 }
@@ -321,6 +325,8 @@ void gdrom(rt::Context& c) {
         ++repeats;
         return;
     }
+    static uint32_t lines = 0;
+    if (++lines > 20000) return;  // enough to see what the game waits for, without filling the disc
     if (repeats) rt::log("msr: GDROM:   (the call before, %u times more)", repeats);
     repeats = 0;
     std::copy(now, now + 5, last);
