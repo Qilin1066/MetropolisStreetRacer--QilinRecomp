@@ -271,6 +271,11 @@ if(QILIN_GEN_DIR)
         recomp/runtime/bus.cpp)
     target_include_directories(qilin_gen PUBLIC "${QILIN_GEN_DIR}")
     target_link_libraries(qilin_gen PUBLIC qilin_runtime qilin_platform PRIVATE qilin_warnings)
+    if(MSVC)
+        # C4702 (unreachable code): lifted code calls guest functions that never return (they
+        # stop, or loop for ever), and the code after such a call is still emitted.
+        target_compile_options(qilin_gen PRIVATE /wd4702)
+    endif()
     # During the bring-up: each access notes its instruction, so a stop names it (docs/runtime.md).
     option(QILIN_BRINGUP "Note the guest instruction of each access in the game build" ON)
     if(QILIN_BRINGUP)
