@@ -499,7 +499,8 @@ void test_cfg() {
         // A caller goes on in its callee's exit mode: bsr callee ; nop ; fmov fr0,fr2 ; rts ; nop ;
         // callee: fschg ; rts ; nop. The fmov after the call is a 64-bit move.
         {
-            Cfg cx(program({0xB003, 0x0009, 0xF20C, 0x000B, 0x0009, 0xF3FD, 0x000B, 0x0009}));
+            const BootFile two = program({0xB003, 0x0009, 0xF20C, 0x000B, 0x0009, 0xF3FD, 0x000B, 0x0009});
+            Cfg cx(two);  // a Cfg keeps a reference to its boot file
             cx.run();
             const Function& caller = cx.functions().at(B);
             CHECK(caller.fp_modes == Modes({at(B + 0x04, all_known(kFpSz))}) && caller.fp_unknown.empty());
