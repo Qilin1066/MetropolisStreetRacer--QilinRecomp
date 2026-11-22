@@ -91,6 +91,14 @@ else()
     target_compile_options(qilin_runtime INTERFACE -ffp-contract=off -fno-fast-math -frounding-math)
 endif()
 
+# ---- The guest address space (recomp/runtime/memory.hpp) ----
+add_library(qilin_memory STATIC recomp/runtime/memory.cpp)
+target_include_directories(qilin_memory PUBLIC recomp/runtime)
+target_link_libraries(qilin_memory PRIVATE qilin_warnings)
+if(WIN32)
+    target_link_libraries(qilin_memory PRIVATE onecore)  # VirtualAlloc2, MapViewOfFile3 (Windows 10 1803+)
+endif()
+
 # ---- Lifted code (optional): the output of `qilin lift`, which is derived
 # from the game and so lives outside the repository ----
 #   qilin lift disc/MSR.BIN --out gen && cmake -B build -DQILIN_GEN_DIR=$PWD/gen
@@ -117,6 +125,6 @@ endif()
 # ---- Tests (no game files needed) ----
 enable_testing()
 add_executable(qilin_tests recomp/tests/tests.cpp)
-target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_warnings)
+target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_memory qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)

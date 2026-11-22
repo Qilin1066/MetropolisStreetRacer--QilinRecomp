@@ -19,6 +19,7 @@
 #include "decoder.hpp"
 #include "gdrom.hpp"
 #include "guest.hpp"
+#include "memory.hpp"
 #include "lifter.hpp"
 #include "report.hpp"
 #include "sha256.hpp"
@@ -659,6 +660,28 @@ void test_lifter() {
         c6.run();
         const LiftResult e = Lifter(c6).lift(c6.functions().at(B));
         CHECK(e.ok && e.code.contains("const uint32_t ret = c.spc; QILIN_OUT rt::set_sr(c, c.ssr, 0x8c010000u); QILIN_IN"));
+    }
+
+    // ---- the guest address space: main RAM at all sixteen of its addresses ----
+    {
+        rt::GuestMemory memory;
+        CHECK(memory.ok());
+        if (memory.ok()) {
+            uint8_t* const g = memory.base();
+            CHECK(memory.ram() == g + 0x8C000000u);
+            const uint32_t word = 0x12345678u;
+            std::memcpy(g + 0x8C010000u, &word, 4);  // cached
+            bool same = true;
+            for (unsigned i = 0; i < rt::GuestMemory::kRamViews; ++i) {
+                uint32_t v = 0;
+                std::memcpy(&v, g + rt::GuestMemory::ram_view(i) + 0x10000u, 4);
+                same = same && v == word;
+            }
+            CHECK(same);
+            g[0xAD010004u] = 0xAB;  // through the uncached mirror
+            CHECK(g[0x8C010004u] == 0xAB && g[0x0F010004u] == 0xAB);
+            CHECK(rt::GuestMemory::ram_view(0) == 0x0C000000u && rt::GuestMemory::ram_view(15) == 0xCF000000u);
+        }
     }
 
     // ---- the helpers generated code calls ----
