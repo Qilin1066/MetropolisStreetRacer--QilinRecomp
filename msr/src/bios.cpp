@@ -202,7 +202,9 @@ void gd_send_command(rt::Context& c) {
     case kDmaStream: {
         const uint32_t frame = rt::ld32(c.r[5]), sectors = rt::ld32(c.r[5] + 4);
         if (frame < kFrameOffset || sectors == 0) gd_stop(c, "a stream from before the disc's start, or of nothing", frame);
-        if (g_stream.left) gd_stop(c, "a second stream while one is open", frame);
+        // A stream the game leaves unfinished (the file system streams ahead, then seeks
+        // elsewhere) ends when the next one starts: the drive takes one streaming read at a time,
+        // and a new command ends the one in progress. A later call naming the old one stops.
         g_stream.id = r.id, g_stream.sector = frame - kFrameOffset, g_stream.in_buffer = 0, g_stream.sent = 0;
         g_stream.left = uint64_t(sectors) * 2048;
         break;
