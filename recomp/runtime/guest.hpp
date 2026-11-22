@@ -61,7 +61,7 @@ inline uint32_t g_pc = 0;  // set by checked code before each access, for the re
 // A time limit, checked every 2^20 accesses: a test's lifted code that runs
 // on (a loop waiting for an interrupt, say) stops with its state intact.
 inline uint64_t g_accesses = 0;
-inline std::chrono::steady_clock::time_point g_deadline = std::chrono::steady_clock::time_point::max();
+inline std::chrono::steady_clock::time_point g_deadline = (std::chrono::steady_clock::time_point::max)();  // parenthesised: windows.h may define max
 // And a limit on the host stack: guest recursion that doesn't end (a cycle
 // in a structure the test made up) stops before it overflows the host's.
 inline const char* g_stack_base = nullptr;

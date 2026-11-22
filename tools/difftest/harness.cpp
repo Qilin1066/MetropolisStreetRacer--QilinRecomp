@@ -29,6 +29,9 @@
 #if defined(_WIN32)
 #include <fcntl.h>
 #include <io.h>
+#ifndef NOMINMAX
+#define NOMINMAX  // windows.h's min and max macros break std::max and the like
+#endif
 #include <windows.h>
 #else
 #include <sys/mman.h>
