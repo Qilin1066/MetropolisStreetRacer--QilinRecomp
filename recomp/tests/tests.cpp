@@ -18,6 +18,7 @@
 
 #include "bootfile.hpp"
 #include "cfg.hpp"
+#include "arm/decoder.hpp"
 #include "decoder.hpp"
 #include "drive.hpp"
 #include "gdrom.hpp"
@@ -1361,6 +1362,43 @@ void scheduler(rt::Context& c, int rounds) {
 }  // namespace threads
 
 // A folder served as a disc: the file system a GD-ROM driver reads.
+// The sound CPU's instructions (docs/sound.md).
+void test_arm_decoder() {
+    using qilin::arm::Op;
+    using qilin::arm::decode;
+    // mov sp, #0xB000 (an immediate rotated: 0x0B ror 20)
+    auto in = decode(0xE3A0DA0Bu);
+    CHECK(in.op == Op::mov && in.rd == 13 && in.imm && in.value == 0xB000u && in.cond == 14);
+    // bl 0x75c from 0x148
+    in = decode(0xEB000183u);
+    CHECK(in.op == Op::bl && in.branch_target(0x148) == 0x75Cu);
+    // ldr r0, [pc, #2908]
+    in = decode(0xE59F0B5Cu);
+    CHECK(in.op == Op::ldr && in.rn == 15 && in.rd == 0 && in.imm && in.value == 2908 && in.pre && in.up);
+    // mrs sl, cpsr; msr cpsr_fc, sl
+    in = decode(0xE10FA000u);
+    CHECK(in.op == Op::mrs && in.rd == 10 && !in.spsr);
+    in = decode(0xE129F00Au);
+    CHECK(in.op == Op::msr && in.rm == 10 && in.fields == 9);
+    // stmfd sp!, {lr}; ldm sp, {pc}^
+    in = decode(0xE92D4000u);
+    CHECK(in.op == Op::stm && in.rn == 13 && in.writeback && in.pre && !in.up && in.list == 0x4000);
+    in = decode(0xE8DD8000u);
+    CHECK(in.op == Op::ldm && in.s && in.list == 0x8000 && in.writes_pc());
+    // movne r9, #0; lsl sl, sl, #2 (a mov with a shifted register)
+    in = decode(0x13A09000u);
+    CHECK(in.op == Op::mov && in.cond == 1);
+    in = decode(0xE1A0A10Au);
+    CHECK(in.op == Op::mov && in.rm == 10 && in.amount == 2 && in.shift == qilin::arm::Shift::lsl);
+    // ARMv4 encodings decode, marked: ldrh r0, [r1]; umull r0, r1, r2, r3
+    in = decode(0xE1D100B0u);
+    CHECK(in.op == Op::ldrh && in.armv4);
+    in = decode(0xE0810392u);
+    CHECK(in.op == Op::umull && in.armv4);
+    // A compare without S isn't one: undefined.
+    CHECK(decode(0x03020100u).op == Op::undefined);
+}
+
 void test_folder_drive() {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "qilin_folder_drive_test";
@@ -1452,6 +1490,7 @@ int main() {
     test_nonlocal_return();
     test_guest_threads();
     test_folder_drive();
+    test_arm_decoder();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;

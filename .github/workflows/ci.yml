@@ -52,6 +52,12 @@ jobs:
           else
             ctest --test-dir build -C Release --output-on-failure
           fi
+      # The sound CPU's decoder against GNU objdump over a sample of words (docs/sound.md).
+      - name: ARM decoder check
+        if: matrix.sweep
+        run: |
+          sudo apt-get install -y -qq binutils-arm-none-eabi
+          python3 tools/check/verify_arm.py --qilin build/qilin --random 300000
       # The shaders are committed as SPIR-V; check that it matches the sources and that they compile.
       - name: Shaders up to date
         if: matrix.sweep

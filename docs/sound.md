@@ -21,7 +21,7 @@ Replacing Manatee natively, as Toy Commander replaced AUDIO64, would mean writin
 Every instruction can be conditional.
 
 The plan, in the order it will be written:
-1. **An ARM decoder** (`recomp/src/arm/`), table-driven like the SH-4 one, checked against `arm-none-eabi-objdump` over the driver's words. The full 32-bit encoding space is too large to sweep, so the check covers every word of the drivers and a random sample of the rest.
+1. ✅ **An ARM decoder** (`recomp/src/arm/`), table-driven like the SH-4 one, checked against `arm-none-eabi-objdump` over the driver's words. The full 32-bit encoding space is too large to sweep, so the check covers every word of the drivers and a random sample of the rest.
 2. **Discovery and lifting**:
    - functions from the reset and FIQ vectors and from `BL` targets;
    - literal pools (`LDR rN,[pc,#k]`);
@@ -37,3 +37,10 @@ The plan, in the order it will be written:
 5. **Checking**: the lifted driver against the original under an ARM reference run as a black box (`qemu-arm` in system mode, or the emulator used for Flycast-based checks), like the SH-4 differential test.
 
 The driver is the game's data: like `MSR.BIN`, it is lifted from the player's disc at build time and never committed.
+
+## Progress
+
+- **The decoder** (2026-11-22). `recomp/src/arm/decoder.{hpp,cpp}` decodes every class of the instruction set: data processing (with rotated immediates and shifts), the multiplies, swaps, status transfers, word and byte transfers, block transfers, branches, `swi`, and the coprocessor space, which the AICA doesn't have. ARMv4's halfword transfers and long multiplies decode but are marked, since the ARM7DI is an ARMv3 core. Fields the architecture says should be zero (rn of `mov`/`mvn`, rd of the compares) make a word undefined, as do compares without S, which are other instructions on later cores.
+  - `qilin armdis <file>` prints each word decoded.
+  - `tools/check/verify_arm.py` compares the operation and condition with `arm-none-eabi-objdump -m armv4`. Over both drivers on the disc and 300,000 random words (313,700 in all) there are **0 unexplained differences**. The known ones are encodings objdump prints as later architectures' instructions or marks undefined itself.
+  - CI runs the random part; unit tests cover the driver's start-up instructions.

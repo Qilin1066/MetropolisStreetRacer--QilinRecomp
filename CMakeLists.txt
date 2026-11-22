@@ -71,6 +71,7 @@ add_library(qilin_core STATIC
     recomp/src/decoder.cpp
     recomp/src/cfg.cpp
     recomp/src/lifter.cpp
+    recomp/src/arm/decoder.cpp
 )
 target_include_directories(qilin_core PUBLIC recomp/src)
 target_link_libraries(qilin_core PUBLIC qilin_disc PRIVATE qilin_warnings)

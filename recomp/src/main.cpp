@@ -13,6 +13,7 @@
 //   qilin coverage <1ST_READ.BIN> [--list]              byte accounting of the code: code / literal / table /
 //                                                       padding / unknown (exit 3 if any unknown)
 //   qilin suspects <1ST_READ.BIN>                       functions with problems, for review
+//   qilin armdis  <file> [--base addr]                  ARM (the sound CPU's) words, decoded: the decoder check
 //   qilin hardware <1ST_READ.BIN> [--list]               the hardware the code names: literal-pool
 //                                                       addresses in each device, by function
 //   qilin fpmode  <1ST_READ.BIN> [--list]               floating-point mode (FPSCR.PR/SZ/FR) proof: what is
@@ -45,6 +46,7 @@
 
 #include "bootfile.hpp"
 #include "cfg.hpp"
+#include "arm/decoder.hpp"
 #include "decoder.hpp"
 #include "gdrom.hpp"
 #include "lifter.hpp"
@@ -76,6 +78,7 @@ int usage() {
                "  qilin coverage <1ST_READ.BIN> [--list]\n"
                "  qilin suspects <1ST_READ.BIN>\n"
                "  qilin trial   <1ST_READ.BIN> --base addr\n"
+               "  qilin armdis  <file> [--base addr]\n"
                "  qilin hardware <1ST_READ.BIN> [--list]\n"
                "  qilin fpmode  <1ST_READ.BIN> [--list]\n"
                "  qilin lift    <MSR.BIN> --out <dir>\n"
@@ -507,6 +510,26 @@ int cmd_hardware(const Args& a) {
     return 0;
 }
 
+// Each 32-bit word of a file as the ARM decoder reads it: address, word, the
+// mnemonic and the registers it names (tools/check/verify_arm.py compares
+// these with binutils).
+int cmd_armdis(const Args& a) {
+    std::ifstream f(a.input, std::ios::binary);
+    if (!f) throw Failure{std::format("cannot read {}", a.input)};
+    const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), {});
+    const uint32_t base = a.base;
+    for (size_t k = 0; k + 4 <= bytes.size(); k += 4) {
+        const uint32_t w = uint32_t(bytes[k]) | uint32_t(bytes[k + 1]) << 8 | uint32_t(bytes[k + 2]) << 16 | uint32_t(bytes[k + 3]) << 24;
+        const uint32_t pc = base + static_cast<uint32_t>(k);
+        const arm::Insn in = arm::decode(w);
+        static constexpr const char* kCond[16] = {"eq", "ne", "cs", "cc", "mi", "pl", "vs", "vc",
+                                                  "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"};
+        std::println("{:08x} {:08x} {} {} {} {}{}", pc, w, arm::name(in.op), kCond[in.cond], in.s ? 1 : 0,
+                     arm::describe(in, pc), in.armv4 ? " (ARMv4)" : "");
+    }
+    return 0;
+}
+
 int cmd_fpmode(const Args& a) {
     const BootFile boot = must(BootFile::load(a.input), a.input);
     Cfg cfg(boot);
@@ -566,6 +589,7 @@ int main(int argc, char** argv) {
         if (a.command == "trial") return cmd_trial(a);
         if (a.command == "fpmode") return cmd_fpmode(a);
         if (a.command == "hardware") return cmd_hardware(a);
+        if (a.command == "armdis") return cmd_armdis(a);
         if (a.command == "lift") return cmd_lift(a);
         return usage();
     } catch (const Failure& f) {

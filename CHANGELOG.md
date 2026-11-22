@@ -19,6 +19,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
   - the settings, the menu and the saves' history;
   - the SDL3 window, Vulkan, audio and pads, with their tests (graphical ones under Xvfb in CI).
 - **The boot ROM's GDROM calls**, after Toy Commander's (reads, table of contents, the drive's state). The drive is the disc image, or for development a folder of the extracted disc served as ISO 9660.
+- **The sound CPU's decoder** (ARM7DI, ARMv3; ARMv4 forms marked), the first step to lifting the game's sound driver, `MANATEE.DRV` (`docs/sound.md`): `qilin armdis`, checked against binutils over both drivers on the disc and 300,000 random words with 0 unexplained differences.
 - **GD-ROM streaming reads** (command 28, calls 6 and 7), seek; the boot ROM's **FLASHROM** calls over the flash memory file; **ROMFONT** lock and unlock; **SYSTEM** ends the program. `msr` starts the window, renderer, menu and sound output, and maps the sound chip. Written without running (the author's instruction).
 - **Interrupt delivery**: the lifter polls at loop heads, and the interrupt service calls the game's own handlers from its libraries' table (VBR + 0x200), as their entry at VBR + 0x600 would. The GD-ROM DMA's end and the vertical blank are delivered.
 - **Entry stubs** (`bra common; mov #n,r4`, or a few instructions falling into a function) are functions: 5,296 functions, all lifted; the 52 new or resized pass the differential test.
