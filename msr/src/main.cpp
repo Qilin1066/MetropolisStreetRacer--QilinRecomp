@@ -1,0 +1,110 @@
+// msr: Metropolis Street Racer, recompiled. The program players run.
+//
+// Bring-up stage (docs/runtime.md): it loads the game from the player's disc
+// image into guest RAM as the console's boot ROM and the disc's launcher
+// would, runs it, and stops with a report at the first thing the port
+// doesn't provide yet.
+//
+// Runtime code: no std::format.
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "bios.hpp"
+#include "gdrom.hpp"
+#include "guest.hpp"
+#include "memory.hpp"
+#include "onchip.hpp"
+#include "sha256.hpp"
+#include "system.hpp"
+
+namespace rt = qilin::rt;
+
+namespace {
+
+constexpr uint32_t kIpBin = 0x8C008000u;     // where the boot ROM loads IP.BIN
+constexpr uint32_t kProgram = 0x8C010000u;   // where the game is loaded and entered
+constexpr uint32_t kStackTop = 0x8C00F400u;  // r15 on entry: start-up paints the stack below it
+
+std::optional<std::vector<uint8_t>> read_whole(const std::filesystem::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return std::nullopt;
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), {});
+}
+
+struct Disc {
+    std::vector<uint8_t> program, ip_bin;
+};
+
+// The game and IP.BIN from the player's disc image (.cue or .gdi), or, for
+// development, from a folder holding the extracted MSR.BIN and IP.BIN.
+Disc read_disc(const std::filesystem::path& path) {
+    Disc d;
+    std::error_code ec;
+    if (std::filesystem::is_directory(path, ec)) {
+        auto program = read_whole(path / "MSR.BIN");
+        if (!program) rt::fatal("%s: no MSR.BIN in this folder", path.string().c_str());
+        d.program = std::move(*program);
+        if (auto ip = read_whole(path / "IP.BIN")) d.ip_bin = std::move(*ip);
+        return d;
+    }
+    auto disc = qilin::GdRom::open(path);
+    if (!disc) rt::fatal("%s: %s", path.string().c_str(), disc.error().c_str());
+    auto files = disc->files();
+    if (!files) rt::fatal("%s: %s", path.string().c_str(), files.error().c_str());
+    for (const qilin::GdFile& f : *files)
+        if (f.path == "MSR.BIN") {
+            auto bytes = disc->read_file(f);
+            if (!bytes) rt::fatal("%s: MSR.BIN: %s", path.string().c_str(), bytes.error().c_str());
+            d.program = std::move(*bytes);
+        }
+    if (d.program.empty()) rt::fatal("%s: no MSR.BIN on this disc (is it Metropolis Street Racer?)", path.string().c_str());
+    auto ip = disc->system_area();
+    if (!ip) rt::fatal("%s: IP.BIN: %s", path.string().c_str(), ip.error().c_str());
+    d.ip_bin = std::move(*ip);
+    return d;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc != 2) {
+        std::fprintf(stderr, "usage: msr <disc image (.cue or .gdi)>\n");
+        return 1;
+    }
+    const Disc disc = read_disc(argv[1]);
+    // The game this build was lifted from, and nothing else: lifted code is that file's.
+    const std::string sha = qilin::sha256_hex(disc.program);
+    if (sha != rt::g_lifted_sha256)
+        rt::fatal("this disc's MSR.BIN (SHA-256 %s) isn't the one this build was made from (%s)", sha.c_str(),
+                  rt::g_lifted_sha256);
+    if (disc.program.size() > 0x8D000000u - kProgram) rt::fatal("MSR.BIN is larger than RAM");
+
+    rt::GuestMemory memory;
+    if (!memory.ok()) rt::fatal("can't map the guest's memory: %s", memory.error());
+    rt::g_mem = memory.base();
+    std::memcpy(rt::g_mem + kProgram, disc.program.data(), disc.program.size());
+    if (!disc.ip_bin.empty()) std::memcpy(rt::g_mem + kIpBin, disc.ip_bin.data(), std::min<size_t>(disc.ip_bin.size(), 0x8000u));
+
+    msr::map_onchip();
+    msr::install_bios();
+
+    rt::g_guest_threads = true;
+    rt::Context c;
+    c.r[15] = kStackTop;
+    c.fpscr = 0x00040000u;  // DN = 1: denormals flushed, as the console starts
+    try {
+        rt::call_guest(c, kProgram);
+    } catch (const rt::Stop& s) {
+        rt::report(stderr, s, &c);
+        rt::backtrace(stderr, c, kStackTop);
+        return 2;
+    }
+    std::fprintf(stderr, "msr: the game returned to the boot ROM\n");
+    return 0;
+}

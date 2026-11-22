@@ -19,6 +19,8 @@ Static recompilation of **Metropolis Street Racer** (Dreamcast, North American r
 
 - `recomp/src/`: `gdrom` (Redump CUE and GDI images, sectors, ISO 9660), `bootfile` (IP.BIN's fields, the boot file, known-build SHA table), `decoder` (table-driven, 209 forms, X-macro `QILIN_SH4_OPS`), `cfg` (function discovery, known-bits dataflow, jump tables, coverage, floating-point mode), `lifter` (SH-4 → C++, slice 1 integer, slice 2 floating point), `report` (JSON), `main.cpp` (the `qilin` CLI).
 - `recomp/runtime/`: `guest.hpp` (context, memory, helpers for generated code), `dispatch.cpp` (function table lookup, `setjmp` sites and non-local returns), `memory.hpp/.cpp` (the guest address space: RAM at its 16 addresses), `fiber.hpp/.cpp` (guest threads).
+- `recomp/runtime/` also: `bus.hpp/.cpp` (accesses that aren't RAM: store queues, mapped devices), `system.hpp/.cpp` (native code at guest addresses, reports, backtraces).
+- `msr/src/`: the program (`main.cpp`) and the port (`msr_port`, built in CI): `onchip.cpp` (SH-4 control registers, one table entry each), `bios.cpp` (the boot ROM's system calls). `docs/runtime.md` has the design and the bring-up log.
 - `tools/difftest/`: `difftest.py` + `harness.cpp`: lifted code against the original under `qemu-system-sh4`.
 - `recomp/tests/tests.cpp`: unit tests (`ctest`), on a synthetic disc image.
 - `tools/check/verify_decoder.py`: compares the decoder with binutils objdump on all 65,536 words.
@@ -34,6 +36,8 @@ python3 tools/check/verify_decoder.py --qilin build/qilin --sweep    # needs bin
 build/qilin extract path/to/game.cue --out disc
 build/qilin info disc/MSR.BIN --ip disc/IP.BIN
 build/qilin lift disc/MSR.BIN --out gen    # then -DQILIN_GEN_DIR=$PWD/gen, target qilin_difftest, tools/difftest/difftest.py
+cmake --build build -j2 --target msr        # the game (same QILIN_GEN_DIR); build/msr game.cue (or the extracted disc folder)
+build/qilin hardware disc/MSR.BIN --list   # the device addresses code names, by function
 ```
 
 Before a milestone commit, all of these must hold: tests pass, warnings are clean (`QILIN_WERROR`) under GCC and Clang, the decoder sweep has **0 unexplained** differences, and (when the lifter or runtime changed) the generated code compiles with `QILIN_WERROR` and the differential test has **0 failures**. Any new binutils difference goes in `known_difference` with a comment explaining why.
@@ -54,6 +58,8 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 - FP in lifted code: round to nearest or to zero (RM = 0 or 1), DN = 1 (inputs and results flushed), default NaN `0x7FBFFFFF`, `fmac` fused, flag/cause bits not kept, `rt::lds_fpscr` stops on RM > 1 or enable bits. 64-bit `fmov`: even register at the lower address (the compiler's double constants are laid out that way; QEMU does the opposite). `fipr`/`ftrv`/`fsca`/`fsrra` are provisional models in `guest.hpp`.
 - QEMU 8.2 as an FP reference: debugger writes to FPSCR don't reach its FPU (each trial runs an `lds r0,fpscr` stub at `0x8C00E000`; r0 in both banks must hold the trial's FPSCR); it doesn't flush denormal inputs; `fipr`/`ftrv` only run with PR = 1 (a bug); no `fsca`; `fsrra` computes, then faults; `stc sr` drops Q and M (also in 11.1). The test runs `fipr`/`ftrv`/`fsca` for QEMU with the runtime's model (the harness evaluates it) and keeps QEMU's `fsrra`. The debugger shows the FP bank FPSCR.FR selects: write bank 1 with FR set, then bank 0, then the real FPSCR.
 - Differential test machinery: in checked builds registers are context references (`QILIN_REG`), so a stop is an exact state and becomes a comparison point (*pass to a stop*); hardware accesses are replayed (log in the harness; redirected to a scratch word at `0x8D000000`, in r2d's RAM above the Dreamcast's 16 MiB); polled words become hardware; limits stop cleanly (0.3 s, 4 MiB host stack, 4,096 hardware accesses). A per-case hardware-access limit lets a script bisect to the first access where the two sides part.
+- Building `gen/` with `--parallel` and no count runs out of memory on a 2-core, 7 GB machine (cc1plus killed): use `-j2`. CMake must be configured with `CXX=g++-14` there (the default GCC is 13).
+- The game's first boot facts: r15 = `0x8C00F400` on entry; the boot ROM's system-call vectors are at `0x8C0000B0`–`0x8C0000E0`; SYSINFO's area is `0x8C000068`–`0x8C00007F`, and start-up reads byte 12 there as the TV standard (`'0'` NTSC). PDTRA bits 9–8 are the cable (0 VGA).
 - Delay-slot order: the branch reads its condition/target/PR, a call sets PR, then the slot runs. `rts` with `lds.l @r15+,pr` or a pop in the slot is real code.
 - The cloud workspace's file bridge has a 400 MB per-file limit: the disc image can't be staged. The extracted disc is at `D:\Recompilation Projects\MSR Project\disc` on the author's PC (with `qilin.exe` and `read-disc.cmd` beside it); stage `disc\MSR.BIN`, `1ST_READ.BIN`, `IP.BIN` and other small files from there. There is no shell on that PC from the cloud session: programs there are run by the author, or through computer use (File Explorer, double-click).
 - **The launcher (`1ST_READ.BIN`) is replaced natively, not lifted** (author's decision, 2026-11-21). Only `MSR.BIN` is lifted. The hand-over is a command line in a 512-byte argument block at `0x8C1101F0` in the game's image; the game takes `-DEMO=`, `-ZONE=`, `-SPEED=`, `-playable`, `-autodemo`, and starts `1st_read.bin -DEMO=.. -ZONE=.. -SPEED=..` for its attract loop (the launcher then restarts it with `-DEMO=-1` plus those). Game main is `0x8C010202`; start-a-program is `0x8C02F68A`. The game has debug strings (`cblCable = %d`, `Here we go - %s`), useful for naming.
@@ -75,7 +81,7 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 2. **A better reference for floating point**: Flycast or a console, for `fipr`/`ftrv`/`fsca`/`fsrra` (QEMU 8.2 can't run them) and to confirm the 64-bit `fmov` pair order and denormal input flushing (QEMU differs from the hardware on both; the difftest build uses `QILIN_REFERENCE_QEMU`).
 3. **Review the prior art** (`docs/prior-art.md`): the two Dreamcast static recompilations, and the Sonic Adventure decomp as a naming source for Sega's libraries (licence first).
 4. **Confirm the hand-over's open points** (`docs/disc-and-boot-analysis.md`) when the original can be traced under Flycast; read `GINXFER.BIN`.
-5. Hardware-access profile, library boundaries, timing model; then the runtime, on Toy Commander's `dreamcast/` and `host/` layers.
+5. **The runtime bring-up** (`docs/runtime.md`): `msr` runs from the entry point to the Holly system bus registers (step 5 of its log). Next: bring in Toy Commander's `dreamcast/` and `host/` layers (PowerVR2 and system bus registers first), the GD-ROM and flash system calls, the timer unit, interrupt delivery; then the window and renderer.
 
 ## Conventions
 

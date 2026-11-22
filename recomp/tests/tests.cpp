@@ -862,15 +862,16 @@ void test_floating_point() {
     CHECK(bank[2] == 0x3FF80000u && bank[3] == 0 && get64(bank, 2) == std::bit_cast<uint64_t>(1.5));
     // A 64-bit fmov puts the even register at the lower address (the hardware's order).
     {
+        // 64 bytes standing for RAM at 0x8C000000 (the access helpers take RAM's addresses only).
         std::vector<uint8_t> memory(64, 0);
         uint8_t* const saved = g_mem;
-        g_mem = memory.data();
+        g_mem = memory.data() - 0x8C000000u;
         bank[4] = 0x11111111u, bank[5] = 0x22222222u;
-        st_pair(8, bank, 4);
-        CHECK(ld32(8) == 0x11111111u && ld32(12) == 0x22222222u);
+        st_pair(0x8C000008u, bank, 4);
+        CHECK(ld32(0x8C000008u) == 0x11111111u && ld32(0x8C00000Cu) == 0x22222222u);
         // The compiler's double constants are laid out that way: 0.301 as 3FD34395 810624DD.
-        st32(16, 0x3FD34395u), st32(20, 0x810624DDu);
-        ld_pair(16, bank, 6);
+        st32(0x8C000010u, 0x3FD34395u), st32(0x8C000014u, 0x810624DDu);
+        ld_pair(0x8C000010u, bank, 6);
         CHECK(f64(get64(bank, 6)) == 0.301);
         g_mem = saved;
     }
@@ -1390,6 +1391,7 @@ void test_guest_threads() {
 namespace qilin::rt {
 extern const FnEntry g_functions[] = {{threads::kTask, threads::task, false, false}};
 extern const size_t g_function_count = 1;
+extern const char g_lifted_sha256[] = "";
 extern const JumpSiteEntry g_jump_sites[] = {{jumps::kSite, nullptr}, {threads::kYield, nullptr}, {threads::kSched, nullptr}};
 extern const size_t g_jump_site_count = 3;
 }  // namespace qilin::rt

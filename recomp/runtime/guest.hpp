@@ -50,6 +50,10 @@ struct Stop {
 // Guest memory: the 4 GB guest address space at a host base, `base + addr`.
 inline uint8_t* g_mem = nullptr;
 
+// Main RAM's sixteen views (memory.hpp): area 3 (0x0C000000-0x0FFFFFFF, its
+// 16 MiB and three mirrors) in P0, P1, P2 or P3.
+inline bool in_ram(uint32_t a) { return (a & 0x1C000000u) == 0x0C000000u && ((0x71u >> (a >> 29)) & 1u); }
+
 #ifdef QILIN_CHECKED_MEMORY
 // Bring-up and tests: accesses outside the regions the host mapped stop.
 struct Region {
@@ -182,10 +186,24 @@ inline unsigned g_load_next = 0;
 #else
 inline void check(uint32_t, uint32_t) {}
 inline void check_store(uint32_t, uint32_t) {}
-#define QILIN_HW_LOAD(a, n) ((void)0)
+// Release builds: RAM is the fast path (every view of it is mapped), and
+// anything else goes to the bus (bus.cpp): the devices the runtime maps.
+uint32_t bus_read(uint32_t a, unsigned n);
+void bus_write(uint32_t a, uint32_t v, unsigned n);
+void bus_flush_store_queue(uint32_t a, uint32_t pc);
+#define QILIN_HW_LOAD(a, n) \
+    if (!::qilin::rt::in_ram(a)) [[unlikely]] return ::qilin::rt::bus_read(a, n)
 #define QILIN_TRACE_LOAD(a, v, n) ((void)0)
-#define QILIN_HW_STORE(a, n, v) ((void)0)
+#define QILIN_HW_STORE(a, n, v) \
+    if (!::qilin::rt::in_ram(a)) [[unlikely]] return ::qilin::rt::bus_write(a, (n) < 4 ? (v) & ((1u << (8 * (n))) - 1) : (v), n)
+#ifdef QILIN_BRINGUP
+// Bring-up builds of the game: the instruction of each access is noted (one
+// store), so a stop on the bus names it.
+inline uint32_t g_pc = 0;
+#define QILIN_PC(a) (::qilin::rt::g_pc = (a))
+#else
 #define QILIN_PC(a) ((void)0)
+#endif
 #define QILIN_REG [[maybe_unused]] uint32_t
 #define QILIN_TICK(a) ((void)0)
 #endif
@@ -357,6 +375,12 @@ inline void ld_pair(uint32_t a, uint32_t* bank, unsigned n) {
         bank[n + kPairLow] = lo, bank[n + 1 - kPairLow] = hi;
         return;
     }
+#else
+    if (!in_ram(a)) [[unlikely]] {
+        const uint32_t lo = bus_read(a, 4), hi = bus_read(a + 4, 4);
+        bank[n + kPairLow] = lo, bank[n + 1 - kPairLow] = hi;
+        return;
+    }
 #endif
     check(a, 8);
     std::memcpy(&bank[n + kPairLow], g_mem + view(a), 4);
@@ -368,6 +392,12 @@ inline void st_pair(uint32_t a, const uint32_t* bank, unsigned n) {
         hw_room(2, a);
         hw_store(a, 4, bank[n + kPairLow]);
         hw_store(a + 4, 4, bank[n + 1 - kPairLow]);
+        return;
+    }
+#else
+    if (!in_ram(a)) [[unlikely]] {
+        bus_write(a, bank[n + kPairLow], 4);
+        bus_write(a + 4, bank[n + 1 - kPairLow], 4);
         return;
     }
 #endif
@@ -546,16 +576,17 @@ inline void lds_fpscr(uint32_t& fpscr, uint32_t v, uint32_t pc) {
 }
 
 // pref @rN. Addresses 0xE0000000-0xE3FFFFFF are the store queues: a pref
-// there sends a queue's 32 bytes to hardware, which is the graphics layer's
-// business and isn't modelled yet. Anywhere else it is a cache hint.
-// pref of a store-queue address sends the queue to memory; the runtime will
-// do that. In the differential test it is logged as a hardware access.
+// there sends a queue's 32 bytes where QACR0/QACR1 say (the bus, release
+// builds). Anywhere else it is a cache hint. In the differential test it is
+// logged as a hardware access.
 inline void pref(uint32_t addr, uint32_t pc) {
     if ((addr & 0xFC000000u) != 0xE0000000u) return;
 #ifdef QILIN_CHECKED_MEMORY
     if (g_hw_replay) return g_pc = pc, hw_log(addr, 0x200, 0);
-#endif
     throw Stop{Stop::Unsupported, pc, addr};
+#else
+    bus_flush_store_queue(addr, pc);
+#endif
 }
 
 // ---- arithmetic the lifter doesn't write inline ----

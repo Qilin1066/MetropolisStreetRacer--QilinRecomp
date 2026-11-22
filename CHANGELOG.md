@@ -12,6 +12,14 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ## [Unreleased]
 
 ### Added
+- **`msr`, the game's program** (bring-up stage):
+  - reads `MSR.BIN` and IP.BIN from the player's disc image, checks the file is the one the build was lifted from, and loads both where the boot ROM would;
+  - runs the lifted game until something isn't provided, then reports where, with the registers and a backtrace from the guest stack;
+  - runs from the entry point to the Holly system bus registers (`docs/runtime.md`).
+- **The bus**: release builds take RAM as the fast path and everything else through mapped devices; the store queues are sent where QACR0/1 say.
+- **Native code at guest addresses**, used for the boot ROM's system calls: the vectors and SYSINFO so far.
+- **The SH-4's control registers**, one table entry each: CCR, the video cable in PDTRA (VGA), and the interrupt controller.
+- **`qilin hardware`**: the device addresses that code names, by function.
 - **The guest address space** in the runtime: main RAM mapped at all sixteen of its addresses (the area and its mirrors, in P0 to P3), so an access needs no address arithmetic. Linux, macOS and Windows.
 - **Fibers** for the guest's cooperative threads: switching in assembly on x86-64 and AArch64, the Windows fiber API on Windows; AddressSanitizer is told about each switch.
 - **`longjmp` across lifted frames**: the functions that call the program's `setjmp` are lifted to be resumable after the call, and a return to an armed `setjmp` site unwinds the host stack to its frame. `setjmp`'s address is in the known-build table; `table.cpp` lists the sites.

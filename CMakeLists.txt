@@ -100,6 +100,12 @@ if(WIN32)
     target_link_libraries(qilin_platform PRIVATE onecore)  # VirtualAlloc2, MapViewOfFile3 (Windows 10 1803+)
 endif()
 
+# ---- The port: the hardware and system software the game runs on (msr/src),
+# built without the lifted code too, so CI compiles it ----
+add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp)
+target_include_directories(msr_port PUBLIC msr/src)
+target_link_libraries(msr_port PUBLIC qilin_runtime PRIVATE qilin_warnings)
+
 # ---- Lifted code (optional): the output of `qilin lift`, which is derived
 # from the game and so lives outside the repository ----
 #   qilin lift disc/MSR.BIN --out gen && cmake -B build -DQILIN_GEN_DIR=$PWD/gen
@@ -108,7 +114,7 @@ endif()
 set(QILIN_GEN_DIR "" CACHE PATH "qilin lift output directory")
 if(QILIN_GEN_DIR)
     file(GLOB QILIN_GEN_SOURCES CONFIGURE_DEPENDS "${QILIN_GEN_DIR}/*.cpp")
-    add_library(qilin_gen_checked STATIC ${QILIN_GEN_SOURCES} recomp/runtime/dispatch.cpp)
+    add_library(qilin_gen_checked STATIC ${QILIN_GEN_SOURCES} recomp/runtime/dispatch.cpp recomp/runtime/system.cpp)
     target_include_directories(qilin_gen_checked PUBLIC "${QILIN_GEN_DIR}")
     # Checked memory; and QEMU's two differences from the hardware, so the rest
     # can be compared with it (recomp/runtime/guest.hpp). Never in a game build.
@@ -121,11 +127,29 @@ if(QILIN_GEN_DIR)
         # The checked runtime stops guest recursion at 4 MiB of host stack; Windows gives 1 MiB by default.
         target_link_options(qilin_difftest PRIVATE /STACK:16777216)
     endif()
+
+    # The game: the lifted code built for speed (RAM as the fast path, the rest
+    # through the bus), and the program players run (msr/src).
+    add_library(qilin_gen STATIC ${QILIN_GEN_SOURCES} recomp/runtime/dispatch.cpp recomp/runtime/system.cpp
+        recomp/runtime/bus.cpp)
+    target_include_directories(qilin_gen PUBLIC "${QILIN_GEN_DIR}")
+    target_link_libraries(qilin_gen PUBLIC qilin_runtime qilin_platform PRIVATE qilin_warnings)
+    # During the bring-up: each access notes its instruction, so a stop names it (docs/runtime.md).
+    option(QILIN_BRINGUP "Note the guest instruction of each access in the game build" ON)
+    if(QILIN_BRINGUP)
+        target_compile_definitions(qilin_gen PUBLIC QILIN_BRINGUP)
+    endif()
+    add_executable(msr msr/src/main.cpp)
+    target_link_libraries(msr PRIVATE msr_port qilin_gen qilin_disc qilin_warnings)
+    if(MSVC)
+        target_link_options(msr PRIVATE /STACK:8388608)  # guest recursion runs on the host stack
+    endif()
 endif()
 
 # ---- Tests (no game files needed) ----
 enable_testing()
-add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/dispatch.cpp)
+add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/dispatch.cpp recomp/runtime/system.cpp
+    recomp/runtime/bus.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_platform qilin_warnings)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)

@@ -13,6 +13,8 @@
 //   qilin coverage <1ST_READ.BIN> [--list]              byte accounting of the code: code / literal / table /
 //                                                       padding / unknown (exit 3 if any unknown)
 //   qilin suspects <1ST_READ.BIN>                       functions with problems, for review
+//   qilin hardware <1ST_READ.BIN> [--list]               the hardware the code names: literal-pool
+//                                                       addresses in each device, by function
 //   qilin fpmode  <1ST_READ.BIN> [--list]               floating-point mode (FPSCR.PR/SZ/FR) proof: what is
 //                                                       unproven (exit 3 if anything is)
 //   qilin lift    <MSR.BIN> --out <dir>                 lifts every function it can to C++ (for the
@@ -74,6 +76,7 @@ int usage() {
                "  qilin coverage <1ST_READ.BIN> [--list]\n"
                "  qilin suspects <1ST_READ.BIN>\n"
                "  qilin trial   <1ST_READ.BIN> --base addr\n"
+               "  qilin hardware <1ST_READ.BIN> [--list]\n"
                "  qilin fpmode  <1ST_READ.BIN> [--list]\n"
                "  qilin lift    <MSR.BIN> --out <dir>\n"
                "  qilin --version\n");
@@ -395,7 +398,8 @@ int cmd_lift(const Args& a) {
     flush();
     write_text((dir / "functions.hpp").string(), decls + "}  // namespace qilin::gen\n");
     write_text((dir / "table.cpp").string(),
-               table + std::format("}};\nextern const size_t g_function_count = {};\n", cfg.functions().size()) +
+               table + std::format("}};\nextern const size_t g_function_count = {};\nextern const char g_lifted_sha256[] = \"{}\";\n",
+                                   cfg.functions().size(), boot.sha256) +
                    [&] {
                        // Where a longjmp may come back to (sorted), with a placeholder when there are none.
                        std::string s = "extern const JumpSiteEntry g_jump_sites[] = {\n";
@@ -406,10 +410,10 @@ int cmd_lift(const Args& a) {
                    }());
     write_text((dir / "stubs.cpp").string(), stubs + "}  // namespace qilin::gen\n");
     // The literals compiled as constants, sorted: checked builds stop on a store into one.
-    std::string lits = std::format("{}#include \"guest.hpp\"\nnamespace qilin::rt {{\nextern const Region g_folded[] = {{\n", kHead);
+    std::string lits = std::format("{}#include \"guest.hpp\"\n#ifdef QILIN_CHECKED_MEMORY  // checked builds only\nnamespace qilin::rt {{\nextern const Region g_folded[] = {{\n", kHead);
     for (const auto& [addr, size] : folded) lits += std::format("    {{0x{:08x}u, 0x{:08x}u}},\n", addr, addr + size);
     write_text((dir / "literals.cpp").string(),
-               lits + std::format("}};\nextern const size_t g_folded_count = {};\n}}  // namespace qilin::rt\n", folded.size()));
+               lits + std::format("}};\nextern const size_t g_folded_count = {};\n}}  // namespace qilin::rt\n#endif\n", folded.size()));
     write_text((dir / "lift_report.txt").string(), report);
 
     const size_t total = cfg.functions().size();
@@ -418,6 +422,88 @@ int cmd_lift(const Args& a) {
     std::vector<std::pair<std::string, size_t>> sorted(reasons.begin(), reasons.end());
     std::ranges::sort(sorted, [](const auto& x, const auto& y) { return x.second > y.second; });
     for (const auto& [why, n] : sorted) std::println("{:>6}  {}", n, why);
+    return 0;
+}
+
+// The Dreamcast's devices, by physical address (below P4: the low 29 bits,
+// whatever the segment) or by P4 address. From the console's and the SH7750's
+// published memory maps.
+struct HwDevice {
+    uint32_t lo, hi;
+    const char* name;
+};
+constexpr HwDevice kHwDevices[] = {
+    {0x00000000u, 0x00200000u, "boot ROM"},
+    {0x00200000u, 0x00220000u, "flash memory"},
+    {0x005F6800u, 0x005F6C00u, "system bus (DMA, interrupt control)"},
+    {0x005F6C00u, 0x005F7000u, "Maple bus"},
+    {0x005F7000u, 0x005F7400u, "GD-ROM (G1 ATA)"},
+    {0x005F7400u, 0x005F7800u, "G1 bus control"},
+    {0x005F7800u, 0x005F7C00u, "G2 bus control (DMA)"},
+    {0x005F7C00u, 0x005F8000u, "PowerVR interface (TA DMA)"},
+    {0x005F8000u, 0x005FA000u, "PowerVR2 core registers"},
+    {0x00600000u, 0x00700000u, "modem"},
+    {0x00700000u, 0x00710000u, "AICA registers"},
+    {0x00710000u, 0x00710010u, "AICA real-time clock"},
+    {0x00800000u, 0x00A00000u, "sound RAM"},
+    {0x01000000u, 0x04000000u, "expansion (G2)"},
+    {0x04000000u, 0x05000000u, "video RAM, 64-bit path"},
+    {0x05000000u, 0x06000000u, "video RAM, 32-bit path"},
+    {0x10000000u, 0x10800000u, "tile accelerator FIFO"},
+    {0x10800000u, 0x11000000u, "TA YUV converter"},
+    {0x11000000u, 0x12000000u, "TA direct texture path"},
+    {0xE0000000u, 0xE4000000u, "store queues"},
+    {0xF0000000u, 0xF8000000u, "cache and TLB arrays"},
+    {0xFF000000u, 0xFF200000u, "CCN (cache, MMU, QACR)"},
+    {0xFF200000u, 0xFF400000u, "UBC (break controller)"},
+    {0xFF800000u, 0xFFA00000u, "BSC (bus state controller)"},
+    {0xFFA00000u, 0xFFC00000u, "DMAC"},
+    {0xFFC00000u, 0xFFC80000u, "CPG (clock, standby)"},
+    {0xFFC80000u, 0xFFD00000u, "SH-4 RTC"},
+    {0xFFD00000u, 0xFFD80000u, "INTC"},
+    {0xFFD80000u, 0xFFE00000u, "TMU (timers)"},
+    {0xFFE00000u, 0xFFE80000u, "SCI"},
+    {0xFFE80000u, 0xFFF00000u, "SCIF (serial)"},
+};
+// A literal that looks like a device address: in P1 or P2 (how the libraries
+// name devices), in P4, or a physical address in system space (P0 above the
+// boot ROM and below the expansion area). Small numbers and floats aren't.
+const HwDevice* hw_device(uint32_t v) {
+    const uint32_t segment = v & 0xE0000000u;
+    const bool plausible = v >= 0xE0000000u || segment == 0x80000000u || segment == 0xA0000000u ||
+                           (segment == 0 && v >= 0x005F0000u && v < 0x00A00000u);
+    if (!plausible) return nullptr;
+    const uint32_t a = v >= 0xE0000000u ? v : v & 0x1FFFFFFFu;
+    for (const HwDevice& d : kHwDevices)
+        if (a >= d.lo && a < d.hi) return &d;
+    return nullptr;
+}
+
+int cmd_hardware(const Args& a) {
+    const BootFile boot = must(BootFile::load(a.input), a.input);
+    Cfg cfg(boot);
+    cfg.run();
+    // device -> register (literal value) -> functions naming it
+    std::map<const HwDevice*, std::map<uint32_t, std::set<uint32_t>>> uses;
+    for (const auto& [start, f] : cfg.functions())
+        for (const auto& [addr, size] : f.literals)
+            if (size == 4)
+                if (const uint32_t v = boot.u32(addr); const HwDevice* d = hw_device(v)) uses[d][v].insert(start);
+    std::println("devices named by literal-pool addresses in code (a base is often named, the registers by offset):");
+    for (const HwDevice& d : kHwDevices) {
+        const auto it = uses.find(&d);
+        if (it == uses.end()) continue;
+        std::set<uint32_t> fns;
+        for (const auto& [v, s] : it->second) fns.insert(s.begin(), s.end());
+        std::println("  {:<38} {:4} addresses, {:4} functions ({:08x}-{:08x})", d.name, it->second.size(), fns.size(),
+                     *fns.begin(), *fns.rbegin());
+        if (a.list)
+            for (const auto& [v, s] : it->second) {
+                std::string list;
+                for (const uint32_t fn : s) list += std::format(" {:08x}", fn);
+                std::println("      {:08x}:{}", v, list);
+            }
+    }
     return 0;
 }
 
@@ -479,6 +565,7 @@ int main(int argc, char** argv) {
         if (a.command == "suspects") return cmd_suspects(a);
         if (a.command == "trial") return cmd_trial(a);
         if (a.command == "fpmode") return cmd_fpmode(a);
+        if (a.command == "hardware") return cmd_hardware(a);
         if (a.command == "lift") return cmd_lift(a);
         return usage();
     } catch (const Failure& f) {
