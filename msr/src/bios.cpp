@@ -318,8 +318,9 @@ void gd_abort(rt::Context& c) {
 void gd_dma_end(rt::Context& c) {
     const uint32_t fn = c.r[4], arg = c.r[5];
     c.r[0] = 0;
-    if (!g_dma_end_unreported || fn == 0) return;
-    g_dma_end_unreported = false;
+    if (!g_dma_end_unreported) return;
+    g_dma_end_unreported = false;  // reported, with a function to call or none
+    if (fn == 0) return;
     const uint32_t r4 = c.r[4], r5 = c.r[5];
     c.r[4] = arg;
     rt::call_guest(c, fn);
