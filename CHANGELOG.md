@@ -17,6 +17,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **`longjmp` across lifted frames**: the functions that call the program's `setjmp` are lifted to be resumable after the call, and a return to an armed `setjmp` site unwinds the host stack to its frame. `setjmp`'s address is in the known-build table; `table.cpp` lists the sites.
 - **Guest threads**: a `longjmp` to a site armed in a suspended thread switches to it; one to a `setjmp` site or a function that no frame holds starts a new thread there, on its own fiber (the libraries' tasks start so). A suspended thread whose guest stack a new one starts in is ended, its frames unwound; a stop on any thread reaches the thread that switched to it. Off in the differential test.
 
+### Checked
+- The generated code under UBSan (GCC 14), full differential test with a second seed: no undefined behaviour, 0 failures. Over seeds 1 and 2, 5 functions have no conclusive trial.
+
 ### Fixed
 - **Accesses through two views of the same RAM** at constant addresses could be reordered by the compiler; the access helpers now fold a constant address to its P1 view when compiled (GCC and Clang).
 - The memory test on arm64: the compiler reordered accesses at two views of the same byte (now fenced; the hazard is documented).

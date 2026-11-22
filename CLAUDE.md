@@ -71,7 +71,7 @@ Before a milestone commit, all of these must hold: tests pass, warnings are clea
 
 ## Next steps, in order
 
-1. **The runtime pieces the test exposed**: native interrupt delivery in place of the libraries' exception entry (or a second lifting for FR = 1); RAM views computed at run time from one register, and on MSVC (constant addresses are folded, `rt::view`). Then UBSan and an MSVC build of the generated code; more seeds.
+1. **The runtime pieces the test exposed**: native interrupt delivery in place of the libraries' exception entry (or a second lifting for FR = 1); RAM views computed at run time from one register, and on MSVC (constant addresses are folded, `rt::view`). Then an MSVC build of the generated code (on the author's PC: CI has no game data). UBSan and seed 2 are done: no undefined behaviour, 0 failures; 5 functions untested over both seeds.
 2. **A better reference for floating point**: Flycast or a console, for `fipr`/`ftrv`/`fsca`/`fsrra` (QEMU 8.2 can't run them) and to confirm the 64-bit `fmov` pair order and denormal input flushing (QEMU differs from the hardware on both; the difftest build uses `QILIN_REFERENCE_QEMU`).
 3. **Review the prior art** (`docs/prior-art.md`): the two Dreamcast static recompilations, and the Sonic Adventure decomp as a naming source for Sega's libraries (licence first).
 4. **Confirm the hand-over's open points** (`docs/disc-and-boot-analysis.md`) when the original can be traced under Flycast; read `GINXFER.BIN`.
