@@ -10,6 +10,7 @@
 
 #include "bus.hpp"
 #include "clock.hpp"
+#include "game.hpp"
 #include "guest.hpp"
 
 namespace dreamcast {
@@ -92,7 +93,7 @@ void write(uint32_t a, uint32_t v, unsigned) {
         case 0: t.tcor = v; return;
         case 4: t.count = v, t.since = guest_ns(); return;
         case 8:
-            if ((v & 7u) > 4 || (v & 0x20u) || (n == 2 && (v & 0xC0u))) unsupported(a, v);
+            if ((v & 7u) > 4 || (n == 2 && (v & 0xC0u))) unsupported(a, v);  // UNIE (0x20): timer_interrupts
             rebase(n);
             t.tcr = v & 0xFFu & ~0x100u;
             if (!(v & 0x100u)) t.underflowed = false;  // UNF is cleared by writing 0
@@ -124,17 +125,44 @@ void dmac_write(uint32_t a, uint32_t v, unsigned n) {
 
 // The operand cache's address array (0xF4000000-0xF4FFFFFF): code writes
 // a line's tag with U = V = 0 to invalidate it (the movie player clears the
-// whole cache that way after a DMA into memory). The port has no cache:
-// such writes do nothing; anything else (a read, a valid or dirty tag) is
-// new and stops.
+// whole cache that way after a DMA into memory), and reads tags to find dirty
+// lines to write back (Metropolis Street Racer's libraries, 0x8C122C5C). The
+// port has no cache, memory always holds what was written: a read finds no
+// line valid (0), and a write, whatever its tag, has nothing to do. Anything
+// but a longword stops.
+uint32_t oc_address_read(uint32_t a, unsigned n) {
+    if (n != 4) unsupported(a, 0);
+    return 0;
+}
 void oc_address_write(uint32_t a, uint32_t v, unsigned n) {
-    if (n != 4 || (v & 3u)) unsupported(a, v);
+    if (n != 4) unsupported(a, v);
 }
 
 }  // namespace
 
+bool timer_interrupts(rt::Context& c) {
+    bool held = false;
+    const uint32_t ipra = rt::bus_read(0xFFD00004u, 2);
+    for (int n = 0; n < 3; ++n) {
+        Timer& t = g_timer[n];
+        if (!(g_tstr & (1u << n)) || !(t.tcr & 0x20u)) continue;
+        (void)current(n, guest_ns());
+        if (!t.underflowed) continue;
+        const uint32_t level = (ipra >> (12 - 4 * n)) & 15u;
+        if (level == 0) continue;  // the interrupt's priority 0: never taken
+        if (level <= ((c.sr >> 4) & 15u)) {
+            held = true;
+            continue;
+        }
+        game::timer_interrupt(c, 0x400u + 0x20u * static_cast<uint32_t>(n));
+        // The handler clears UNF by writing TCR; one that doesn't is called again at the next
+        // service, as the console would take the interrupt again.
+    }
+    return held;
+}
+
 void map_sh4_peripherals() {
-    rt::map({0xF4000000u, 0xF5000000u, "SH-4 operand cache address array", nullptr, oc_address_write});
+    rt::map({0xF4000000u, 0xF5000000u, "SH-4 operand cache address array", oc_address_read, oc_address_write});
     rt::map({kBase, kBase + 0x30u, "SH-4 timer unit", read, write});
     rt::map({kDmacBase, kDmacBase + 0x44u, "SH-4 DMA controller", dmac_read, dmac_write});
 }

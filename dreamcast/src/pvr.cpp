@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "bus.hpp"
@@ -129,17 +130,21 @@ void pvr_dma() {
 // G2 DMA, channels 0-3 at 0x005F7800 + 0x20 n: STAG (+0x00) the G2 bus
 // address (the sound chip's memory and registers), STAR (+0x04) the RAM
 // address, LEN (+0x08) bytes (bit 31: enable cleared at the end), DIR (+0x0C)
-// 0 from RAM and 1 to it, TSEL (+0x10) 0 for a start by ST, EN (+0x14), ST
-// (+0x18) starts it. Done at once, a word at a time through the bus; then ST
+// 0 from RAM and 1 to it, TSEL (+0x10) the starts allowed besides ST (Kamui's
+// sound library writes 5), EN (+0x14), ST (+0x18) starts it. Only a start by
+// ST is done: the hardware starts TSEL allows never come in the port. Done at once, a word at a time through the bus; then ST
 // reads 0 and normal event 15 + n (its end) is raised. Anything else stops.
 constexpr uint32_t kG2Lo = 0x005F7800u, kG2Hi = 0x005F7880u;
 void g2_dma(uint32_t base) {
     const uint32_t g2 = reg(base), ram = reg(base + 4), len = reg(base + 8);
     const uint32_t bytes = len & 0x7FFFFFFFu;
     const bool to_ram = reg(base + 0x0C) & 1u;
-    if (!(reg(base + 0x14) & 1u) || (reg(base + 0x10) & 7u) || bytes == 0 || bytes % 32 || (g2 & 0x1FFFFFFFu) < 0x00700000u ||
-        (g2 & 0x1FFFFFFFu) + bytes > 0x01000000u)
+    if (!(reg(base + 0x14) & 1u) || bytes == 0 || bytes % 32 || (g2 & 0x1FFFFFFFu) < 0x00700000u ||
+        (g2 & 0x1FFFFFFFu) + bytes > 0x01000000u) {
+        std::fprintf(stderr, "G2 DMA %u: STAG %08X STAR %08X LEN %08X DIR %u TSEL %u EN %u: a transfer the port doesn't do\n",
+                (base - kG2Lo) / 0x20u, g2, ram, len, reg(base + 0x0C), reg(base + 0x10), reg(base + 0x14));
         throw rt::Stop{rt::Stop::Unsupported, 0, g2};
+    }
     if (!rt::in_ram(0xA0000000u | (ram & 0x1FFFFFFFu)) || !rt::in_ram(0xA0000000u | ((ram + bytes - 1) & 0x1FFFFFFFu)))
         throw rt::Stop{rt::Stop::Unsupported, 0, ram};
     const uint32_t from = 0xA0000000u | ((to_ram ? g2 : ram) & 0x1FFFFFFFu);

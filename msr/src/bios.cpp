@@ -9,6 +9,7 @@
 #include "drive.hpp"
 #include "flash.hpp"
 #include "guest.hpp"
+#include "bus.hpp"
 #include "system.hpp"
 
 namespace msr {
@@ -50,14 +51,27 @@ void sysinfo(rt::Context& c) {
 }
 
 // ROMFONT (vector 0x8C0000B4), r1 the function: 0 the font's address, 1 lock it (for the
-// caller's use), 2 unlock. The font is the boot ROM's own, which this project doesn't have: a
-// request for it stops. Locking and unlocking succeed (nothing else uses it).
+// caller's use), 2 unlock. The font is the boot ROM's own (Sega's; at 0xA0100020 on the console:
+// 12x24 and 24x24 glyphs, ISO 8859-1 and JIS X 0208, as KallistiOS's bfont describes), which this
+// project doesn't have and can't ship. The game draws Shift-JIS text with it (0x8C0B3808). Until
+// an openly licensed font is laid out the same way, the address given is that of a blank font
+// (every glyph empty: text drawn with it is invisible), and the first request says so.
+constexpr uint32_t kFontAddress = 0xA0100020u;
+uint32_t blank_font_read(uint32_t, unsigned) { return 0; }
+void blank_font_write(uint32_t a, uint32_t v, unsigned) { throw rt::Stop{rt::Stop::Unsupported, a, v}; }  // ROM
 void rom_font(rt::Context& c) {
     switch (c.r[1]) {
+    case 0: {
+        static bool said = false;
+        if (!said) rt::log("msr: the game asks for the boot ROM's font: it gets a blank one (its text is invisible)");
+        said = true;
+        c.r[0] = kFontAddress;
+        return;
+    }
     case 1: c.r[0] = 0; return;
     case 2: return;
     default:
-        rt::log("msr: the game asks for the boot ROM's font (ROMFONT, r1 = %u), which the port doesn't have", c.r[1]);
+        rt::log("msr: ROMFONT with r1 = %u, which the boot ROM doesn't have", c.r[1]);
         throw rt::Stop{rt::Stop::Unsupported, c.pr, c.r[1]};
     }
 }
@@ -149,8 +163,9 @@ uint32_t g_next_id = 1;
 // its calls masked, so it never came.)
 bool g_dma_end_pending = false;
 bool g_dma_end_unreported = false;  // ended, and call 5 (gd_dma_end) not yet told
+bool g_in_dma_callback = false;     // running the game's DMA-end callback (gd_dma_end)
 void deliver_pending(rt::Context& c) {
-    if (!g_dma_end_pending) return;
+    if (!g_dma_end_pending || g_in_dma_callback) return;
     g_dma_end_pending = false;
     g_dma_end_unreported = true;
     if (!g_raise_bus_event) throw rt::Stop{rt::Stop::Unsupported, c.pr, 0xA40u};
@@ -330,7 +345,18 @@ void gd_dma_end(rt::Context& c) {
     if (fn == 0) return;
     const uint32_t r4 = c.r[4], r5 = c.r[5];
     c.r[4] = arg;
-    rt::call_guest(c, fn);
+    // The callback asks for the next piece (0x8C02E114 -> 0x8C120D50); that DMA ends after the
+    // callback, as on the console (a piece takes time), so the handler takes its end on its next
+    // pass and the pieces follow one another instead of nesting.
+    g_in_dma_callback = true;
+    try {
+        rt::call_guest(c, fn);
+    } catch (...) {
+        g_in_dma_callback = false;
+        throw;
+    }
+    g_in_dma_callback = false;
+    deliver_pending(c);
     c.r[4] = r4, c.r[5] = r5, c.r[0] = 0;
 }
 
@@ -417,6 +443,8 @@ void restart_bios() {
 void install_bios(Drive& drive) {
     g_drive = &drive;
     rt::provide(kCalls);
+    // The font's part of the boot ROM (its 2 MB at 0x00000000; the font about 0.5 MB from 0x100020).
+    rt::map({0x00100000u, 0x00200000u, "boot ROM font (blank)", blank_font_read, blank_font_write});
     set_vector(0x8C0000B0u, kSysinfo);
     set_vector(0x8C0000B4u, kRomFont);
     set_vector(0x8C0000B8u, kFlash);

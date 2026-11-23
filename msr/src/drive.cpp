@@ -101,14 +101,25 @@ public:
             e.sector = next, e.size = static_cast<uint32_t>(sectors * kSector);
             next += static_cast<uint32_t>(sectors);
         }
+        // The files at the sectors the disc has them (disc.json, written by qilin extract): the game
+        // reads some by sector numbers of its own, not through the file system (IMAGES/LOADING.TGA
+        // at 293133), so a layout of the port's own would hand it the wrong file.
+        std::map<std::string, std::pair<uint32_t, uint32_t>> layout;
+        if (!read_layout(folder, layout, why)) return false;
         for (Entry& e : entries_)
             if (!e.dir) {
-                e.sector = next;
-                next += (e.size + kSector - 1) / kSector;
-                if (e.size == 0) ++next;
+                const std::string rel = upper(e.path.lexically_relative(folder).generic_string());
+                const auto it = layout.find(rel);
+                if (it == layout.end()) return why = rel + " is in the folder but not on the disc (disc.json)", false;
+                if (it->second.second != e.size)
+                    return why = rel + " isn't the size the disc has (" + std::to_string(e.size) + " bytes, the disc " +
+                                 std::to_string(it->second.second) + ")", false;
+                e.sector = it->second.first;
+                if (e.sector < next) return why = rel + ": its sector on the disc is among the file system's own", false;
                 files_.emplace(e.sector, &e - entries_.data());
+                end_ = std::max(end_, e.sector + std::max<uint32_t>(1, (e.size + kSector - 1) / kSector));
             }
-        end_ = next;
+        end_ = std::max(end_, next);
         fill_path_table(path_l_, false);
         fill_path_table(path_m_, true);
         return true;
@@ -146,6 +157,40 @@ public:
     }
 
 private:
+    static std::string upper(std::string t) {
+        for (char& ch : t) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        return t;
+    }
+
+    // disc.json beside the folder (qilin extract --out <folder> writes it there) or in it: each
+    // file's path, sector and size. Only those three fields of its "files" list are read.
+    static bool read_layout(const std::filesystem::path& folder, std::map<std::string, std::pair<uint32_t, uint32_t>>& out,
+                            std::string& why) {
+        std::ifstream in(folder / "disc.json");
+        if (!in) in.open(folder.parent_path() / "disc.json");
+        if (!in)
+            return why = "no disc.json beside " + folder.string() +
+                         " (qilin extract writes it; the files' sectors must be the disc's)", false;
+        const std::string text((std::istreambuf_iterator<char>(in)), {});
+        size_t at = text.find("\"files\"");
+        if (at == std::string::npos) return why = "disc.json has no file list", false;
+        const auto field = [&](size_t from, const char* key) -> size_t {
+            const size_t k = text.find(key, from);
+            return k == std::string::npos ? k : text.find(':', k) + 1;
+        };
+        while ((at = text.find("\"path\"", at)) != std::string::npos) {
+            const size_t q1 = text.find('"', text.find(':', at) + 1), q2 = text.find('"', q1 + 1);
+            const size_t sec = field(q2, "\"sector\""), size = field(q2, "\"size\"");
+            if (q1 == std::string::npos || q2 == std::string::npos || sec == std::string::npos || size == std::string::npos)
+                return why = "disc.json: a file entry without its path, sector and size", false;
+            out[upper(text.substr(q1 + 1, q2 - q1 - 1))] = {static_cast<uint32_t>(std::stoul(text.substr(sec, 16))),
+                                                           static_cast<uint32_t>(std::stoul(text.substr(size, 16)))};
+            at = q2;
+        }
+        if (out.empty()) return why = "disc.json lists no files", false;
+        return true;
+    }
+
     bool scan(size_t dir, std::string& why) {
         std::error_code ec;
         std::vector<std::filesystem::directory_entry> list;
@@ -155,7 +200,7 @@ private:
         for (const auto& de : list) {
             std::string name = de.path().filename().string();
             std::transform(name.begin(), name.end(), name.begin(), [](char ch) { return static_cast<char>(std::toupper(static_cast<unsigned char>(ch))); });
-            if (dir == 0 && name == "IP.BIN") continue;  // the system area, not a file
+            if (dir == 0 && (name == "IP.BIN" || name == "DISC.JSON")) continue;  // the system area; the layout
             Entry e;
             e.name = name, e.path = de.path(), e.dir = de.is_directory();
             if (!e.dir) {

@@ -12,6 +12,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ## [Unreleased]
 
 ### Added
+- **The game reaches its first screen** (Clock Settings, drawn correctly; run headless in the cloud workspace on the extracted disc). What it took:
+  - **GD-ROM streams**, answered the way the game's library reads them: call 7 gives the data left; call 1 answers "processing" between pieces; the DMA's end is raised at once for the interrupt system to deliver; call 5 calls the game's DMA-end callback; a request past the end fails.
+  - **Folder disc layout:** an extracted folder's files sit at the disc's own sectors, read from `disc.json`. The game reads `IMAGES/LOADING.TGA` by sector number, not through the file system.
+  - **Timer unit interrupts** (TUNI0-2, priorities from IPRA). The interrupt service now runs every millisecond.
+  - **Interrupt handlers** are entered with the libraries' entry FPSCR (0x00040000) and FPUL 0.
+  - **Cache arrays:** no caches, so reads find no valid line and writes do nothing. Area 7's reserved range ignores the game's stray writes (0x8C14655E).
+  - **G2 DMA** starts by ST whatever TSEL allows (Kamui's sound library writes 5).
+  - **Sound CPU:** byte and half-word access to the chip's registers.
+  - **ARM lifter:** a function whose code reaches below its start is entered by a jump to the start. Before this, every such function stopped at once. Branch tables up to five instructions after their base.
+  - **Boot ROM font:** a blank one, logged, until an openly licensed font is laid out in the same format.
 - **The intro movie** (`MOVIES/MSR.SFD`) plays on a cold start, as the launcher played it. The video is decoded by pl_mpeg (MIT, pinned), and the sound by a new ADX decoder written from the format's public description. A, B, X, Y or Start skips it. It is shown through a new `video::show` and has its own sound stream. Written and compiled, not run.
 - **The graphics pieces Kamui 2 uses** in `pvr.cpp`: PVR-DMA between RAM and video memory, G2 DMA to and from the sound chip, and the tile accelerator's texture path at `0x11000000`, including channel 2's DMA on the 32-bit path. The Maple bus was already in Toy Commander's layer, which this game shares through Shinobi. Written and compiled, not run.
 - **The launcher's native replacement** (`msr/src/launcher.cpp`). The game's start-a-program (`0x8C02F68A`) is now native code, not lifted: a new `replaced` list in the known-build table makes `qilin lift` emit such functions as calls to the port (`rt::replaced`). When the game hands back to `1st_read.bin` for its attract loop, `msr` restarts it. The restart ends the guest threads (`rt::end_guest_threads`), clears the drive's state, reloads the image and RAM as on a first start, and writes `-DEMO=-1` plus the game's arguments into its argument block. A request for the browser's loader or any other program stops, saying what it was. The cold start's intro movie (`MSR.SFD`) is skipped with a message until there is a Sofdec decoder. Written and compiled, not run.

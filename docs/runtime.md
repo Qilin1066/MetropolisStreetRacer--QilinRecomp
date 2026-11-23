@@ -96,6 +96,12 @@ Each step: run `msr`, read where it stops, provide what it needs, run again.
     - **Before that, the finding:** the game loads `SOUND\MANATEE.DRV` (Sega's later driver, with MLT sound banks), not `AUDIO64.DRV`, which is also on the disc. Toy Commander's stand-in is for AUDIO64 (versions 1.80 and 1.90) and stops on any other driver when the game releases the sound CPU. This disc's AUDIO64 is version 1.90f.2, with the interface table `0xAAC`, `0xAEC`, `0xB34`. A stand-in for Manatee comes next.
 15. **The launcher's replacement** (written, not yet run; `docs/disc-and-boot-analysis.md`, "The hand-over"). `msr` runs the game in a loop. Start-a-program (`0x8C02F68A`, replaced natively) given `1st_read.bin` throws `msr::StartGame`. That exception unwinds the guest frames: a guest thread passes it to its resumer, so it reaches the host stack. Then `rt::end_guest_threads()` makes each suspended thread unwind its own frames, as a thread whose stack is taken over does. The drive forgets its requests, the image and RAM are loaded again, the argument block is written, and the game is entered afresh. The devices run on as the console's do: the game's start-up sets them up again.
 16. **The game's graphics and Maple bus** (written, not yet run). `qilin hardware --list` shows the devices the game's code names. Most are already in Toy Commander's layers: the tile accelerator's input, channel 2's DMA, the render start, the palette, the fog table, Maple's DMA and its controllers, memory card and Jump Pack (both games use Shinobi's peripheral library). Three were missing: PVR-DMA (Kamui 2's functions `0x8C13A420` and `0x8C13D2A0`), G2 DMA (`0x8C131180`), and the texture path at `0x11000000` (store queues through `0xE1000000`/`0xE1800000`, `0x8C130ECC`). `pvr.cpp` now does all three. The Maple bus needs no code of this game's own until a run shows a device or command the layer stops on.
+17. **The first screen** (2026-11-23, headless, on the extracted disc staged into the cloud workspace; the four large `SOUND/*.AFS` archives couldn't be staged, so silent stand-ins of the same size were used). The game boots past its loading and shows Clock Settings, drawn correctly, at 60 pictures a second. The fixes along the way are in the changelog. The main ones:
+   - the GD-ROM stream protocol as the game's library reads it;
+   - files at the disc's own sectors (`disc.json`);
+   - timer interrupts;
+   - the interrupt entry's FPSCR;
+   - ARM functions whose code reaches below their start.
 
 ## The Dreamcast and host layers
 

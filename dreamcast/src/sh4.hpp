@@ -5,9 +5,17 @@
 
 #include <cstdint>
 
+#include "guest.hpp"
+
 namespace dreamcast {
 
 void map_sh4_peripherals();
+
+// The timer unit's underflow interrupts (TUNI0-2, INTEVT 0x400/0x420/0x440,
+// priorities in IPRA), for the interrupt service: each channel counting with
+// UNIE set and underflowed is taken if its priority is above IMASK. Returns
+// whether one was held back by IMASK.
+bool timer_interrupts(qilin::rt::Context& c);
 
 // What Shinobi's timer set-up (0x8C0B4958) does: timer 0 stopped, counting at
 // Pφ/64 with no interrupt, from 0xFFFFFFFF with 0xFFFFFFFF to reload, started.

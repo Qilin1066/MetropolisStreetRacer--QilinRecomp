@@ -41,12 +41,13 @@ std::vector<uint32_t> ArmLifter::branch_table(uint32_t pc) const {
     if (is_add(in) && in.rd == 15 && in.rn == 15 && !in.imm && in.shift == Shift::lsl && in.amount == 2) {
         base = pc + 8;
     } else {
-        // add rP, pc, #k within the three instructions before, and the jump's register made from rP.
+        // add rP, pc, #k within the five instructions before (the driver bounds the index between:
+        // cmp, movcs pc,lr), and the jump's register made from rP.
         unsigned jump_reg = 16;
         if (is_add(in) && in.rd == 15 && !in.imm && in.amount == 0) jump_reg = 17;  // add pc, rA, rB
         else if (in.op == Op::mov && in.rd == 15 && !in.imm && in.amount == 0 && in.shift == Shift::lsl && !in.by_register) jump_reg = in.rm;
         if (jump_reg == 16) return {};
-        for (uint32_t back = 4; back <= 12 && pc >= back; back += 4) {
+        for (uint32_t back = 4; back <= 20 && pc >= back; back += 4) {
             const Insn p = decode(image_.u32(pc - back));
             if (!(is_add(p) && p.rn == 15 && p.imm && p.rd != 15)) continue;
             const unsigned rp = p.rd;
@@ -218,11 +219,15 @@ std::string ArmLifter::emit(const ArmFunction& f) const {
         return std::format("{{ c.ret = {}; return; }}", value);
     };
     const std::set<uint32_t> bad(f.bad.begin(), f.bad.end());
-    uint32_t expected = f.start;
+    // The code is emitted in address order; a function whose code reaches below its start (the
+    // driver's 0x7234 branches back to 0x5160) is entered by a jump to its start.
+    const bool starts_lower = !f.insns.empty() && *f.insns.begin() != f.start;
+    if (starts_lower) out += std::format("    goto {};\n", label(f.start));
+    uint32_t expected = starts_lower ? 0xFFFFFFFFu : f.start;
     for (const uint32_t pc : f.insns) {
         if (pc != expected && expected != 0xFFFFFFFFu)
             out += std::format("    rt::stop(rt::Stop::Undefined, {}, 0);  // ran on past reached code\n", hex(expected));
-        if (f.labels.contains(pc)) {
+        if (f.labels.contains(pc) || (starts_lower && pc == f.start)) {
             out += std::format("{}:\n", label(pc));
             if (f.loops.contains(pc)) out += "    QILIN_ARM_POLL();\n";
         }

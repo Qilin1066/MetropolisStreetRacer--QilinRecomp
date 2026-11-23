@@ -33,13 +33,17 @@ uint32_t table_handler(uint32_t intevt) {
     return h == kUnhandled ? 0 : h;
 }
 
-// The entry's call: IMASK 15, INTEVT in r4, the registers put back after.
+// The entry's call: IMASK 15, FPSCR 0x00040000 and FPUL 0 (the entry loads both, 0x8C130BE8),
+// INTEVT in r4; the registers, FPSCR among them, put back after.
 void call_handler(rt::Context& c, uint32_t handler, uint32_t intevt) {
     const rt::Context saved = c;
     c.sr |= 0xF0u;
+    rt::lds_fpscr(c.fpscr, 0x00040000u, handler);
+    c.fpul = 0;
     c.r[4] = intevt;
     rt::call_guest(c, handler);
     c = saved;
+    rt::lds_fpscr(c.fpscr, saved.fpscr, handler);
 }
 
 // The level-6 interrupt (IRL 9, INTEVT 0x320): the graphics chip's events.
@@ -55,6 +59,12 @@ constexpr std::array<rt::Provided, 1> kNatives{{{kLevel6, "interrupt entry: leve
 bool g_provided = false;
 
 }  // namespace
+
+void timer_interrupt(rt::Context& c, uint32_t intevt) {
+    const uint32_t h = table_handler(intevt);
+    if (!h) throw rt::Stop{rt::Stop::Unsupported, c.pr, intevt};  // enabled with no handler installed
+    call_handler(c, h, intevt);
+}
 
 uint32_t interrupt_handler(uint32_t offset) {
     if (!g_provided) rt::provide(kNatives), g_provided = true;

@@ -182,16 +182,24 @@ bool access(uint32_t off, bool write, uint32_t& v, unsigned size) {
     return true;
 }
 
+// The chip's registers are 16 bits wide, one to each 32-bit word; the driver also reads and
+// writes them a byte or a half at a time (0x2001, the high byte of a DSP register's word). Those go
+// through the word: read, the bytes in place, written back.
 uint32_t reg_read(uint32_t off, unsigned n) {
     uint32_t v = 0;
     if (access(off, false, v, n)) return v;
-    if (n != 4 || (off & 3u)) arm::stop(arm::Stop::Unsupported, arm::g_pc, off);
-    return rt::bus_read(0x00700000u + off, 4);
+    if (n == 4 && !(off & 3u)) return rt::bus_read(0x00700000u + off, 4);
+    if ((n != 1 && n != 2) || (off & (n - 1u))) arm::stop(arm::Stop::Unsupported, arm::g_pc, off);
+    const uint32_t word = rt::bus_read(0x00700000u + (off & ~3u), 4);
+    return (word >> ((off & 3u) * 8)) & (n == 1 ? 0xFFu : 0xFFFFu);
 }
 void reg_write(uint32_t off, uint32_t v, unsigned n) {
     if (access(off, true, v, n)) return;
-    if (n != 4 || (off & 3u)) arm::stop(arm::Stop::Unsupported, arm::g_pc, off);
-    rt::bus_write(0x00700000u + off, v, 4);
+    if (n == 4 && !(off & 3u)) return rt::bus_write(0x00700000u + off, v, 4);
+    if ((n != 1 && n != 2) || (off & (n - 1u))) arm::stop(arm::Stop::Unsupported, arm::g_pc, off);
+    const uint32_t shift = (off & 3u) * 8, mask = (n == 1 ? 0xFFu : 0xFFFFu) << shift;
+    const uint32_t word = rt::bus_read(0x00700000u + (off & ~3u), 4);
+    rt::bus_write(0x00700000u + (off & ~3u), (word & ~mask) | ((v << shift) & mask), 4);
 }
 
 void run() {

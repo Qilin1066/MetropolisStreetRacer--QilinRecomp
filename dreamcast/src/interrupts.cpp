@@ -9,6 +9,7 @@
 #include "guest.hpp"
 #include "maple.hpp"
 #include "pvr.hpp"
+#include "sh4.hpp"
 #include "video.hpp"
 #include "system.hpp"
 
@@ -85,8 +86,9 @@ void service(rt::Context& c) {
         rt::call_guest(c, handler);
         c = saved;
     }
-    // Level 6 first, as the console's priorities have it; then level 4.
+    // Level 6 first, as the console's priorities have it; then level 4; then the timers.
     if (level4(c)) rt::g_irq_waiting = true;
+    if (timer_interrupts(c)) rt::g_irq_waiting = true;
 }
 
 }  // namespace
@@ -97,8 +99,9 @@ void start_interrupts() {
     rt::g_irq_service = service;
     std::thread([] {
         auto next = std::chrono::steady_clock::now();
+        // A service a millisecond: the frame's blanks, and the timers' underflows between them.
         for (;;) {
-            next += std::chrono::nanoseconds(kFrameNs);
+            next += std::chrono::milliseconds(1);
             std::this_thread::sleep_until(next);
             interrupt_pending();
         }

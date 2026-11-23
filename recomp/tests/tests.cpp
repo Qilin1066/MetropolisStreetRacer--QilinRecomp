@@ -1447,6 +1447,12 @@ void test_folder_drive() {
     write(dir / "a.bin", "hello");
     write(dir / "sub" / "b.txt", std::string(3000, 'b'));
     std::string why;
+    CHECK(msr::Drive::of_folder(dir, why) == nullptr);  // no disc.json: the disc's sectors unknown
+    write(dir / "disc.json", R"({"files": [{"path": "A.BIN", "sector": 50000, "size": 4},
+        {"path": "SUB/B.TXT", "sector": 50010, "size": 3000}]})");
+    CHECK(msr::Drive::of_folder(dir, why) == nullptr);  // A.BIN's size differs
+    write(dir / "disc.json", R"({"files": [{"path": "A.BIN", "sector": 50000, "size": 5},
+        {"path": "SUB/B.TXT", "sector": 50010, "size": 3000}]})");
     const auto drive = msr::Drive::of_folder(dir, why);
     CHECK(drive != nullptr);
     if (!drive) return;
@@ -1468,10 +1474,10 @@ void test_folder_drive() {
     };
     list(root);
     CHECK(names.size() == 4 && names.contains("A.BIN;1") && names.contains("SUB") && !names.contains("IP.BIN;1"));
-    CHECK(names["A.BIN;1"].second == 5);
+    CHECK(names["A.BIN;1"].second == 5 && names["A.BIN;1"].first == 50000);
     CHECK(drive->read(names["A.BIN;1"].first, s) && std::memcmp(s, "hello", 5) == 0 && s[5] == 0);
     list(names["SUB"].first);
-    CHECK(names.contains("B.TXT;1") && names["B.TXT;1"].second == 3000);
+    CHECK(names.contains("B.TXT;1") && names["B.TXT;1"].second == 3000 && names["B.TXT;1"].first == 50010);
     CHECK(drive->read(names["B.TXT;1"].first + 1, s) && s[951] == 'b' && s[952] == 0);
     CHECK(!drive->read(44999, s));
     fs::remove_all(dir);

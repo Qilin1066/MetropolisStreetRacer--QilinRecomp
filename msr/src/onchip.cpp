@@ -71,9 +71,39 @@ void write(uint32_t a, uint32_t v, unsigned n) {
     r->value = v;
 }
 
+// Area 7's reserved part, 0x1C000000-0x1EFFFFFF (the SH7750's manual lists nothing there; the
+// on-chip registers' area-7 copies start at 0x1F000000). The game's own code writes there
+// (0x8C14655E, a library's set-up storing through an address built from r15: 0xBC60E73C), which
+// the console ignores. Reads give 0, writes are dropped; the first few are logged.
+unsigned g_reserved_logged = 0;
+void note_reserved(uint32_t a, bool write, uint32_t v) {
+    if (g_reserved_logged >= 8) return;
+    ++g_reserved_logged;
+#ifdef QILIN_BRINGUP
+    rt::log("msr: %s area 7's reserved address %08X (value %08X), from %08X: ignored, as by the console",
+            write ? "a write to" : "a read of", a, v, rt::g_pc);
+#else
+    rt::log("msr: %s area 7's reserved address %08X (value %08X): ignored, as by the console",
+            write ? "a write to" : "a read of", a, v);
+#endif
+}
+uint32_t reserved_read(uint32_t a, unsigned) { return note_reserved(a, false, 0), 0; }
+void reserved_write(uint32_t a, uint32_t v, unsigned) { note_reserved(a, true, v); }
+void reserved_block(uint32_t a, const uint8_t*, unsigned) { note_reserved(a, true, 0); }
+
+// The caches' address and data arrays (0xF0000000-0xF7FFFFFF: instruction cache 0xF0/0xF1,
+// operand cache 0xF5 here, its address array 0xF4 in dreamcast/src/sh4.cpp; the TLB arrays 0xF2/0xF3/0xF6/0xF7 are not here). The port has no
+// caches: memory is always what the CPU last wrote, so the libraries' flushes and invalidations
+// (writes to an address array, 0x8C122C5C) have nothing to do, and a read finds no line valid.
+uint32_t cache_read(uint32_t, unsigned) { return 0; }
+void cache_write(uint32_t, uint32_t, unsigned) {}
+
 }  // namespace
 
 void map_onchip() {
+    rt::map({0xF0000000u, 0xF2000000u, "SH-4 instruction cache arrays (no cache)", cache_read, cache_write});
+    rt::map({0xF5000000u, 0xF6000000u, "SH-4 operand cache data array (no cache)", cache_read, cache_write});
+    rt::map({0x1C000000u, 0x1F000000u, "area 7, reserved", reserved_read, reserved_write, reserved_block});
     std::sort(g_registers.begin(), g_registers.end(), [](const Register& x, const Register& y) { return x.address < y.address; });
     for (Register& r : g_registers) r.value = r.reset;
     // The store queues' QACR0/QACR1 (0xFF000038, 0xFF00003C) are the bus's own.

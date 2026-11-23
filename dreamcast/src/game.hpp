@@ -16,6 +16,8 @@ uint32_t interrupt_handler(uint32_t offset);
 // Runs the handlers the system software chained on a system bus event
 // (0xA00 + 0x20 n, 0xB00 + 0x20 n), if any, as its level-4 handler would.
 void raise_bus_event(qilin::rt::Context& c, uint32_t event);
+// A timer unit underflow interrupt (INTEVT 0x400, 0x420 or 0x440): the game's handler for it.
+void timer_interrupt(qilin::rt::Context& c, uint32_t intevt);
 // The console's own settings the game reads: its language (1 English,
 // 2 German, 3 French, 4 Spanish) and stereo or mono sound.
 void set_console(unsigned language, bool stereo);
