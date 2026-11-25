@@ -8,7 +8,10 @@
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <mutex>
+#include <set>
+#include <utility>
 #include <vector>
 
 namespace qilin::rt {
@@ -44,6 +47,32 @@ void provide(std::span<const Provided> natives) {
     std::sort(r.begin(), r.end(), [](const Provided& a, const Provided& b) { return a.entry < b.entry; });
     for (size_t i = 1; i < r.size(); ++i)
         if (r[i - 1].entry == r[i].entry) fatal("%08X has native code twice (%s, %s)", r[i].entry, r[i - 1].name, r[i].name);
+}
+
+namespace {
+std::vector<Wrapper>& wrapper_registry() {
+    static std::vector<Wrapper> r;
+    return r;
+}
+}  // namespace
+
+void provide_wrappers(std::span<const Wrapper> wrappers) {
+    auto& r = wrapper_registry();
+    for (const Wrapper& w : wrappers) {
+        if (std::any_of(r.begin(), r.end(), [&](const Wrapper& o) { return o.entry == w.entry; }))
+            fatal("%08X is wrapped twice (%s)", w.entry, w.name);
+        r.push_back(w);
+    }
+}
+
+void wrapped(Context& c, uint32_t fn, Body body) {
+    for (const Wrapper& w : wrapper_registry())
+        if (w.entry == fn) {
+            c.ret = c.pr;  // where an empty function returns; the body sets it again when it runs
+            w.fn(c, body);
+            return;
+        }
+    throw Stop{Stop::Unsupported, fn, fn};  // wrapped in the port, and this build has no wrapper for it
 }
 
 const Provided* native_at(uint32_t entry) {
@@ -148,6 +177,29 @@ void idle_wait() {
     g_idle_wake.wait_for(lock, std::chrono::milliseconds(1), [] { return g_irq_pending.load(std::memory_order_seq_cst); });
     g_idle_waiters.fetch_sub(1, std::memory_order_seq_cst);
 }
+
+#ifdef QILIN_WATCH
+namespace {
+const bool g_watch_read = [] {
+    if (const char* s = std::getenv("QILIN_WATCH")) {
+        char* end = nullptr;
+        g_watch_lo = static_cast<uint32_t>(std::strtoul(s, &end, 16)) | 0x80000000u;
+        g_watch_hi = (*end == '-' ? static_cast<uint32_t>(std::strtoul(end + 1, &end, 16)) | 0x80000000u : g_watch_lo + 3) + 1;
+        if (*end != '\0' || g_watch_hi <= g_watch_lo) fatal("QILIN_WATCH: <from>[-<to>], hex addresses");
+        std::fprintf(stderr, "watching stores into %08X-%08X\n", g_watch_lo, g_watch_hi - 1);
+    }
+    return true;
+}();
+}  // namespace
+
+void watch_store(uint32_t a, uint32_t n) {
+    static std::mutex m;
+    static std::set<std::pair<uint32_t, uint32_t>> seen;
+    std::lock_guard lock(m);
+    if (seen.emplace(g_pc, a & ~3u).second)
+        std::fprintf(stderr, "watch: %08X (in fn_%08X) stores %u bytes at %08X\n", g_pc, function_containing(g_pc), n, a);
+}
+#endif
 
 void wake_idle() {
     if (g_idle_waiters.load(std::memory_order_seq_cst) == 0) return;

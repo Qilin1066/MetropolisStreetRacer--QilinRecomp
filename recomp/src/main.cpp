@@ -348,6 +348,9 @@ int cmd_trial(const Args& a) {
 // lifted_NNN.cpp, stubs.cpp (functions not lifted yet: calling one stops),
 // table.cpp (the address -> function table for indirect calls) and
 // lift_report.txt (what wasn't lifted, and why).
+// rt::kFrameSteps (recomp/runtime/guest.hpp): the per-picture steps rt::frame_step keeps.
+constexpr size_t rt_frame_steps = 16;
+
 int cmd_lift(const Args& a) {
     if (!a.out_dir) throw Failure{"lift needs --out <dir>"};
     const BootFile boot = must(BootFile::load(a.input), a.input);
@@ -355,7 +358,18 @@ int cmd_lift(const Args& a) {
     if (!build) throw Failure{std::format("{}: not a supported program (SHA-256 {})", a.input, boot.sha256)};
     Cfg cfg(boot);
     cfg.run();
-    const Lifter lifter(cfg, build->setjmp, build->idle);
+    const Lifter lifter(cfg, build->setjmp, build->idle, build->frame_steps);
+    for (const uint32_t w : build->wrapped)
+        if (!cfg.functions().contains(w)) throw Failure{std::format("the wrapped function {:08x} (KnownBuild::wrapped) isn't a function", w)};
+    // Each per-picture step must be an ftrc in some function, and fit rt::frame_step's table.
+    if (build->frame_steps.size() > rt_frame_steps)
+        throw Failure{std::format("{} per-picture steps (KnownBuild::frame_steps); rt::frame_step keeps {}", build->frame_steps.size(), rt_frame_steps)};
+    for (const uint32_t at : build->frame_steps) {
+        if (!std::ranges::any_of(cfg.functions(), [&](const auto& e) { return std::ranges::binary_search(e.second.insns, at); }))
+            throw Failure{std::format("the per-picture step at {:08x} (KnownBuild::frame_steps) is in no function", at)};
+        if (cfg.insn(at).op != sh4::Op::ftrc)
+            throw Failure{std::format("the per-picture step at {:08x} (KnownBuild::frame_steps) isn't an ftrc", at)};
+    }
     // Each wait loop's head must be in some function (the lifter checks it is a loop's head there).
     for (const uint32_t head : build->idle)
         if (!std::ranges::any_of(cfg.functions(), [&](const auto& e) { return std::ranges::binary_search(e.second.insns, head); }))
@@ -397,7 +411,17 @@ int cmd_lift(const Args& a) {
             if (++in_chunk == kPerFile) flush();
             continue;
         }
-        const LiftResult result = lifter.lift(f);
+        LiftResult result = lifter.lift(f);
+        if (std::ranges::contains(build->wrapped, start)) {
+            // KnownBuild::wrapped: the lifted body under its own name, the function a call to the wrapper.
+            if (!result.ok) throw Failure{std::format("the wrapped function {:08x} isn't lifted: {}", start, result.why)};
+            const std::string head = std::format("void {}(rt::Context& c) {{", name);
+            const size_t at = result.code.find(head);
+            if (at == std::string::npos) throw Failure{std::format("internal: no head for the wrapped function {:08x}", start)};
+            result.code.replace(at, head.size(), std::format("void {}_body(rt::Context& c) {{", name));
+            result.code += std::format("void {}(rt::Context& c) {{ rt::wrapped(c, 0x{:08x}u, {}_body); }}\n", name, start, name);
+            decls += std::format("void {}_body(rt::Context& c);\n", name);
+        }
         table += std::format("    {{0x{:08x}u, gen::{}, {}, {}}},\n", start, name, result.any_mode ? "true" : "false",
                              result.keeps_mode || !result.ok ? "true" : "false");
         if (result.ok) {

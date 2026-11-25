@@ -189,7 +189,19 @@ inline unsigned g_load_next = 0;
     if (hardware(a, n)) return hw_store(a, n, v)
 #else
 inline void check(uint32_t, uint32_t) {}
+#ifdef QILIN_WATCH
+// Development builds (cmake -DQILIN_WATCH=ON, with QILIN_BRINGUP): QILIN_WATCH=<from>-<to> (hex
+// guest addresses, any view) logs each instruction that stores into that range, once for each
+// instruction and word, to stderr (system.cpp). Finding what writes a value, without a debugger.
+inline uint32_t g_watch_lo = 0, g_watch_hi = 0;  // P1 addresses; hi 0: nothing watched
+void watch_store(uint32_t a, uint32_t n);
+inline void check_store(uint32_t a, uint32_t n) {
+    const uint32_t p1 = (a & 0x1FFFFFFFu) | 0x80000000u;
+    if (p1 < g_watch_hi && p1 + n > g_watch_lo) [[unlikely]] watch_store(p1, n);
+}
+#else
 inline void check_store(uint32_t, uint32_t) {}
+#endif
 // Release builds: RAM is the fast path (every view of it is mapped), and
 // anything else goes to the bus (bus.cpp): the devices the runtime maps.
 uint32_t bus_read(uint32_t a, unsigned n);
@@ -370,6 +382,25 @@ inline uint32_t ftrc_s(uint32_t n) { return ftrc(f32(in(n))); }
 inline uint32_t ftrc_d(uint64_t n) { return ftrc(f64(in(n))); }
 inline uint64_t fcnvsd(uint32_t fpul) { return out(static_cast<double>(f32(in(fpul)))); }
 inline uint32_t fcnvds(uint64_t n) { return out(static_cast<float>(f64(in(n)))); }
+
+// A per-picture step (KnownBuild::frame_steps): a whole number the game works out from its frame
+// rate with ftrc and adds to a clock once a picture (the race clock's milliseconds, trunc(1000 /
+// pictures a second)). Where the port draws g_frame_split pictures for each one the game asked
+// for (60 a second for its 30), the step of one of the game's pictures, trunc(x * split), is
+// shared out over those pictures in whole numbers, so the clock keeps the game's own sums: 16 then
+// 17 for its 33, where trunc(1000 / 60) would give 16 and 16 and the clock would run 4% slow.
+// `site` is the step's index in the list (qilin lift numbers them); one guest thread runs at a time.
+inline constexpr unsigned kFrameSteps = 16;
+inline uint32_t g_frame_split = 1;
+inline uint32_t frame_step(unsigned site, uint32_t n) {
+    const uint32_t split = g_frame_split;
+    if (split <= 1) return ftrc_s(n);
+    static uint32_t phase[kFrameSteps] = {};
+    const int64_t whole = static_cast<int32_t>(ftrc(static_cast<double>(f32(in(n)) * static_cast<float>(split))));
+    const uint32_t p = phase[site] % split;
+    phase[site] = (p + 1) % split;
+    return static_cast<uint32_t>(whole * (p + 1) / split - whole * p / split);
+}
 
 // Double registers: DRn is FRn (the high half) and FRn+1.
 inline uint64_t get64(const uint32_t* bank, unsigned n) { return uint64_t(bank[n]) << 32 | bank[n + 1]; }
@@ -580,6 +611,11 @@ void call_any_mode(Context& c, uint32_t target, uint32_t from);
 // A function the port replaces with native code (KnownBuild::replaced): runs the native
 // registered at its address (rt::provide), which returns to PR; none registered stops.
 void replaced(Context& c, uint32_t fn);
+// A function the port wraps (KnownBuild::wrapped): qilin lift emits its lifted body as its own
+// function, and the function itself as a call to the wrapper registered at its address
+// (provide_wrappers, system.hpp), which runs the body when it chooses. Stops if there is none.
+using Body = void (*)(Context&);
+void wrapped(Context& c, uint32_t fn, Body body);
 // Ends every guest thread but the host thread's own, each unwinding its frames; for a
 // restart of the program. Only from the host thread's stack, with no guest frame live on it.
 void end_guest_threads();

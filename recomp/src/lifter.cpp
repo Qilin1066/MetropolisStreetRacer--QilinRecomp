@@ -43,8 +43,8 @@ uint16_t gpr_uses(const Insn& in) {
 class Emit {
 public:
     Emit(const Cfg& cfg, const Function& f, const std::set<uint32_t>& mova_words, uint32_t setjmp,
-         const std::set<uint32_t>& idle)
-        : cfg_(cfg), f_(f), mova_words_(mova_words), setjmp_(setjmp), idle_(idle) {
+         const std::set<uint32_t>& idle, const std::map<uint32_t, unsigned>& frame_steps)
+        : cfg_(cfg), f_(f), mova_words_(mova_words), setjmp_(setjmp), idle_(idle), frame_steps_(frame_steps) {
         for (const auto& [pc, mode] : f.fp_modes) modes_[pc] = mode;
     }
 
@@ -487,6 +487,10 @@ private:
             even(pc, in.n());
             return std::format("rt::set64({}, {}, rt::float_d(c.fpul));", bank(pc), in.n());
         case Op::ftrc:
+            if (const auto step = frame_steps_.find(pc); step != frame_steps_.end()) {
+                if (double_mode(pc)) throw Fail{pc, "a per-picture step (KnownBuild::frame_steps) in double precision"};
+                return std::format("c.fpul = rt::frame_step({}u, {});", step->second, fr(pc, in.n()));
+            }
             if (!double_mode(pc)) return std::format("c.fpul = rt::ftrc_s({});", fr(pc, in.n()));
             even(pc, in.n());
             return std::format("c.fpul = rt::ftrc_d(rt::get64({}, {}));", bank(pc), in.n());
@@ -659,6 +663,7 @@ private:
     const std::set<uint32_t>& mova_words_;
     uint32_t setjmp_ = 0;
     const std::set<uint32_t>& idle_;
+    const std::map<uint32_t, unsigned>& frame_steps_;
     std::vector<uint32_t> sites_;  // return addresses of this function's calls to setjmp
     std::set<uint32_t> loops_;     // targets of backward branches: loops' heads
     mutable std::vector<std::pair<uint32_t, uint32_t>> folded_;
@@ -676,8 +681,9 @@ bool any_mode(const Function& f) {
            (f.fp_modes.empty() && f.calls.empty() && f.tails.empty() && f.icalls.empty() && f.itails.empty() && !f.falls_into);
 }
 
-Lifter::Lifter(const Cfg& cfg, uint32_t setjmp, std::span<const uint32_t> idle)
+Lifter::Lifter(const Cfg& cfg, uint32_t setjmp, std::span<const uint32_t> idle, std::span<const uint32_t> frame_steps)
     : cfg_(cfg), setjmp_(setjmp), idle_(idle.begin(), idle.end()) {
+    for (const uint32_t a : frame_steps) frame_steps_.emplace(a, static_cast<unsigned>(frame_steps_.size()));
     // Pool words code may write: one a mova points at, or one whose address is itself a constant in
     // some pool (cached or uncached alias), as the libraries' handler table is (0x8C130B24).
     std::set<uint32_t> pool;
@@ -695,7 +701,7 @@ Lifter::Lifter(const Cfg& cfg, uint32_t setjmp, std::span<const uint32_t> idle)
 LiftResult Lifter::lift(const Function& f) const {
     LiftResult result;
     try {
-        Emit emit(cfg_, f, mova_words_, setjmp_, idle_);
+        Emit emit(cfg_, f, mova_words_, setjmp_, idle_, frame_steps_);
         const std::string code = emit.run();
         result.code = emit.sync_macros() + code;
         result.dynamic = emit.dynamic();

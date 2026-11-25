@@ -6,7 +6,7 @@ A static recompilation of **Metropolis Street Racer** (Bizarre Creations / Sega,
 
 ## Status
 
-The game boots through its title cards to the title screen and the attract demo, and from there through a new game, player details and a memory-card save to the first race (San Francisco, Fisherman's Wharf), which runs at a steady 30 frames a second and drives. No whole lap has been played yet.
+The game boots through its title cards to the title screen and the attract demo, and from there through a new game, player details and a memory-card save to the first race (San Francisco, Fisherman's Wharf), which runs at a steady 30 frames a second, as on the console, or at 60 (`frame_rate = 60` in the settings menu's Display page) with the cars' physics still the original's, and drives. No whole lap has been played yet.
 
 | Part | State |
 |---|---|
@@ -47,7 +47,7 @@ A controller, or the keyboard, is the pad on port A. Keys: Z X A S for A B X Y, 
 - `msr.ini`, the memory card and flash memory live in `%LOCALAPPDATA%\qilin\msr`, `~/Library/Application Support/qilin/msr` or `$XDG_DATA_HOME/qilin/msr` (default `~/.local/share/qilin/msr`); `QILIN_SAVE_DIR` overrides.
 - The game's own Clock Settings screen comes up at every start: its races follow the time of day.
 
-Test runs: `QILIN_HEADLESS=1`, `QILIN_SHOT=<folder>,<every>` (PPM screenshots), `QILIN_PRESS` (scripted presses) and `QILIN_DUMP` (RAM dumps); syntax and a script to the first race in `docs/runtime.md`.
+Test runs: `QILIN_HEADLESS=1`, `QILIN_SHOT=<folder>,<every>[,<from>-<to>]` (PPM screenshots), `QILIN_PRESS` (scripted presses) and `QILIN_DUMP` (RAM dumps); syntax and a script to the first race in `docs/runtime.md`.
 
 ## Building
 

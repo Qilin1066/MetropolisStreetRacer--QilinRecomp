@@ -13,12 +13,23 @@ namespace {
 // MSR.BIN's start-a-program (0x8C02F68A): the launcher is replaced natively, and with it the
 // library that hands over to it (msr/src/launcher.cpp; docs/disc-and-boot-analysis.md). Shinobi's
 // settings queries, the language (0x8C1304BC) and the sound mode (0x8C13043E, set 0x8C130408):
-// answered from msr.ini (msr/src/console.cpp).
-constexpr uint32_t kMsrReplaced[] = {0x8C02F68Au, 0x8C130408u, 0x8C13043Eu, 0x8C1304BCu};
+// answered from msr.ini (msr/src/console.cpp). The game's two frame-rate setters, a picture every
+// vertical blank (0x8C02D0D0) and every second one (0x8C02D0E6): msr/src/frame_rate.cpp.
+constexpr uint32_t kMsrReplaced[] = {0x8C02D0D0u, 0x8C02D0E6u, 0x8C02F68Au, 0x8C130408u, 0x8C13043Eu, 0x8C1304BCu};
 // Wait loops: 0x8C12B980, in 0x8C12B8DE, waits for a bit of 0x8C5BE3FC to clear, calling entry 7 of
 // the libraries' table at 0x8C5C35D4 (an rts) each time round; only an interrupt's handler clears
 // it. The menus spend their time there (docs/runtime.md, "Waiting").
 constexpr uint32_t kMsrIdle[] = {0x8C12B980u};
+// The race clock's step, in 0x8C07E0A8: its milliseconds a picture (up, 0x8C07E0D2) and a
+// countdown's (down, 0x8C07E108), each trunc(1000 / (pictures a second / 0x8C4B1DB2's halfword)).
+constexpr uint32_t kMsrFrameSteps[] = {0x8C07E0D2u, 0x8C07E108u};
+// The cars' physics, kept at the game's own frame rate when the port draws more pictures
+// (msr/src/frame_rate.cpp): the race's world step (0x8C03BAD4, a task: every car's step, their
+// collisions, velocities from how far they moved), every second picture with the pictures between
+// interpolated; a car's step in it (0x8C03C14E, r4 the car), whose cars are the ones interpolated;
+// a car's update (0x8C0AB7B8), which the race's setup also calls on its own; and that setup
+// (0x8C03B3E2, a task: the cars put on the grid and settled), at the game's rate throughout.
+constexpr uint32_t kMsrWrapped[] = {0x8C03B3E2u, 0x8C03BAD4u, 0x8C03C14Eu, 0x8C0AB7B8u};
 
 // The North American disc, MK-51012 V1.010, dated 2000-11-30. Hashes
 // recorded from the Redump image in v0.3.0; docs/disc-and-boot-analysis.md
@@ -27,7 +38,7 @@ constexpr std::array<KnownBuild, 2> kKnownBuilds{{
     {"b5515a96ba7e67dc2dfe08b6adf7d99a4d6c95e7e9fb015fe1f70dffa59af0e9", "1ST_READ.BIN", "MK-51012", "V1.010",
      "Metropolis Street Racer (USA): launcher"},
     {"7780f031bc7124dd68e2b411daf5e6fb636589ab4ea9b36427531d95517d9888", "MSR.BIN", "MK-51012", "V1.010",
-     "Metropolis Street Racer (USA): game", 0x8C0EE5BCu, kMsrReplaced, kMsrIdle},
+     "Metropolis Street Racer (USA): game", 0x8C0EE5BCu, kMsrReplaced, kMsrIdle, kMsrFrameSteps, kMsrWrapped},
 }};
 
 std::unexpected<std::string> fail(std::string message) { return std::unexpected(std::move(message)); }

@@ -495,6 +495,11 @@ void Menu::display_page() {
     ImGui::BeginDisabled(!s_.vsync);
     ImGui::Checkbox("Low latency (with vsync: at most one frame waiting)", &s_.low_latency);
     ImGui::EndDisabled();
+    if (frame_rates_) {
+        const char* const kRates[] = {"Original", "60"};
+        int rate = s_.frame_rate == 60 ? 1 : 0;
+        if (ImGui::Combo("Frame rate", &rate, kRates, 2)) s_.frame_rate = rate == 1 ? 60u : 0u;
+    }
     ImGui::Checkbox("Frame times (F3)", &s_.performance_overlay);
     ImGui::SeparatorText("Refresh rate");
     const bool was_match = s_.match_refresh, was_vrr = s_.variable_refresh;

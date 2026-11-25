@@ -272,7 +272,7 @@ endif()
 
 # ---- The port: the hardware and system software the game runs on (msr/src),
 # built without the lifted code too, so CI compiles it ----
-add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp msr/src/drive.cpp msr/src/launcher.cpp msr/src/adx.cpp msr/src/romfont.cpp msr/src/console.cpp)
+add_library(msr_port STATIC msr/src/onchip.cpp msr/src/bios.cpp msr/src/rtc.cpp msr/src/drive.cpp msr/src/launcher.cpp msr/src/adx.cpp msr/src/romfont.cpp msr/src/console.cpp msr/src/frame_rate.cpp)
 target_include_directories(msr_port PUBLIC msr/src)
 target_link_libraries(msr_port PUBLIC qilin_runtime qilin_disc PRIVATE qilin_warnings)
 if(QILIN_HOST)
@@ -318,6 +318,14 @@ if(QILIN_GEN_DIR)
     option(QILIN_BRINGUP "Note the guest instruction of each access in the game build" ON)
     if(QILIN_BRINGUP)
         target_compile_definitions(qilin_gen PUBLIC QILIN_BRINGUP)
+    endif()
+    # Development: QILIN_WATCH=<from>-<to> logs the instructions storing into that range (guest.hpp).
+    option(QILIN_WATCH "Let QILIN_WATCH log stores into a range of guest memory (slower; development only)" OFF)
+    if(QILIN_WATCH)
+        if(NOT QILIN_BRINGUP)
+            message(FATAL_ERROR "QILIN_WATCH needs QILIN_BRINGUP (the instruction of each access)")
+        endif()
+        target_compile_definitions(qilin_runtime INTERFACE QILIN_WATCH QILIN_BRINGUP)
     endif()
     if(NOT QILIN_HOST)
         message(FATAL_ERROR "msr needs the host layer (QILIN_HOST)")

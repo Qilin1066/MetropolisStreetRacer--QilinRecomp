@@ -74,6 +74,14 @@ struct KnownBuild {
     // changes). qilin lift makes the host wait there for the next interrupt (QILIN_IDLE, guest.hpp)
     // instead of going round as fast as it can.
     std::span<const uint32_t> idle = {};
+    // Per-picture steps: single-precision ftrc instructions turning the game's frame rate into a
+    // whole number it adds to a clock once a picture. qilin lift makes each a call to
+    // rt::frame_step (guest.hpp), which keeps the game's sums when the port draws more pictures
+    // than the game asked for (docs/runtime.md, "Frame rate").
+    std::span<const uint32_t> frame_steps = {};
+    // Functions the port wraps: qilin lift keeps each lifted, as <name>_body, and makes the
+    // function a call to the port's wrapper with it (rt::wrapped), which decides when it runs.
+    std::span<const uint32_t> wrapped = {};
 };
 const KnownBuild* known_build(std::string_view sha256_hex);
 

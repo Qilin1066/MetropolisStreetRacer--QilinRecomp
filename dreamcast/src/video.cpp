@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cmath>
 #include <iterator>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,7 @@ std::unique_ptr<Menu> g_menu;
 std::thread::id g_thread;
 std::string g_shot_folder;
 uint64_t g_shot_every = 60, g_pictures = 0;
+uint64_t g_shot_from = 0, g_shot_to = UINT64_MAX;  // QILIN_SHOT's window of pictures
 uint32_t g_scale = 2, g_last_drawn = 0;
 bool g_drawn = false;  // a render since the last picture shown
 // The widening the screen asks for (screen_widening), kept by the window's
@@ -190,14 +192,23 @@ void start() {
     set_texture_packs();
     if (!o.headless) {
         g_menu = std::make_unique<Menu>(*g_display, g_settings, g_data);
+        g_menu->offer_frame_rates(game::frame_rate_choice());
         g_menu->set_running_scale(g_scale);
     }
+    // QILIN_SHOT=<folder>[,<every>[,<from>-<to>]]: every <every>th picture (60), only from picture
+    // <from> to <to> if given (a dense look at a moment without a shot of the whole run).
     if (const char* s = std::getenv("QILIN_SHOT")) {
         g_shot_folder = s;
         if (const size_t comma = g_shot_folder.find(','); comma != std::string::npos) {
-            g_shot_every = std::strtoull(g_shot_folder.c_str() + comma + 1, nullptr, 10);
+            char* end = nullptr;
+            g_shot_every = std::strtoull(g_shot_folder.c_str() + comma + 1, &end, 10);
+            if (*end == ',') {
+                g_shot_from = std::strtoull(end + 1, &end, 10);
+                if (*end != '-') rt::fatal("QILIN_SHOT: <folder>,<every>,<from>-<to>");
+                g_shot_to = std::strtoull(end + 1, &end, 10);
+            }
+            if (*end != '\0' || g_shot_every == 0 || g_shot_from > g_shot_to) rt::fatal("QILIN_SHOT: <folder>[,<every>[,<from>-<to>]], every at least 1");
             g_shot_folder.resize(comma);
-            if (g_shot_every == 0) rt::fatal("QILIN_SHOT: every 0th picture?");
         }
     }
     measure_screen();
@@ -355,6 +366,7 @@ void vblank() {
     set_texture_packs();
     if (g_menu && g_menu->take_reload_textures()) g_renderer->reload_texture_packs();
     sound::set_volume(g_settings.volume, g_settings.mute_unfocused && g_display->sdl_window() && !g_display->focused());
+    game::set_frame_rate(g_settings.frame_rate);
     const float strength = g_settings.rumble ? float(g_settings.rumble_strength) / 100.0f : 0.0f;
     for (unsigned port = 0; port < 4; ++port) g_display->rumble(port, strength * maple::vibration(port));
     if (!g_drawn) return;
@@ -365,7 +377,7 @@ void vblank() {
     if (!p.image) return;
     g_drawn = false;
     ++g_pictures;
-    if (!g_shot_folder.empty() && g_pictures % g_shot_every == 0) shot(g_renderer->read_back(), p.width, p.height);
+    if (!g_shot_folder.empty() && g_pictures % g_shot_every == 0 && g_pictures >= g_shot_from && g_pictures <= g_shot_to) shot(g_renderer->read_back(), p.width, p.height);
     dump_ram_if_asked();
     // 4:3, widened as it was drawn: never stretched (a movie is never widened).
     g_display->present_image(p.image, p.view, p.width, p.height, 4.0f / 3.0f * p.widen, p.height / g_scale);

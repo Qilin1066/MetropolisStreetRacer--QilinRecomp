@@ -66,6 +66,7 @@ struct Settings {
     unsigned sharpness = 80;          // FSR's sharpening, 0-100
     bool vsync = true;                // at the display's refresh (no tearing); off: the lowest latency
     bool low_latency = true;          // with vsync: at most one finished picture waiting for the display
+    unsigned frame_rate = 0;          // pictures a second: 0, the game's own; 60 (where the game offers it)
     std::string gpu;                  // the graphics device's name (empty: the best one)
     bool performance_overlay = false; // frame rate, 1% and 0.1% lows and frame times in a corner (F3 switches it)
     bool match_refresh = true;        // fullscreen: a refresh that's a multiple of 60 Hz when the desktop's isn't

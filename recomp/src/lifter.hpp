@@ -25,6 +25,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -62,13 +63,16 @@ public:
     // setjmp: the program's setjmp, if it has one (from the known-build table): its call sites are
     // where a longjmp may come back to, so the functions with one are lifted to be resumable there.
     // idle: wait loops' heads (KnownBuild::idle), where the poll for interrupts waits for one.
-    explicit Lifter(const Cfg& cfg, uint32_t setjmp = 0, std::span<const uint32_t> idle = {});
+    // frame_steps: ftrc instructions lifted as rt::frame_step (KnownBuild::frame_steps).
+    explicit Lifter(const Cfg& cfg, uint32_t setjmp = 0, std::span<const uint32_t> idle = {},
+                    std::span<const uint32_t> frame_steps = {});
     LiftResult lift(const Function& f) const;
 
 private:
     const Cfg& cfg_;
     uint32_t setjmp_ = 0;
     std::set<uint32_t> idle_;
+    std::map<uint32_t, unsigned> frame_steps_;  // address: its index
     // Words some code takes the address of with mova: a literal there may be written (hand-written
     // code keeps variables in its pools), so it is loaded from memory, not compiled as a constant.
     std::set<uint32_t> mova_words_;

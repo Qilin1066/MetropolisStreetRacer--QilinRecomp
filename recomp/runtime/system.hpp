@@ -41,6 +41,15 @@ struct Provided {
 
 // Registers native code. Registering an address twice is a mistake and stops.
 void provide(std::span<const Provided> natives);
+// Native code around a lifted function (KnownBuild::wrapped): called in its place with its lifted
+// body, which it may run (with the context as the function was entered) or not. When it doesn't,
+// the function returns to its caller as an empty one would.
+struct Wrapper {
+    uint32_t entry;
+    const char* name;
+    void (*fn)(Context& c, Body body);
+};
+void provide_wrappers(std::span<const Wrapper> wrappers);
 // The native code for an address, or nullptr; and its name.
 const Provided* native_at(uint32_t entry);
 const char* native_name(uint32_t entry);

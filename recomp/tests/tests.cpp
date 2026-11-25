@@ -918,6 +918,19 @@ void test_floating_point() {
     CHECK(ftrc_s(bits(-2.7f)) == 0xFFFFFFFEu && ftrc_s(bits(3e9f)) == 0x7FFFFFFFu);
     CHECK(ftrc_s(bits(-3e9f)) == 0x80000000u && ftrc_s(0x7FC00000u) == 0x7FFFFFFFu && ftrc_s(0xFFC00000u) == 0x7FFFFFFFu);
     CHECK(fcnvds(std::bit_cast<uint64_t>(1.0 / 3.0)) == 0x3EAAAAABu);
+    // A per-picture step (KnownBuild::frame_steps): trunc as ftrc at the game's rate; drawn twice as
+    // often, trunc(2x) shared out, 16 then 17 for the race clock's 1000 / 60 (the game's 33).
+    g_frame_split = 1;
+    CHECK(frame_step(0, bits(1000.0f / 30.0f)) == 33u && frame_step(0, bits(-2.7f)) == 0xFFFFFFFEu);
+    g_frame_split = 2;
+    {
+        const uint32_t ms = bits(1000.0f / 60.0f);
+        const uint32_t a = frame_step(1, ms), b = frame_step(1, ms), c = frame_step(1, ms), d = frame_step(1, ms);
+        CHECK(a == 16u && b == 17u && c == 16u && d == 17u);
+        CHECK(frame_step(2, ms) == 16u);  // each step its own turn
+        CHECK(frame_step(3, bits(-1000.0f / 60.0f)) + frame_step(3, bits(-1000.0f / 60.0f)) == static_cast<uint32_t>(-33));
+    }
+    g_frame_split = 1;
     CHECK(fcnvsd(bits(0.5f)) == std::bit_cast<uint64_t>(0.5));
     CHECK(float_d(0x80000000u) == std::bit_cast<uint64_t>(-2147483648.0));
     // Double registers: DRn is FRn (high) and FRn+1.

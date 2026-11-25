@@ -53,6 +53,9 @@ public:
     bool wants_pause() const { return opening_ || open_; }
     // The internal resolution the game runs at (a change waits for the next start).
     void set_running_scale(unsigned scale) { running_scale_ = scale; }
+    // The game can be drawn at 60 pictures a second throughout (game::frame_rate_choice): the
+    // Display page offers the frame rate.
+    void offer_frame_rates(bool offer) { frame_rates_ = offer; }
     // Lines under the frame-time graph (where the time goes), from the main loop.
     void set_frame_details(std::vector<std::string> lines) { frame_details_ = std::move(lines); }
     bool frame_times_shown() const;
@@ -86,6 +89,7 @@ private:
     std::vector<SaveBackup> save_history_;
     std::string note_;           // said under the table (what moved where)
     unsigned running_scale_ = 1;
+    bool frame_rates_ = false;
 };
 
 }  // namespace dreamcast

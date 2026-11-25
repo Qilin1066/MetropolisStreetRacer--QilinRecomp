@@ -154,10 +154,10 @@ Settings default_settings() {
 }
 
 bool apply_preset(Settings& s, const std::string& name) {
-    if (name == "original" || name == "low-end") {  // the console's picture: 1x, its filtering (a Pi 4 does exactly this)
-        s.scale = 1, s.anisotropy = 1, s.msaa = 1, s.vsync = true;
-    } else if (name == "desktop") {  // a desktop GPU: the screen's height (auto), 16x anisotropic, 4x MSAA
-        s.scale = 0, s.anisotropy = 16, s.msaa = 4, s.vsync = true;
+    if (name == "original" || name == "low-end") {  // the console's picture: 1x, its filtering, its frame rate (a Pi 4 does exactly this)
+        s.scale = 1, s.anisotropy = 1, s.msaa = 1, s.vsync = true, s.frame_rate = 0;
+    } else if (name == "desktop") {  // a desktop GPU: the screen's height (auto), 16x anisotropic, 4x MSAA, 60 a second
+        s.scale = 0, s.anisotropy = 16, s.msaa = 4, s.vsync = true, s.frame_rate = 60;
     } else {
         return false;
     }
@@ -268,6 +268,10 @@ bool parse_settings(const std::string& text, Settings& out, std::string& error) 
                 if (!boolean(s.vsync)) return false;
             } else if (name == "low_latency") {
                 if (!boolean(s.low_latency)) return false;
+            } else if (name == "frame_rate") {
+                if (v == "original" || v == "30") s.frame_rate = 0;
+                else if (v == "60") s.frame_rate = 60;
+                else return fail("frame_rate is original or 60");
             } else if (name == "gpu") {
                 s.gpu = value;
             } else if (name == "performance_overlay") {
@@ -279,7 +283,7 @@ bool parse_settings(const std::string& text, Settings& out, std::string& error) 
             } else {
                 return fail("[display] has no '" + name +
                             "' (preset fullscreen monitor scaling smooth look scanlines mask internal_scale anisotropy msaa texture_packs "
-                            "dump_textures antialiasing fsr sharpness vsync low_latency gpu "
+                            "dump_textures antialiasing fsr sharpness vsync low_latency frame_rate gpu "
                             "performance_overlay match_refresh variable_refresh)");
             }
             continue;
@@ -386,6 +390,9 @@ std::string settings_text(const Settings& s) {
         "# picture waits for the display (false: one more, smoother where the GPU's time varies).\n"
         "vsync = " + b(s.vsync) + "\n"
         "low_latency = " + b(s.low_latency) + "\n"
+        "# Pictures a second: original, the game's own (where it draws fewer in places, as a racing game's\n"
+        "# races at 30), or 60 throughout, at the same speed (games that offer it).\n"
+        "frame_rate = " + (s.frame_rate == 60 ? std::string("60") : std::string("original")) + "\n"
         "# The graphics device, by name (empty: the best one).\n"
         "gpu = " + s.gpu + "\n"
         "# Frame rate, 1% and 0.1% lows and recent frame times in a corner (F3 switches it).\n"
