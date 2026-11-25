@@ -22,6 +22,7 @@
 #include "arm/lifter.hpp"
 #include "decoder.hpp"
 #include "drive.hpp"
+#include "romfont.hpp"
 #include "adx.hpp"
 #include "launcher.hpp"
 #include "gdrom.hpp"
@@ -1515,6 +1516,38 @@ void test_arm_lifter_jumps() {
     CHECK(code.contains("default: rt::stop(rt::Stop::BadJump, 0x00000028u, r); }"));
 }
 
+// The font served in place of the boot ROM's: the scaling, and the layout the game's library reads.
+void test_romfont() {
+    namespace rf = msr::romfont;
+    // A single pixel: a 3x3 block at three times the size, which halves to (0,0), (1,0) and (0,1)
+    // (two or more of their four pixels set) but not (1,1) (one).
+    std::vector<uint8_t> dot(8 * 16, 0);
+    dot[0] = 1;
+    const std::vector<uint8_t> s = rf::scale_glyph(dot, 8);
+    CHECK(s.size() == 12 * 24);
+    CHECK(s[0] == 1 && s[1] == 1 && s[12] == 1 && s[13] == 0 && s[2] == 0 && s[24] == 0);
+    // A vertical stroke stays one solid column band, all 24 rows.
+    std::vector<uint8_t> bar(16 * 16, 0);
+    for (int y = 0; y < 16; ++y) bar[size_t(y) * 16 + 8] = 1;
+    const std::vector<uint8_t> b = rf::scale_glyph(bar, 16);
+    bool solid = true;
+    for (int y = 0; y < 24; ++y) solid &= b[size_t(y) * 24 + 12] == 1 && b[size_t(y) * 24 + 2] == 0;
+    CHECK(b.size() == 24 * 24 && solid);
+    const std::vector<uint8_t>& f = rf::image();
+    CHECK(f.size() == rf::kGlyphBytes && rf::kWideStart == 0x2880u);
+    const auto blank = [&](uint32_t at, uint32_t n) {
+        for (uint32_t i = 0; i < n; ++i)
+            if (f[at + i]) return false;
+        return true;
+    };
+    CHECK(blank(0, rf::kNarrowBytes));                                         // ' '
+    CHECK(!blank(('A' - 32) * rf::kNarrowBytes, rf::kNarrowBytes));            // 'A'
+    CHECK(blank(rf::kWideStart, rf::kWideBytes));                              // JIS 0x2121, the ideographic space
+    CHECK(!blank(rf::kWideStart + 203 * rf::kWideBytes, rf::kWideBytes));      // JIS 0x2330, full-width 0 (the game's 203)
+    CHECK(!blank(rf::kWideStart + 658 * rf::kWideBytes, rf::kWideBytes));      // JIS 0x3021, the first kanji
+    CHECK(blank(rf::kWideStart + (7 * 94 - 1) * rf::kWideBytes, rf::kWideBytes));  // row 7's unassigned end
+}
+
 void test_folder_drive() {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "qilin_folder_drive_test";
@@ -1624,6 +1657,7 @@ int main() {
     test_adx();
     test_arm_decoder();
     test_arm_lifter_jumps();
+    test_romfont();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;

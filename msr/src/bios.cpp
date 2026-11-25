@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "drive.hpp"
+#include "romfont.hpp"
 #include "flash.hpp"
 #include "guest.hpp"
 #include "bus.hpp"
@@ -51,23 +52,32 @@ void sysinfo(rt::Context& c) {
 }
 
 // ROMFONT (vector 0x8C0000B4), r1 the function: 0 the font's address, 1 lock it (for the
-// caller's use), 2 unlock. The font is the boot ROM's own (Sega's; at 0xA0100020 on the console:
-// 12x24 and 24x24 glyphs, ISO 8859-1 and JIS X 0208, as KallistiOS's bfont describes), which this
-// project doesn't have and can't ship. The game draws Shift-JIS text with it (0x8C0B3808). Until
-// an openly licensed font is laid out the same way, the address given is that of a blank font
-// (every glyph empty: text drawn with it is invisible), and the first request says so.
-constexpr uint32_t kFontAddress = 0xA0100020u;
-uint32_t blank_font_read(uint32_t, unsigned) { return 0; }
-void blank_font_write(uint32_t a, uint32_t v, unsigned) { throw rt::Stop{rt::Stop::Unsupported, a, v}; }  // ROM
+// caller's use), 2 unlock. The boot ROM's own font is Sega's and can't be shipped. The game draws
+// all its dialog text, English included, from its 24x24 JIS X 0208 glyphs (0x8C0B3808, through
+// Sega's font library at 0x8C1406B4). The font given is GNU Unifont's glyphs in the same layout
+// (romfont.hpp; docs/runtime.md, "The boot ROM's font"). Past the glyphs, the library's tables
+// of icons (from offset 0x7E900) are blank, and the first read there says so.
+constexpr uint32_t kFontAddress = 0xA0100020u, kFontPhysical = 0x00100020u;
+uint32_t font_read(uint32_t a, unsigned n) {
+    const uint32_t p = a & 0x1FFFFFFFu;
+    if (p >= kFontPhysical && p - kFontPhysical + n <= romfont::kGlyphBytes) {
+        const uint8_t* b = romfont::image().data() + (p - kFontPhysical);
+        uint32_t v = 0;
+        for (unsigned i = 0; i < n; ++i) v |= uint32_t(b[i]) << (8 * i);
+        return v;
+    }
+    static bool said = false;
+    if (!said)
+        rt::log("msr: the game reads the boot ROM at %08X, outside the font's glyphs (the icons there are blank)", a);
+    said = true;
+    return 0;
+}
+void font_write(uint32_t a, uint32_t v, unsigned) { throw rt::Stop{rt::Stop::Unsupported, a, v}; }  // ROM
 void rom_font(rt::Context& c) {
     switch (c.r[1]) {
-    case 0: {
-        static bool said = false;
-        if (!said) rt::log("msr: the game asks for the boot ROM's font: it gets a blank one (its text is invisible)");
-        said = true;
+    case 0:
         c.r[0] = kFontAddress;
         return;
-    }
     case 1: c.r[0] = 0; return;
     case 2: return;
     default:
@@ -444,7 +454,7 @@ void install_bios(Drive& drive) {
     g_drive = &drive;
     rt::provide(kCalls);
     // The font's part of the boot ROM (its 2 MB at 0x00000000; the font about 0.5 MB from 0x100020).
-    rt::map({0x00100000u, 0x00200000u, "boot ROM font (blank)", blank_font_read, blank_font_write});
+    rt::map({0x00100000u, 0x00200000u, "boot ROM font (Unifont)", font_read, font_write});
     set_vector(0x8C0000B0u, kSysinfo);
     set_vector(0x8C0000B4u, kRomFont);
     set_vector(0x8C0000B8u, kFlash);

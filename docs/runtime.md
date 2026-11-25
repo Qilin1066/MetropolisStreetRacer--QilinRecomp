@@ -104,6 +104,23 @@ Each step: run `msr`, read where it stops, provide what it needs, run again.
    - ARM functions whose code reaches below their start.
 18. **Past Clock Settings** (2026-11-25, on the author's PC with the whole extracted disc, real sound archives included, headless). The sound driver stopped at once on "a return to an unexpected address": two kinds of computed jump into straight-line code that the ARM lifter took for returns (`docs/sound.md`). With them lifted as switches, the game runs at 60 pictures a second: Clock Settings waits 60 seconds with no input, then the KUDOS title card and the CRI Sofdec/ADX logos follow, and the title screen ("PRESS START BUTTON"). Left there, the game called `0x8C03B3E2`, a function the analysis had missed; with the hidden entries found (`docs/recompiler-core.md`) the attract demo plays: a 3D flyover of London ("London, Trafalgar, 12.39pm") and a recorded race, at 30 pictures a second, for as long as it was left (240 s).
 
+## The boot ROM's font
+
+The game asks the boot ROM for its font (ROMFONT, function 0) and reads glyphs from it through Sega's font library, linked into `MSR.BIN` at `0x8C1406B4`. The console's font is Sega's and can't be shipped, so `msr` serves GNU Unifont's glyphs in the same layout (`msr/src/romfont.*`, `bios.cpp`).
+
+**The layout**, from the library's code, which computes each glyph's offset from the font's start (`0xA0100020`):
+- narrow glyphs, 12x24, 36 bytes each, from offset 0: index `c - 32` for `c` = 32 to 127, `96 + c - 160` for 160 to 255 (ISO 8859-1); 288 slots;
+- wide glyphs, 24x24, 72 bytes each, from offset `0x2880`: JIS X 0208 rows 1 to 7 at `(row - 1) * 94 + cell - 1`, then rows 16 to 84 at `658 + (row - 16) * 94 + cell - 1` (row 8, box drawing, isn't there); 7,056 slots, ending at `0x7E900`;
+- then the library's two tables of icons: 22 of 24x24 at `0x7E900` and 32x32 ones at `0x7EF30` (its types 5 and 6). `msr` leaves these blank and logs the first read there; the game hasn't read them so far.
+
+Pixels are packed row after row, most significant bit first: the game's unpacking at `0x8C0B38D8` takes bit `7 - (x & 7)` of byte `y * 3 + x / 8` of a wide glyph.
+
+**What the game uses it for.** At start-up, before Clock Settings, `0x8C0B3394` (through `0x8C0B3808`, which accepts Shift-JIS `0x8140`-`0x8396` and `0x889F`-`0x9872` and reports anything else) builds an atlas of 396 wide glyphs: full-width digits and letters, kana and kanji. Read in order, they spell the game's Japanese strings ("この車２台デモレースがご覧になれます。", and so on). The English menus use the game's own font, and look the same with a blank ROM font. So this font shows only where the game draws its Japanese text, which needs the console's language to reach the game (below, and CLAUDE.md's next steps).
+
+**The glyphs.** `tools/make_romfont.py` takes GNU Unifont 18.0.01's Japanese variant (`unifont_jp-18.0.01.hex.gz`, SHA-256 checked), maps each slot's JIS X 0208 code to Unicode with Python's own EUC-JP codec, and writes the 8x16 and 16x16 glyphs in slot order to `msr/src/romfont_glyphs.inc` (committed, about 0.5 MB): 190 narrow, 6,847 wide, the rest of JIS's slots empty. JIS's Latin-1 symbols (´ ¨ ° ± × ÷ § ¶), half-width in Unifont, are centred in their wide cells; the soft hyphen has no glyph. When the game first reads the font, `msr` scales every glyph by 3/2: Scale3x (Andrea Mazzoleni's algorithm, as described at https://www.scale2x.it/algorithm) to three times the size, then each 2x2 block set if at least two of its pixels are. Unifont is GPL-2.0-or-later with the font embedding exception, and OFL-1.1; the generated file says so and stays under those terms.
+
+**The console's language.** `msr.ini`'s `[console] language` (and the menu's) isn't passed on yet: the game reads its language and sound mode through Shinobi from flash memory's settings partition, which starts blank, so it runs in its default, English. Toy Commander answers those Shinobi queries natively (its `shinobi_language` and friends); MSR's copies of them (Shinobi 1.68) haven't been found yet. `0x8C13733C` and its neighbours, which also read flash, are the backup library's.
+
 ## The Dreamcast and host layers
 
 `dreamcast/` and `host/` are Toy Commander--QilinRecomp's (2026-11-22, its commit `085a3fd`), kept in step. The changes made to fit this runtime:
