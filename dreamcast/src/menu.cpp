@@ -1,3 +1,4 @@
+#include "path.hpp"
 // The settings menu (menu.hpp), from Punch-Out's, kept in step. Runtime code: no std::format.
 #include "menu.hpp"
 
@@ -13,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "qilin/host/audio.hpp"
 #include "system.hpp"
 
 #ifndef QILIN_VERSION
@@ -112,6 +114,12 @@ Menu::~Menu() {
     if (ImGui::GetCurrentContext()) ImGui::DestroyContext();
 }
 
+bool Menu::take_reload_textures() {
+    const bool was = reload_textures_;
+    reload_textures_ = false;
+    return was;
+}
+
 bool Menu::take_controls_changed() {
     const bool was = controls_changed_;
     controls_changed_ = false;
@@ -154,7 +162,7 @@ bool Menu::handle(const void* event) {
             if (!e.key.repeat && e.key.key == SDLK_F3) {  // the frame-time readout, kept in the settings
                 s_.performance_overlay = !s_.performance_overlay;
                 if (!save_settings(folder_, s_))
-                    qilin::rt::log("the settings can't be saved to %s", settings_file(folder_).string().c_str());
+                    qilin::rt::log("the settings can't be saved to %s", qilin::utf8_path(settings_file(folder_)).c_str());
                 return true;
             }
             break;
@@ -201,7 +209,7 @@ void Menu::close() {
     if (open_) {
         s_.fullscreen = display_.fullscreen();
         if (!save_settings(folder_, s_))
-            qilin::rt::log("the settings can't be saved to %s", settings_file(folder_).string().c_str());
+            qilin::rt::log("the settings can't be saved to %s", qilin::utf8_path(settings_file(folder_)).c_str());
     }
     open_ = opening_ = peek_ = false;
     capture_ = -1;
@@ -264,7 +272,7 @@ void Menu::tick() {
             if (quit_) {
                 s_.fullscreen = display_.fullscreen();
                 if (!save_settings(folder_, s_))
-                    qilin::rt::log("the settings can't be saved to %s", settings_file(folder_).string().c_str());
+                    qilin::rt::log("the settings can't be saved to %s", qilin::utf8_path(settings_file(folder_)).c_str());
             } else {
                 close();
             }
@@ -484,6 +492,9 @@ void Menu::display_page() {
         ImGui::SameLine();
     }
     ImGui::Checkbox("Vsync", &s_.vsync);
+    ImGui::BeginDisabled(!s_.vsync);
+    ImGui::Checkbox("Low latency (with vsync: at most one frame waiting)", &s_.low_latency);
+    ImGui::EndDisabled();
     ImGui::Checkbox("Frame times (F3)", &s_.performance_overlay);
     ImGui::SeparatorText("Refresh rate");
     const bool was_match = s_.match_refresh, was_vrr = s_.variable_refresh;
@@ -528,6 +539,37 @@ void Menu::display_page() {
     ImGui::EndDisabled();
     if (limit <= 1.0f) ImGui::TextDisabled("This GPU has no anisotropic filtering.");
     else ImGui::TextDisabled("For the textures the game filters; its unfiltered ones stay as they are.");
+    const unsigned most = display_.gpu().max_samples;
+    static constexpr unsigned kSamples[] = {1, 2, 4, 8};
+    std::snprintf(label, sizeof label, s_.msaa == 1 ? "Off (the console's)" : "%ux", s_.msaa);
+    if (ImGui::BeginCombo("Anti-aliasing (MSAA)", label)) {
+        for (unsigned n : kSamples) {
+            if (n > most) continue;
+            std::snprintf(label, sizeof label, n == 1 ? "Off (the console's)" : "%ux", n);
+            if (ImGui::Selectable(label, s_.msaa == n)) s_.msaa = n;
+        }
+        ImGui::EndCombo();
+    }
+    if (s_.msaa > most) ImGui::TextDisabled("This GPU has up to %ux: %ux is used.", most, most);
+    else ImGui::TextDisabled("Smooths polygons' edges; more samples, more GPU work.");
+    ImGui::Checkbox("SMAA anti-aliasing", &s_.smaa);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(on the picture: every edge, the textures' too; with MSAA or a higher resolution, smoother still)");
+    ImGui::Checkbox("AMD FSR 1 upscaling", &s_.fsr);
+    ImGui::SameLine();
+    ImGui::TextDisabled(s_.scaling == host::Scaling::integer ? "(not at whole multiples)" : "(where the picture is shown larger than it's drawn)");
+    if (s_.fsr) {
+        int sharp = int(s_.sharpness);
+        if (ImGui::SliderInt("FSR sharpness", &sharp, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) s_.sharpness = unsigned(sharp);
+    }
+    ImGui::Checkbox("Texture packs", &s_.texture_packs);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!s_.texture_packs);
+    if (ImGui::Button("Reload")) reload_textures_ = true;
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("Replacements from textures/load in the data folder, named <width>x<height>_<hash>.png.");
+    ImGui::Checkbox("Dump textures", &s_.dump_textures);
+    ImGui::TextDisabled("Saves every texture the game draws to textures/dump, so named, to make a pack from.");
 
     ImGui::SeparatorText("Graphics device");
     const std::string chosen = s_.gpu.empty() ? "The best one" : s_.gpu;
@@ -577,13 +619,21 @@ void Menu::game_page() {
     int volume = int(s_.volume);
     if (ImGui::SliderInt("Volume", &volume, 0, 100, "%d%%", ImGuiSliderFlags_AlwaysClamp)) s_.volume = unsigned(volume);
     ImGui::Checkbox("Mute when another window has the keyboard", &s_.mute_unfocused);
+    // The playback device: the system's default (followed when it changes), or one by name.
+    static const std::vector<std::string> devices = host::AudioOut::playback_devices();
+    if (ImGui::BeginCombo("Sound device (from the next start)", s_.sound_device.empty() ? "The system's default" : s_.sound_device.c_str())) {
+        if (ImGui::Selectable("The system's default", s_.sound_device.empty())) s_.sound_device.clear();
+        for (const std::string& name : devices)
+            if (ImGui::Selectable(name.c_str(), s_.sound_device == name)) s_.sound_device = name;
+        ImGui::EndCombo();
+    }
 
     ImGui::SeparatorText("About");
     ImGui::TextWrapped(QILIN_APP_TITLE " QilinRecomp %s: a static recompilation, the game's own code compiled for this computer.",
                        QILIN_VERSION);
-    ImGui::TextWrapped("Graphics: Vulkan. Window, sound and input: SDL3 (zlib). Menu: Dear ImGui (MIT).");
-    ImGui::TextWrapped("Settings file: %s", settings_file(folder_).string().c_str());
-    ImGui::TextWrapped("Saves and the memory card: %s", folder_.string().c_str());
+    ImGui::TextWrapped("Graphics: Vulkan; SMAA and AMD FidelityFX FSR 1 (MIT). Window, sound and input: SDL3 (zlib). Menu: Dear ImGui (MIT).");
+    ImGui::TextWrapped("Settings file: %s", qilin::utf8_path(settings_file(folder_)).c_str());
+    ImGui::TextWrapped("Saves and the memory card: %s", qilin::utf8_path(folder_).c_str());
 }
 
 }  // namespace dreamcast

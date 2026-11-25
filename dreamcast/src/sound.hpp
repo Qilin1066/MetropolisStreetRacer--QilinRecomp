@@ -16,6 +16,7 @@
 // all: the sound chip's device functions hold it.
 #pragma once
 
+#include <string>
 #include <cstdint>
 #include <mutex>
 
@@ -54,6 +55,8 @@ CdState cd_state();
 // driver stand-in's per-frame work (aica.cpp).
 void set_tick(void (*tick)());
 
+// The playback device by name (the settings; empty: the system's default), before start.
+void set_device(std::string name);
 // The mixer thread and the host's output; after attach.
 void start();
 // The output's volume, 0 to 100, or muted (the settings).

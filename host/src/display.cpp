@@ -17,7 +17,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 
+#include "fsr/fsr_constants.hpp"
 #include "qilin/host/vulkan.hpp"
 #include "shaders.inc"
 
@@ -25,6 +27,33 @@ namespace qilin::host {
 
 namespace {
 constexpr VkFormat kFrameFormat = VK_FORMAT_R8G8B8A8_UNORM;
+
+// SMAA and FSR 1 for the picture (Picture::smaa, Picture::fsr), from Grabbed by the
+// Ghoulies--QilinRecomp's present pass (same owner): the SPIR-V compiled once from the upstream
+// sources (tools/smaa_spirv.sh, tools/fsr_spirv.sh), SMAA's two lookup tables from its headers
+// (fetched at configure time, THIRD_PARTY.md).
+namespace fsr_spirv {
+#include "fsr/fsr_spirv.inc"
+}  // namespace fsr_spirv
+namespace smaa_spirv {
+#include "smaa/smaa_spirv.inc"
+}  // namespace smaa_spirv
+namespace smaa_tables {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-variable"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#endif
+#include "AreaTex.h"
+#include "SearchTex.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+}  // namespace smaa_tables
 
 VkSurfaceKHR make_sdl_surface(VkInstance instance, void* window) {
     VkSurfaceKHR s = VK_NULL_HANDLE;
@@ -116,6 +145,7 @@ struct Display::Impl {
     Image target;     // headless: what's presented
     bool need_rebuild = false;
     bool vsync_built = true;  // the present mode the swapchain has
+    bool low_latency_built = true;  // and its image count's rule
     // With vsync and VK_KHR_present_wait: each present has an id, and the next
     // frame waits until the one before is on screen, so at most one waits in
     // the queue (a frame less latency than a full FIFO queue). 0: none yet on
@@ -138,6 +168,7 @@ struct Display::Impl {
         Display::PadState state;  // as of the last poll
         uint32_t buttons = 0;     // with the stick's ways and the triggers as buttons
         uint16_t rumble_level = 0;
+        uint64_t rumble_refreshed = 0;
         bool pressed = false;  // a button seen since it was opened (said once)
     };
     std::vector<Pad> pads;
@@ -180,6 +211,7 @@ struct Display::Impl {
             if (pads[i].id == id) {
                 const char* name = SDL_GetGamepadName(pads[i].pad);
                 say("controllers: \"%s\" disconnected", name ? name : "the controller");
+                SDL_RumbleGamepad(pads[i].pad, 0, 0, 0);
                 SDL_CloseGamepad(pads[i].pad);
                 pads.erase(pads.begin() + static_cast<std::ptrdiff_t>(i));
                 return;
@@ -219,6 +251,19 @@ struct Display::Impl {
     VkSampler linear = VK_NULL_HANDLE, nearest = VK_NULL_HANDLE;
     VkFormat pipeline_format = VK_FORMAT_UNDEFINED;
     VkPipeline pipelines[2] = {};  // by Look
+
+    // SMAA 1x (three passes at the picture's own size: edges, blending weights, the blend) and
+    // FSR 1 (EASU to the size it's shown at, then RCAS), made at first use; their images made
+    // again when the sizes change. This present's: whether each runs (show), for record.
+    VkDescriptorPool fx_pool = VK_NULL_HANDLE;
+    VkDescriptorSetLayout smaa_set_layout = VK_NULL_HANDLE, fsr_set_layout = VK_NULL_HANDLE;
+    VkPipelineLayout smaa_layout = VK_NULL_HANDLE, fsr_layout = VK_NULL_HANDLE;
+    VkPipeline smaa_pipelines[3] = {}, fsr_pipelines[2] = {};
+    VkDescriptorSet smaa_sets[3] = {}, fsr_sets[2] = {};
+    Image smaa_images[3], fsr_images[2];
+    Image smaa_area, smaa_search;  // SMAA's lookup tables
+    bool run_smaa = false, run_fsr = false;
+    uint32_t fx_w = 0, fx_h = 0;  // the picture's size, for record_fx
 
     // What was shown last, for present_again.
     VkImage last_image = VK_NULL_HANDLE;  // null: the uploaded frame
@@ -369,9 +414,14 @@ struct Display::Impl {
                                    : has(VK_PRESENT_MODE_IMMEDIATE_KHR) ? VK_PRESENT_MODE_IMMEDIATE_KHR
                                                                         : VK_PRESENT_MODE_FIFO_KHR;
         vsync_built = picture.vsync;
+        low_latency_built = picture.low_latency;
         VkSwapchainCreateInfoKHR sci{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         sci.surface = surface;
-        sci.minImageCount = std::min(caps.minImageCount + 1, caps.maxImageCount ? caps.maxImageCount : 8u);
+        // Low latency with vsync: the fewest images FIFO allows (two at least), so at most one
+        // finished picture waits for the display; otherwise one more than the least.
+        const uint32_t least = std::max(caps.minImageCount, 2u);
+        const uint32_t want = picture.vsync && picture.low_latency ? least : least + 1;
+        sci.minImageCount = std::min(want, caps.maxImageCount ? caps.maxImageCount : 8u);
         sci.imageFormat = chosen.format;
         sci.imageColorSpace = chosen.colorSpace;
         sci.imageExtent = extent;
@@ -409,6 +459,293 @@ struct Display::Impl {
         waitable_id = 0;  // ids belong to a swapchain
     }
 
+    // A one-off copy of `bytes` into a whole image (SMAA's tables), left SHADER_READ_ONLY.
+    void upload_once(const Image& im, const void* bytes, VkDeviceSize size) {
+        Buffer b = Buffer::host_visible(gpu, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memcpy(b.mapped, bytes, size_t(size));
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        VkCommandBuffer one = VK_NULL_HANDLE;
+        check(vkAllocateCommandBuffers(gpu.device, &cai, &one), "vkAllocateCommandBuffers");
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        check(vkBeginCommandBuffer(one, &bi), "vkBeginCommandBuffer");
+        transition(one, im.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent = {im.width, im.height, 1};
+        vkCmdCopyBufferToImage(one, b.buffer, im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        transition(one, im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        check(vkEndCommandBuffer(one), "vkEndCommandBuffer");
+        VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        cbi.commandBuffer = one;
+        VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+        si.commandBufferInfoCount = 1;
+        si.pCommandBufferInfos = &cbi;
+        check(vkQueueSubmit2(gpu.queue, 1, &si, VK_NULL_HANDLE), "vkQueueSubmit2");
+        check(vkQueueWaitIdle(gpu.queue), "vkQueueWaitIdle");
+        vkFreeCommandBuffers(gpu.device, pool, 1, &one);
+        b.destroy(gpu);
+    }
+
+    VkShaderModule module_of(std::span<const uint32_t> code) { return module(gpu, code.data(), code.size_bytes()); }
+
+    // The sets both effects use, from one pool: SMAA's three passes (three images each) and FSR's two.
+    void make_fx_pool() {
+        if (fx_pool) return;
+        const VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 9 + 2}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2}};
+        VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpi.maxSets = 5;
+        dpi.poolSizeCount = 2;
+        dpi.pPoolSizes = sizes;
+        check(vkCreateDescriptorPool(gpu.device, &dpi, nullptr, &fx_pool), "vkCreateDescriptorPool");
+    }
+    VkDescriptorSet allocate_set(VkDescriptorSetLayout l) {
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = fx_pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &l;
+        VkDescriptorSet made = VK_NULL_HANDLE;
+        check(vkAllocateDescriptorSets(gpu.device, &ai, &made), "vkAllocateDescriptorSets");
+        return made;
+    }
+
+    // SMAA's pipelines, sets and tables (once), and its images at the picture's size.
+    void smaa_objects(uint32_t width, uint32_t height) {
+        if (!smaa_layout) {
+            make_fx_pool();
+            VkDescriptorSetLayoutBinding b[3]{};
+            for (uint32_t i = 0; i < 3; ++i) b[i] = {i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+            VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            sl.bindingCount = 3;
+            sl.pBindings = b;
+            check(vkCreateDescriptorSetLayout(gpu.device, &sl, nullptr, &smaa_set_layout), "vkCreateDescriptorSetLayout");
+            const VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16};
+            VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            pl.setLayoutCount = 1;
+            pl.pSetLayouts = &smaa_set_layout;
+            pl.pushConstantRangeCount = 1;
+            pl.pPushConstantRanges = &push;
+            check(vkCreatePipelineLayout(gpu.device, &pl, nullptr, &smaa_layout), "vkCreatePipelineLayout");
+            const std::span<const uint32_t> code[3][2] = {{smaa_spirv::kSmaa1_vert, smaa_spirv::kSmaa1_frag},
+                                                          {smaa_spirv::kSmaa2_vert, smaa_spirv::kSmaa2_frag},
+                                                          {smaa_spirv::kSmaa3_vert, smaa_spirv::kSmaa3_frag}};
+            for (uint32_t pass = 0; pass < 3; ++pass) {
+                VkShaderModule modules[2] = {module_of(code[pass][0]), module_of(code[pass][1])};
+                VkPipelineShaderStageCreateInfo stages[2]{{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+                                                          {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO}};
+                for (int i = 0; i < 2; ++i) {
+                    stages[i].stage = i ? VK_SHADER_STAGE_FRAGMENT_BIT : VK_SHADER_STAGE_VERTEX_BIT;
+                    stages[i].module = modules[i];
+                    stages[i].pName = "main";
+                }
+                VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+                VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+                ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+                VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+                vp.viewportCount = vp.scissorCount = 1;
+                VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+                rs.polygonMode = VK_POLYGON_MODE_FILL;
+                rs.cullMode = VK_CULL_MODE_NONE;
+                rs.lineWidth = 1.0f;
+                VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+                ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+                VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+                VkPipelineColorBlendAttachmentState att{};
+                att.colorWriteMask = 0xF;
+                VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+                cb.attachmentCount = 1;
+                cb.pAttachments = &att;
+                const VkDynamicState dynamic[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+                VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+                dyn.dynamicStateCount = 2;
+                dyn.pDynamicStates = dynamic;
+                const VkFormat format = kFrameFormat;
+                VkPipelineRenderingCreateInfo ri{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+                ri.colorAttachmentCount = 1;
+                ri.pColorAttachmentFormats = &format;
+                VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri};
+                info.stageCount = 2;
+                info.pStages = stages;
+                info.pVertexInputState = &vi;
+                info.pInputAssemblyState = &ia;
+                info.pViewportState = &vp;
+                info.pRasterizationState = &rs;
+                info.pMultisampleState = &ms;
+                info.pDepthStencilState = &ds;
+                info.pColorBlendState = &cb;
+                info.pDynamicState = &dyn;
+                info.layout = smaa_layout;
+                check(vkCreateGraphicsPipelines(gpu.device, VK_NULL_HANDLE, 1, &info, nullptr, &smaa_pipelines[pass]), "vkCreateGraphicsPipelines");
+                for (VkShaderModule m : modules) vkDestroyShaderModule(gpu.device, m, nullptr);
+                smaa_sets[pass] = allocate_set(smaa_set_layout);
+            }
+            // The area table (two channels a texel) and the search table (one), as RGBA8.
+            std::vector<uint8_t> area(size_t{AREATEX_WIDTH} * AREATEX_HEIGHT * 4), search(size_t{SEARCHTEX_WIDTH} * SEARCHTEX_HEIGHT * 4);
+            for (size_t i = 0; i < size_t{AREATEX_WIDTH} * AREATEX_HEIGHT; ++i)
+                area[i * 4] = smaa_tables::areaTexBytes[i * 2], area[i * 4 + 1] = smaa_tables::areaTexBytes[i * 2 + 1];
+            for (size_t i = 0; i < size_t{SEARCHTEX_WIDTH} * SEARCHTEX_HEIGHT; ++i) search[i * 4] = smaa_tables::searchTexBytes[i];
+            constexpr VkImageUsageFlags kTable = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            smaa_area = Image::create(gpu, AREATEX_WIDTH, AREATEX_HEIGHT, kFrameFormat, kTable);
+            smaa_search = Image::create(gpu, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, kFrameFormat, kTable);
+            upload_once(smaa_area, area.data(), area.size());
+            upload_once(smaa_search, search.data(), search.size());
+        }
+        if (smaa_images[0].width == width && smaa_images[0].height == height) return;
+        check(vkDeviceWaitIdle(gpu.device), "vkDeviceWaitIdle");  // the old ones may still be read
+        for (Image& im : smaa_images) {
+            im.destroy(gpu);
+            im = Image::create(gpu, width, height, kFrameFormat, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        }
+    }
+
+    // FSR's pipelines and sets (once), and its images at the size the picture is shown at.
+    void fsr_objects(uint32_t width, uint32_t height) {
+        if (!fsr_layout) {
+            make_fx_pool();
+            VkDescriptorSetLayoutBinding b[2]{};
+            b[0] = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            b[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+            VkDescriptorSetLayoutCreateInfo sl{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            sl.bindingCount = 2;
+            sl.pBindings = b;
+            check(vkCreateDescriptorSetLayout(gpu.device, &sl, nullptr, &fsr_set_layout), "vkCreateDescriptorSetLayout");
+            const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, 80};
+            VkPipelineLayoutCreateInfo pl{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            pl.setLayoutCount = 1;
+            pl.pSetLayouts = &fsr_set_layout;
+            pl.pushConstantRangeCount = 1;
+            pl.pPushConstantRanges = &push;
+            check(vkCreatePipelineLayout(gpu.device, &pl, nullptr, &fsr_layout), "vkCreatePipelineLayout");
+            const std::span<const uint32_t> code[2] = {fsr_spirv::kFsr_easu, fsr_spirv::kFsr_rcas};
+            for (int i = 0; i < 2; ++i) {
+                const VkShaderModule m = module_of(code[i]);
+                VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+                ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+                ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+                ci.stage.module = m;
+                ci.stage.pName = "main";
+                ci.layout = fsr_layout;
+                check(vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &ci, nullptr, &fsr_pipelines[i]), "vkCreateComputePipelines");
+                vkDestroyShaderModule(gpu.device, m, nullptr);
+                fsr_sets[i] = allocate_set(fsr_set_layout);
+            }
+        }
+        if (fsr_images[0].width == width && fsr_images[0].height == height) return;
+        check(vkDeviceWaitIdle(gpu.device), "vkDeviceWaitIdle");
+        for (Image& im : fsr_images) {
+            im.destroy(gpu);
+            im = Image::create(gpu, width, height, kFrameFormat, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        }
+    }
+
+    void write_sets(VkDescriptorSet to, const VkDescriptorImageInfo* images, const VkDescriptorType* types, uint32_t n) {
+        VkWriteDescriptorSet w[3]{};
+        for (uint32_t i = 0; i < n; ++i) {
+            w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w[i].dstSet = to;
+            w[i].dstBinding = i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = types[i];
+            w[i].pImageInfo = &images[i];
+        }
+        vkUpdateDescriptorSets(gpu.device, n, w, 0, nullptr);
+    }
+
+    // This present's effects (after the fence: no set is in use): which run, their sets written
+    // for `view` (the picture, sw x sh) and the shown size; returns the view to show.
+    VkImageView prepare_fx(VkImageView view, uint32_t sw, uint32_t sh, VkExtent2D shown) {
+        run_smaa = picture.smaa;
+        // FSR where the picture is shown larger than it is, not at whole multiples (it would only blur).
+        run_fsr = picture.fsr && picture.scaling != Scaling::integer && shown.width && shown.height &&
+                  (shown.width > sw || shown.height > sh);
+        const VkImageLayout read = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        constexpr VkDescriptorType kSampled = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        if (run_smaa) {
+            smaa_objects(sw, sh);
+            // What each pass reads: the colour; the edges, the area and search tables; the colour and the weights.
+            const VkDescriptorImageInfo in[3][3] = {
+                {{linear, view, read}, {linear, smaa_area.view, read}, {nearest, smaa_search.view, read}},
+                {{linear, smaa_images[0].view, read}, {linear, smaa_area.view, read}, {nearest, smaa_search.view, read}},
+                {{linear, view, read}, {linear, smaa_images[1].view, read}, {nearest, smaa_search.view, read}}};
+            const VkDescriptorType types[3] = {kSampled, kSampled, kSampled};
+            for (uint32_t pass = 0; pass < 3; ++pass) write_sets(smaa_sets[pass], in[pass], types, 3);
+            view = smaa_images[2].view;
+        }
+        if (run_fsr) {
+            fsr_objects(shown.width, shown.height);
+            const VkDescriptorType types[2] = {kSampled, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+            const VkDescriptorImageInfo easu[2] = {{linear, view, read}, {VK_NULL_HANDLE, fsr_images[0].view, VK_IMAGE_LAYOUT_GENERAL}};
+            const VkDescriptorImageInfo rcas[2] = {{linear, fsr_images[0].view, read}, {VK_NULL_HANDLE, fsr_images[1].view, VK_IMAGE_LAYOUT_GENERAL}};
+            write_sets(fsr_sets[0], easu, types, 2);
+            write_sets(fsr_sets[1], rcas, types, 2);
+            view = fsr_images[1].view;
+        }
+        return view;
+    }
+
+    // The effects' commands, with the picture (sw x sh) ready to sample.
+    void record_fx(uint32_t sw, uint32_t sh) {
+        if (run_smaa) {
+            const float metrics[4] = {1.0f / float(sw), 1.0f / float(sh), float(sw), float(sh)};
+            for (uint32_t pass = 0; pass < 3; ++pass) {
+                const Image& out = smaa_images[pass];
+                transition(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+                VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+                ca.imageView = out.view;
+                ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                ca.loadOp = pass == 2 ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_CLEAR;  // edge detection discards the rest
+                ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+                ri.renderArea = {{0, 0}, {out.width, out.height}};
+                ri.layerCount = 1;
+                ri.colorAttachmentCount = 1;
+                ri.pColorAttachments = &ca;
+                vkCmdBeginRendering(cmd, &ri);
+                const VkViewport vp{0, 0, float(out.width), float(out.height), 0, 1};
+                const VkRect2D all{{0, 0}, {out.width, out.height}};
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, smaa_pipelines[pass]);
+                vkCmdSetViewport(cmd, 0, 1, &vp);
+                vkCmdSetScissor(cmd, 0, 1, &all);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, smaa_layout, 0, 1, &smaa_sets[pass], 0, nullptr);
+                vkCmdPushConstants(cmd, smaa_layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof metrics, metrics);
+                vkCmdDraw(cmd, 3, 1, 0, 0);
+                vkCmdEndRendering(cmd);
+                transition(cmd, out.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
+        }
+        if (run_fsr) {
+            for (uint32_t pass = 0; pass < 2; ++pass) {
+                const Image& out = fsr_images[pass];
+                transition(cmd, out.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+                uint32_t push[20] = {};
+                if (pass == 0) fsr::easu_constants(sw, sh, out.width, out.height, push);
+                else fsr::rcas_constants(picture.sharpness, push);
+                push[16] = out.width, push[17] = out.height;
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fsr_pipelines[pass]);
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fsr_layout, 0, 1, &fsr_sets[pass], 0, nullptr);
+                vkCmdPushConstants(cmd, fsr_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof push, push);
+                vkCmdDispatch(cmd, (out.width + 15) / 16, (out.height + 15) / 16, 1);  // a 16x16 tile a group
+                transition(cmd, out.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
+        }
+    }
+
+    void destroy_fx() {
+        for (Image& im : smaa_images) im.destroy(gpu);
+        for (Image& im : fsr_images) im.destroy(gpu);
+        smaa_area.destroy(gpu), smaa_search.destroy(gpu);
+        for (VkPipeline p : smaa_pipelines) if (p) vkDestroyPipeline(gpu.device, p, nullptr);
+        for (VkPipeline p : fsr_pipelines) if (p) vkDestroyPipeline(gpu.device, p, nullptr);
+        if (smaa_layout) vkDestroyPipelineLayout(gpu.device, smaa_layout, nullptr);
+        if (fsr_layout) vkDestroyPipelineLayout(gpu.device, fsr_layout, nullptr);
+        if (smaa_set_layout) vkDestroyDescriptorSetLayout(gpu.device, smaa_set_layout, nullptr);
+        if (fsr_set_layout) vkDestroyDescriptorSetLayout(gpu.device, fsr_set_layout, nullptr);
+        if (fx_pool) vkDestroyDescriptorPool(gpu.device, fx_pool, nullptr);
+    }
+
     // The picture's place in a target this size: see Scaling.
     VkRect2D place(VkExtent2D size, float aspect, uint32_t lines) const {
         const float W = float(size.width), H = float(size.height);
@@ -438,6 +775,7 @@ struct Display::Impl {
         } else {  // drawn by the caller: wait for it
             transition(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         }
+        record_fx(fx_w, fx_h);
         transition(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         VkRenderingAttachmentInfo color{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         color.imageView = dst_view;
@@ -483,8 +821,8 @@ Display::Display(const Options& options) : impl_(std::make_unique<Impl>()) {
         d.target = Image::create(d.gpu, options.width, options.height, kFrameFormat,
                                  VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     } else {
-        // Controllers work whichever window has the focus (the game is often
-        // started from a console, which may keep it).
+        // Keep discovering hotplug events in the background. poll() still
+        // suppresses controls and rumble while another window has focus.
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
         if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) die("SDL can't start: %s", SDL_GetError());
         d.log_input = std::getenv("QILIN_INPUT_LOG") != nullptr;
@@ -539,6 +877,7 @@ Display::~Display() {
         d.frame.destroy(d.gpu);
         d.target.destroy(d.gpu);
         d.destroy_pipelines();
+        d.destroy_fx();
         vkDestroySampler(d.gpu.device, d.linear, nullptr);
         vkDestroySampler(d.gpu.device, d.nearest, nullptr);
         vkDestroyDescriptorPool(d.gpu.device, d.dpool, nullptr);
@@ -561,7 +900,7 @@ Display::~Display() {
     d.pads.clear();
     if (d.window) {
         SDL_DestroyWindow(d.window);
-        SDL_Quit();
+        SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
     }
 }
 
@@ -635,7 +974,8 @@ bool Display::poll() {
         if (y > 16384) held |= kPadDown;
         pad.buttons = held;
         b |= held;
-        if (!pad.pressed && held) {
+        if (pad.pressed || held) {
+            const bool first_press = !pad.pressed;
             pad.pressed = true;
             const char* name = SDL_GetGamepadName(p);
             if (d.place_of(pad.key) < 0) {
@@ -645,7 +985,7 @@ bool Display::poll() {
                 if (place < d.joined.size()) d.joined[place] = pad.key;
                 else if (place < Impl::kPlaces) d.joined.push_back(pad.key);
                 if (place < Impl::kPlaces) say("controllers: \"%s\" works (buttons 0x%x): port %c", name ? name : "the controller", held, char('A' + place));
-                else say("controllers: \"%s\" works, but the four ports are taken", name ? name : "the controller");
+                else if (first_press) say("controllers: \"%s\" works, but the four ports are taken", name ? name : "the controller");
             }
         }
         // The right stick (a dead zone of a quarter, then linear to 1): whichever pad's is pushed furthest.
@@ -673,6 +1013,12 @@ bool Display::key_down(int code) const {
     int n = 0;
     const bool* k = SDL_GetKeyboardState(&n);
     return code < n && k[code];
+}
+float Display::screen_aspect() const {
+    if (!impl_->window) return float(impl_->options.width) / float(impl_->options.height);
+    int w = 0, h = 0;
+    SDL_GetWindowSizeInPixels(impl_->window, &w, &h);
+    return w > 0 && h > 0 ? float(w) / float(h) : 0.0f;
 }
 bool Display::focused() const { return impl_->window && (SDL_GetWindowFlags(impl_->window) & SDL_WINDOW_INPUT_FOCUS); }
 Display::PadState Display::pad_state() const { return pad_state(0); }
@@ -712,11 +1058,14 @@ void Display::rumble(unsigned player, float strength) {
     Impl& d = *impl_;
     Impl::Pad* p = player < Impl::kPlaces ? d.at_place(player) : nullptr;
     if (!p) return;
-    if (!focused()) strength = 0.0f;  // not while another window has the keyboard
+    if (!focused() || !std::isfinite(strength)) strength = 0.0f;  // not while another window has the keyboard
     const uint16_t level = static_cast<uint16_t>(std::clamp(strength, 0.0f, 1.0f) * 65535.0f + 0.5f);
-    if (level == p->rumble_level) return;
-    p->rumble_level = level;
-    SDL_RumbleGamepad(p->pad, level, level, level ? 60000 : 0);
+    const uint64_t now = SDL_GetTicksNS();
+    if (level == p->rumble_level && (!level || now - p->rumble_refreshed < 100'000'000)) return;
+    if (SDL_RumbleGamepad(p->pad, level, level, level ? 300 : 0)) {
+        p->rumble_level = level;
+        p->rumble_refreshed = now;
+    }
 }
 
 void Display::Impl::show(VkImage src, VkImageView view, uint32_t sw, uint32_t sh, float aspect, uint32_t lines) {
@@ -727,7 +1076,7 @@ void Display::Impl::show(VkImage src, VkImageView view, uint32_t sw, uint32_t sh
     VkExtent2D dst_size;
     uint32_t index = 0;
     if (d.window) {
-        if (d.need_rebuild || d.vsync_built != d.picture.vsync) d.build_swapchain();
+        if (d.need_rebuild || d.vsync_built != d.picture.vsync || d.low_latency_built != d.picture.low_latency) d.build_swapchain();
         if (d.extent.width == 0) return;  // minimised
         const auto waited_from = std::chrono::steady_clock::now();
         if (d.gpu.present_wait && d.vsync_built && d.waitable_id) {
@@ -755,10 +1104,13 @@ void Display::Impl::show(VkImage src, VkImageView view, uint32_t sw, uint32_t sh
         dst_view = d.target.view;
         dst_size = {d.target.width, d.target.height};
     }
-    // The source, through the sampler the settings ask for (the fence was
-    // waited for: the set isn't in use).
-    VkDescriptorImageInfo ii{d.picture.smooth || d.picture.look == Look::crt ? d.linear : d.nearest,
-                             src ? view : d.frame.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    // The source (through SMAA and FSR where they're on), through the sampler the settings ask
+    // for; FSR's is the size it's shown at, sampled smoothly (the fence was waited for: no set
+    // is in use).
+    d.fx_w = src ? sw : d.frame.width, d.fx_h = src ? sh : d.frame.height;
+    const VkImageView shown = d.prepare_fx(src ? view : d.frame.view, d.fx_w, d.fx_h, d.place(dst_size, aspect, lines).extent);
+    VkDescriptorImageInfo ii{d.picture.smooth || d.picture.look == Look::crt || d.run_fsr ? d.linear : d.nearest, shown,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkWriteDescriptorSet wr{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     wr.dstSet = d.set;
     wr.descriptorCount = 1;

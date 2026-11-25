@@ -1,0 +1,57 @@
+#version 450
+// AMD FidelityFX Super Resolution 1 (MIT; its headers fetched at configure time, THIRD_PARTY.md) for the present
+// pass: EASU scales the frame up to the size it's shown at, RCAS sharpens
+// the result. 32-bit floats throughout (16-bit ones aren't everywhere, the
+// Raspberry Pi's V3D among them). Built with -DEASU or -DRCAS into
+// fsr_spirv.inc by tools/fsr_spirv.sh; nothing compiles at run time.
+#extension GL_GOOGLE_include_directive : enable
+
+layout(push_constant) uniform Constants {
+    uvec4 con0;  // EASU: FsrEasuCon's four; RCAS: FsrRcasCon's in con0
+    uvec4 con1;
+    uvec4 con2;
+    uvec4 con3;
+    uvec4 size;  // the output's width and height
+};
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D target;
+
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+
+#if defined(EASU)
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { return textureGather(source, p, 0); }
+AF4 FsrEasuGF(AF2 p) { return textureGather(source, p, 1); }
+AF4 FsrEasuBF(AF2 p) { return textureGather(source, p, 2); }
+#elif defined(RCAS)
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { return texelFetch(source, p, 0); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#endif
+#include "ffx_fsr1.h"
+
+void apply(AU2 pos) {
+    if (pos.x >= size.x || pos.y >= size.y) return;
+    AF3 c;
+#if defined(EASU)
+    FsrEasuF(c, pos, con0, con1, con2, con3);
+#else
+    FsrRcasF(c.r, c.g, c.b, pos, con0);
+#endif
+    imageStore(target, ASU2(pos), AF4(c, 1));
+}
+
+// 64 threads, each four pixels of a 16×16 tile, as AMD's sample does.
+layout(local_size_x = 64) in;
+void main() {
+    AU2 p = ARmp8x8(gl_LocalInvocationID.x) + AU2(gl_WorkGroupID.x << 4u, gl_WorkGroupID.y << 4u);
+    apply(p);
+    p.x += 8u;
+    apply(p);
+    p.y += 8u;
+    apply(p);
+    p.x -= 8u;
+    apply(p);
+}

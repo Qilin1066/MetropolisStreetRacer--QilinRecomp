@@ -7,16 +7,26 @@
 #include "renderer.hpp"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
+#include <deque>
 #include <iterator>
 #include <map>
+#include <mutex>
+#include <set>
+#include <string>
+#include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
 #include "guest.hpp"
+#include "qilin/host/image.hpp"
 #include "shaders.inc"
 #include "texture.hpp"
 
@@ -43,7 +53,7 @@ struct Push {
     uint32_t flags;
     float alpha_ref;
     uint32_t sort_word;  // sorted translucent draws: the blend factors (bits 31-29, 28-26), the draw's place (25-0)
-    float unused;
+    float shift;    // the draw's x on screen: x times screen[3] plus this (the widened picture, Source::widen)
     float clip[4];  // the user tile clip, scene pixels: x0, y0, x1, y1 (exclusive)
 };
 
@@ -72,7 +82,7 @@ constexpr uint32_t sampler_bits(uint32_t tsp) { return ((tsp >> 13) & 0x3Fu) | (
 enum class Stencil : uint8_t { off, mark_none, mark_shadow, volume, resolve, shade };
 
 struct Draw {
-    uint32_t first = 0, count = 0;  // vertices
+    uint32_t first = 0, count = 0;  // indices (three a triangle)
     uint32_t pipeline = 0;          // the pipeline's key
     VkDescriptorSet set = VK_NULL_HANDLE;
     uint32_t flags = 0;
@@ -81,9 +91,10 @@ struct Draw {
     Stencil stencil = Stencil::off;
     uint32_t clip = 0;  // the user tile clip's rectangle, a byte each (tiles), when the flags use it
     uint32_t sort_word = 0;  // pvr.frag's, for a sorted translucent draw
+    bool overlay = false;    // a 2D overlay: not widened with the scene (Source::widen), centred
     bool same_state(const Draw& o) const {
         return pipeline == o.pipeline && set == o.set && flags == o.flags && depth == o.depth && depth_write == o.depth_write &&
-               stencil == o.stencil && clip == o.clip && sort_word == o.sort_word;
+               stencil == o.stencil && clip == o.clip && sort_word == o.sort_word && overlay == o.overlay;
     }
 };
 
@@ -136,21 +147,162 @@ struct Texture {
     uint64_t palette_hash = 0;
     uint32_t bytes = 0;
     uint64_t used = 0;  // the frame it was last checked in
+    uint64_t pack = 0;  // the hash it has a texture pack's replacement for (0: none)
     struct Set {
         uint32_t bits;  // the sampler's
         VkDescriptorSet set;
-        VkDescriptorPool pool;  // what it came from, to free it to
+        VkDescriptorPool pool;  // the one it came from, to give it back
     };
     std::vector<Set> sets;
 };
-// A texture no polygon has named for this many frames (a minute at 60) is let go: its image and
-// sets are freed, and it is decoded again if it comes back.
-constexpr uint64_t kTextureIdleFrames = 3600, kTextureSweepEvery = 600;
+
+// A texture no render has used for this many is let go (its image, memory
+// and descriptor sets): the cache holds what the game is drawing with, not
+// everything it ever drew (levels, menus and movies would otherwise add up
+// until the device's allocation count ran out). One that comes back is
+// decoded again. Looked at every kEvictEvery renders.
+constexpr uint64_t kTextureAge = 1200, kEvictEvery = 64;
 
 uint64_t hash_words(const uint32_t* w, uint32_t n, uint64_t h) {
     for (uint32_t k = 0; k < n; ++k) h = (h ^ w[k]) * 0x100000001B3ull;
     return h;
 }
+uint64_t hash_bytes(const uint8_t* b, size_t n, uint64_t h) {
+    for (size_t k = 0; k < n; ++k) h = (h ^ b[k]) * 0x100000001B3ull;
+    return h;
+}
+
+}  // namespace
+
+std::string pack_name(uint32_t width, uint32_t height, uint64_t hash) {
+    char name[64];
+    std::snprintf(name, sizeof name, "%ux%u_%016llx.png", width, height, static_cast<unsigned long long>(hash));
+    return name;
+}
+
+bool pack_hash(const std::string& name, uint64_t& hash) {
+    unsigned w = 0, h = 0;
+    char hex[17] = {}, rest[8] = {};
+    if (std::sscanf(name.c_str(), "%5ux%5u_%16[0-9a-fA-F]%7s", &w, &h, hex, rest) != 4 || std::strlen(hex) != 16) return false;
+    const std::string ext = rest;
+    if (ext != ".png" && ext != ".PNG") return false;
+    hash = std::strtoull(hex, nullptr, 16);
+    return true;
+}
+
+namespace {
+
+// The levels below a replacement's largest, each the average of 2x2 of the
+// one above (a side of 1 stays 1), after it in `px`.
+void mip_chain(std::vector<uint32_t>& px, uint32_t width, uint32_t height, uint32_t levels) {
+    size_t from = 0;
+    for (uint32_t l = 1; l < levels; ++l) {
+        const uint32_t w = std::max(width >> (l - 1), 1u), h = std::max(height >> (l - 1), 1u);
+        const uint32_t nw = std::max(w / 2, 1u), nh = std::max(h / 2, 1u);
+        const size_t to = px.size();
+        px.resize(to + size_t{nw} * nh);
+        for (uint32_t y = 0; y < nh; ++y)
+            for (uint32_t x = 0; x < nw; ++x) {
+                uint32_t sum[4] = {};
+                for (uint32_t dy = 0; dy < 2; ++dy)
+                    for (uint32_t dx = 0; dx < 2; ++dx) {
+                        const uint32_t v = px[from + size_t{std::min(2 * y + dy, h - 1)} * w + std::min(2 * x + dx, w - 1)];
+                        for (unsigned c = 0; c < 4; ++c) sum[c] += v >> (8 * c) & 0xFFu;
+                    }
+                uint32_t v = 0;
+                for (unsigned c = 0; c < 4; ++c) v |= ((sum[c] + 2) / 4) << (8 * c);
+                px[to + size_t{y} * nw + x] = v;
+            }
+        from = to;
+    }
+}
+
+// A texture pack's replacement, ready to upload: every level, from the largest.
+struct PackImage {
+    uint32_t width = 0, height = 0, levels = 1;
+    std::vector<uint32_t> pixels;
+};
+
+// Texture packs' replacements read, decoded and given their mip levels on a
+// thread of their own: the render never waits for the disk or the PNG
+// decoder (a texture is drawn as the game has it until its replacement is
+// ready). Requests carry the packs' epoch: what was asked for before the
+// packs changed is dropped when it's taken.
+class PackLoader {
+public:
+    PackLoader() : thread_([this] { run(); }) {}
+    ~PackLoader() {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            stop_ = true;
+        }
+        work_.notify_all();
+        thread_.join();
+    }
+    PackLoader(const PackLoader&) = delete;
+    PackLoader& operator=(const PackLoader&) = delete;
+
+    // `mipmapped`: the original is, so the replacement is where its sides halve to 1x1.
+    void request(uint64_t epoch, uint64_t hash, std::filesystem::path file, bool mipmapped) {
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            queue_.push_back({epoch, hash, std::move(file), mipmapped});
+        }
+        work_.notify_one();
+    }
+    // What has been read for `epoch`, moved into `out`.
+    void take(uint64_t epoch, std::vector<std::pair<uint64_t, PackImage>>& out) {
+        std::lock_guard<std::mutex> lock(m_);
+        for (auto& [e, hash, image] : done_)
+            if (e == epoch) out.emplace_back(hash, std::move(image));
+        done_.clear();
+    }
+    // Until everything asked for has been read.
+    void wait_idle() {
+        std::unique_lock<std::mutex> lock(m_);
+        idle_.wait(lock, [&] { return queue_.empty() && !busy_; });
+    }
+
+private:
+    struct Job {
+        uint64_t epoch, hash;
+        std::filesystem::path file;
+        bool mipmapped;
+    };
+    void run() {
+        for (;;) {
+            Job job;
+            {
+                std::unique_lock<std::mutex> lock(m_);
+                work_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+                if (stop_) return;
+                job = std::move(queue_.front());
+                queue_.pop_front();
+                busy_ = true;
+            }
+            PackImage image;
+            std::string error;
+            if (!qilin::host::load_png(job.file, image.width, image.height, image.pixels, error))
+                qilin::host::die("%s", ("cannot read the texture pack's " + job.file.string() + ": " + error).c_str());
+            const bool halves = !(image.width & (image.width - 1)) && !(image.height & (image.height - 1));
+            image.levels = job.mipmapped && halves ? uint32_t(std::bit_width(std::max(image.width, image.height))) : 1u;
+            mip_chain(image.pixels, image.width, image.height, image.levels);
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                done_.emplace_back(job.epoch, job.hash, std::move(image));
+                busy_ = false;
+            }
+            idle_.notify_all();
+        }
+    }
+
+    std::mutex m_;
+    std::condition_variable work_, idle_;
+    std::deque<Job> queue_;
+    std::vector<std::tuple<uint64_t, uint64_t, PackImage>> done_;
+    bool stop_ = false, busy_ = false;
+    std::thread thread_;  // last: it starts once the rest is made
+};
 
 }  // namespace
 
@@ -177,14 +329,21 @@ struct Renderer::Impl {
     struct Target {
         Image colour;
         bool ready = false;  // drawn into at least once: its contents are kept
+        float widen = 1.0f;  // drawn as Source::widen said
     };
+    uint32_t samples = 1;  // a pixel's, for multisampling (set_msaa): 1 is none
     std::map<uint32_t, Target> targets;  // by frame buffer address
     Target* current = nullptr;
     Image depth{};
+    // With multisampling (set_msaa): what each render draws into, shared by
+    // every frame buffer as the depth buffer is, cleared at the render's start
+    // and resolved into its picture at the end; its samples are never kept
+    // (every render starts its area afresh, so there's nothing to keep).
+    Image multisampled{};
     VkCommandPool pool = VK_NULL_HANDLE;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
-    Buffer vertex_buffer{}, staging{};
+    Buffer vertex_buffer{}, index_buffer{}, staging{};
     // The translucent modifier volumes, for the fragment shader's test
     // (pvr.frag): a header, the volumes, their triangles.
     Buffer volume_buffer{};
@@ -201,6 +360,7 @@ struct Renderer::Impl {
     // the node count read back to make the lists longer when a frame wanted
     // more, and sort.comp, which sorts and blends them into the picture.
     bool sorting = false;
+    bool per_pixel_sort = true;  // set_per_pixel_sort: off, the triangle sort even where the device can do better
     Buffer heads{}, nodes{}, node_count{};
     uint32_t node_capacity = 0;
     VkShaderModule sort_module = VK_NULL_HANDLE;
@@ -218,6 +378,23 @@ struct Renderer::Impl {
     std::unordered_map<uint32_t, VkSampler> samplers;
     std::unordered_map<uint64_t, Texture> textures;
     Texture white{};
+    // Texture packs (set_texture_packs): the replacements found in the load
+    // folder, by hash; what was dumped this run; images and sets a
+    // replacement took the place of, freed once the GPU's work is done.
+    std::filesystem::path pack_load, pack_dump;
+    std::unordered_map<uint64_t, std::filesystem::path> pack_files;
+    std::set<uint64_t> dumped;
+    std::vector<Texture> retired;
+    // The replacements read so far (the loader's), up to kPackCache bytes,
+    // the oldest let go first (read again if wanted again); those asked for;
+    // the packs' epoch, which a change of them moves on.
+    static constexpr size_t kPackCache = size_t{256} << 20;
+    std::unique_ptr<PackLoader> loader;
+    std::unordered_map<uint64_t, PackImage> pack_ready;
+    std::deque<uint64_t> pack_order;
+    size_t pack_bytes = 0;
+    std::set<uint64_t> pack_requested;
+    uint64_t pack_epoch = 0;
     uint64_t frame = 0;
     Stats stats{};
     float anisotropy = 1.0f;  // for filtered textures (set_anisotropy)
@@ -225,8 +402,17 @@ struct Renderer::Impl {
     bool opaque_volumes = false;  // this scene has opaque modifier volumes, drawn into the stencil
     bool translucent_volumes = false;  // and translucent modifier volumes for translucent polygons
 
-    // The frame being built.
+    // The frame being built: its vertices, the triangles as indices into
+    // them (three each; a Gouraud strip's vertices are shared by its
+    // triangles), and the draws, each a range of the indices.
     std::vector<HostVertex> vertices;
+    std::vector<uint32_t> indices;
+    std::vector<uint32_t> strip_at;  // add_strip's: a strip vertex's place in `vertices`, or ~0u
+    // A vertex used by one triangle only: its own index.
+    void emit(const HostVertex& h) {
+        indices.push_back(uint32_t(vertices.size()));
+        vertices.push_back(h);
+    }
     std::vector<Draw> draws;
     struct Upload {
         VkImage image;
@@ -395,12 +581,14 @@ struct Renderer::Impl {
     // may still be showing the old one, so the device goes idle first).
     Target& target(uint32_t key, uint32_t width, uint32_t height) {
         Target& t = targets[key];
-        // Only ever grown: renders of one frame may see it a line taller or
-        // shorter (Toy Racer's last line is inside one part's clip only), and
-        // what the others drew must stay.
-        const uint32_t w = std::max(width * scale, t.colour.width), h = std::max(height * scale, t.colour.height);
+        // Its height only ever grown: renders of one frame may see it a line
+        // taller or shorter (Toy Racer's last line is inside one part's clip
+        // only), and what the others drew must stay. Its width is the
+        // picture's, which changes only when the widening does.
+        const uint32_t w = width * scale, h = std::max(height * scale, t.colour.height);
         if (!t.colour.image || t.colour.width != w || t.colour.height != h) {
             check(vkDeviceWaitIdle(gpu.device), "vkDeviceWaitIdle");
+            if (t.colour.image && t.colour.width != w) t.ready = false;  // a new widening: nothing of the old picture is kept
             t.colour.destroy(gpu);
             ++remade;
             t.colour = Image::create(gpu, w, h, kColourFormat,
@@ -408,11 +596,20 @@ struct Renderer::Impl {
                                          (sorting ? VkImageUsageFlags(VK_IMAGE_USAGE_STORAGE_BIT) : VkImageUsageFlags(0)));
             t.ready = false;
         }
+        // The shared attachments: as large as the largest frame buffer, with
+        // the samples asked for (set_msaa destroys them when that changes).
+        // Nothing outlives a render in them: transient.
         if (!depth.image || depth.width < w || depth.height < h) {
-            check(vkDeviceWaitIdle(gpu.device), "vkDeviceWaitIdle");
+            wait();  // only this renderer's work uses them
             depth.destroy(gpu);
             depth = Image::create(gpu, std::max(w, depth.width), std::max(h, depth.height), depth_format,
-                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+                                  VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, 1, samples);
+        }
+        if (samples > 1 && (!multisampled.image || multisampled.width < w || multisampled.height < h)) {
+            wait();
+            multisampled.destroy(gpu);
+            multisampled = Image::create(gpu, std::max(w, multisampled.width), std::max(h, multisampled.height), kColourFormat,
+                                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, 1, samples);
         }
         return t;
     }
@@ -452,7 +649,7 @@ struct Renderer::Impl {
         rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rs.lineWidth = 1.0f;
         VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        ms.rasterizationSamples = static_cast<VkSampleCountFlagBits>(samples);  // the pipelines are made again when it changes
         VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
         ds.depthTestEnable = VK_TRUE;  // write and compare are dynamic
         VkPipelineColorBlendAttachmentState att{};
@@ -526,34 +723,36 @@ struct Renderer::Impl {
         return s;
     }
 
+    // A texture's descriptor set for a sampler: from any pool with room (an
+    // evicted texture's sets go back to theirs), the newest first, or a new pool.
     VkDescriptorSet set_for(Texture& t, uint32_t bits) {
         for (const Texture::Set& s : t.sets)
             if (s.bits == bits) return s.set;
         VkDescriptorSet set = VK_NULL_HANDLE;
         VkDescriptorPool from = VK_NULL_HANDLE;
-        for (int attempt = 0; attempt < 2 && !set; ++attempt) {
-            if (!set_pools.empty()) {
-                VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-                ai.descriptorPool = set_pools.back();
-                ai.descriptorSetCount = 1;
-                ai.pSetLayouts = &set_layout;
-                if (vkAllocateDescriptorSets(gpu.device, &ai, &set) == VK_SUCCESS) {
-                    from = set_pools.back();
-                    break;
-                }
-                set = VK_NULL_HANDLE;
-            }
+        const auto allocate = [&](VkDescriptorPool p) {
+            VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+            ai.descriptorPool = p;
+            ai.descriptorSetCount = 1;
+            ai.pSetLayouts = &set_layout;
+            if (vkAllocateDescriptorSets(gpu.device, &ai, &set) != VK_SUCCESS) return false;
+            from = p;
+            return true;
+        };
+        bool found = false;
+        for (auto p = set_pools.rbegin(); p != set_pools.rend() && !found; ++p) found = allocate(*p);
+        if (!found) {
             const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024};
             VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-            pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // a texture let go frees its sets
+            pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
             pci.maxSets = 1024;
             pci.poolSizeCount = 1;
             pci.pPoolSizes = &size;
             VkDescriptorPool p;
             check(vkCreateDescriptorPool(gpu.device, &pci, nullptr, &p), "vkCreateDescriptorPool");
             set_pools.push_back(p);
+            if (!allocate(p)) qilin::host::die("no descriptor set from a new pool");
         }
-        if (!set) qilin::host::die("no descriptor set from a new pool");
         const VkDescriptorImageInfo info{sampler(bits), t.image.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
         VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         w.dstSet = set;
@@ -565,6 +764,31 @@ struct Renderer::Impl {
         return set;
     }
 
+    // The textures no render has used for kTextureAge renders, let go. Only
+    // after wait(): no work in flight can be using them.
+    void evict_textures() {
+        for (auto it = textures.begin(); it != textures.end();) {
+            Texture& t = it->second;
+            if (frame - t.used < kTextureAge) {
+                ++it;
+                continue;
+            }
+            for (const Texture::Set& s : t.sets) check(vkFreeDescriptorSets(gpu.device, s.pool, 1, &s.set), "vkFreeDescriptorSets");
+            t.image.destroy(gpu);
+            it = textures.erase(it);
+            ++stats.evicted;
+        }
+    }
+
+    // What texture packs' replacements took the place of: after wait().
+    void free_retired() {
+        for (Texture& t : retired) {
+            for (const Texture::Set& s : t.sets) check(vkFreeDescriptorSets(gpu.device, s.pool, 1, &s.set), "vkFreeDescriptorSets");
+            t.image.destroy(gpu);
+        }
+        retired.clear();
+    }
+
     // An image's every level, one after another from the largest.
     void queue_upload(const Image& image, const uint32_t* rgba, bool fresh) {
         size_t n = 0;
@@ -574,23 +798,6 @@ struct Renderer::Impl {
         std::memcpy(upload_bytes.data() + at, rgba, n);
         uploads.push_back({image.image, image.width, image.height, image.levels, at, fresh});
         ++stats.uploads;
-    }
-
-    // The textures no polygon has named for kTextureIdleFrames, let go. Only after the last
-    // frame's fence (draw waits for it first): nothing in flight uses them.
-    void sweep_textures() {
-        if (frame % kTextureSweepEvery != 0) return;
-        for (auto it = textures.begin(); it != textures.end();) {
-            Texture& t = it->second;
-            if (t.used + kTextureIdleFrames > frame) {
-                ++it;
-                continue;
-            }
-            for (const Texture::Set& s : t.sets) check(vkFreeDescriptorSets(gpu.device, s.pool, 1, &s.set), "vkFreeDescriptorSets");
-            t.image.destroy(gpu);
-            it = textures.erase(it);
-            ++stats.textures_freed;
-        }
     }
 
     // The texture a polygon names, decoded again if video memory or its
@@ -624,12 +831,99 @@ struct Renderer::Impl {
             texture::decode_level(p, raw.data(), l, pixels.data() + at);
             at += std::max(p.width >> l, 1u) * std::max(p.height >> l, 1u);
         }
-        if (fresh) {
-            t.image = Image::create(gpu, p.width, p.height, kColourFormat, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, levels);
-            ++stats.textures;
+        // A texture pack's: dumped once a run, replaced where the load folder has it.
+        uint32_t width = p.width, height = p.height, image_levels = levels;
+        const uint32_t* upload = pixels.data();
+        t.pack = 0;
+        if (!pack_files.empty() || !pack_dump.empty()) {  // hashed only when there's something to match or dump
+            const uint32_t shape[] = {tcw >> 21, tsp & 0x3Fu, p.stride, uint32_t(palette_hash), uint32_t(palette_hash >> 32)};
+            const uint64_t hash = hash_words(shape, 5, hash_bytes(raw.data(), raw.size(), 0xCBF29CE484222325ull));
+            if (!pack_dump.empty() && dumped.insert(hash).second) {
+                const std::filesystem::path file = pack_dump / pack_name(p.width, p.height, hash);
+                std::error_code ec;
+                std::string error;
+                if (!std::filesystem::exists(file, ec) && !qilin::host::save_png(file, p.width, p.height, pixels.data(), error))
+                    qilin::host::die("%s", ("cannot dump a texture to " + file.string() + ": " + error).c_str());
+                ++stats.dumped;
+            }
+            if (const auto it = pack_files.find(hash); it != pack_files.end()) {
+                t.pack = hash;
+                if (const auto ready = pack_ready.find(hash); ready != pack_ready.end()) {
+                    const PackImage& image = ready->second;
+                    width = image.width, height = image.height, image_levels = image.levels, upload = image.pixels.data();
+                    ++stats.replaced;
+                } else if (pack_requested.insert(hash).second) {
+                    // Read on the loader's thread: this texture is decoded
+                    // again once it's ready (collect_pack_images).
+                    if (!loader) loader = std::make_unique<PackLoader>();
+                    loader->request(pack_epoch, hash, it->second, levels > 1);
+                }
+            }
         }
-        queue_upload(t.image, pixels.data(), fresh);
+        // A replacement of another size (or none now, after one): a new
+        // image; the old one and its sets go once the GPU is done with them.
+        if (!fresh && (t.image.width != width || t.image.height != height || t.image.levels != image_levels)) {
+            Texture old;
+            old.image = t.image, old.sets = std::move(t.sets);
+            retired.push_back(std::move(old));
+            t.image = Image{}, t.sets.clear();
+        }
+        const bool new_image = !t.image.image;
+        if (new_image) {
+            t.image = Image::create(gpu, width, height, kColourFormat, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, image_levels);
+            if (fresh) ++stats.textures;
+        }
+        queue_upload(t.image, upload, new_image);
         return t;
+    }
+
+    // Texture packs: see Renderer::set_texture_packs.
+    void set_texture_packs(const std::filesystem::path& load, const std::filesystem::path& dump, bool again = false) {
+        if (load == pack_load && dump == pack_dump && !again) return;
+        pack_load = load, pack_dump = dump;
+        pack_files.clear(), dumped.clear();
+        ++pack_epoch;  // what the loader was asked for before is dropped
+        pack_ready.clear(), pack_order.clear(), pack_requested.clear();
+        pack_bytes = 0;
+        std::error_code ec;
+        if (!dump.empty()) {
+            std::filesystem::create_directories(dump, ec);
+            if (ec) qilin::host::die("%s", ("cannot make the texture dump folder " + dump.string() + ": " + ec.message()).c_str());
+        }
+        if (!load.empty() && std::filesystem::is_directory(load, ec)) {
+            for (auto it = std::filesystem::recursive_directory_iterator(load, ec); !ec && it != std::filesystem::recursive_directory_iterator();
+                 it.increment(ec)) {
+                uint64_t hash = 0;
+                if (!it->is_regular_file(ec) || !pack_hash(it->path().filename().string(), hash)) continue;
+                const auto [at, added] = pack_files.emplace(hash, it->path());
+                if (!added) qilin::host::die("%s", ("two texture pack files for one texture: " + at->second.string() + " and " + it->path().string()).c_str());
+            }
+            if (ec) qilin::host::die("%s", ("cannot read the texture pack folder " + load.string() + ": " + ec.message()).c_str());
+        }
+        for (auto& [k, t] : textures) t.generation = ~uint64_t{0};  // decoded (and looked up) again when next used
+        stats.pack_files = uint32_t(pack_files.size());
+    }
+
+    // The replacements read since the last render: kept, and the textures
+    // waiting for them decoded again when next drawn.
+    void collect_pack_images() {
+        if (!loader) return;
+        std::vector<std::pair<uint64_t, PackImage>> got;
+        loader->take(pack_epoch, got);
+        for (auto& [hash, image] : got) {
+            pack_bytes += image.pixels.size() * sizeof(uint32_t);
+            pack_order.push_back(hash);
+            pack_ready[hash] = std::move(image);
+            for (auto& [k, t] : textures)
+                if (t.pack == hash) t.generation = ~uint64_t{0};
+        }
+        while (pack_bytes > kPackCache && pack_order.size() > 1) {
+            const uint64_t oldest = pack_order.front();
+            pack_order.pop_front();
+            pack_bytes -= pack_ready[oldest].pixels.size() * sizeof(uint32_t);
+            pack_ready.erase(oldest);
+            pack_requested.erase(oldest);  // read again if a texture wants it again
+        }
     }
 
     static bool sane(const ta::Vertex& a) {
@@ -644,6 +938,23 @@ struct Renderer::Impl {
 
     // A strip's triangles in one of its volumes (0, or 1: the second, drawn
     // where the modifier volumes enclose it, in the two-volume mode).
+    // A 2D overlay, kept its shape when the picture is widened: flat (every
+    // vertex at one depth), and in front of the world (the depth test off, or
+    // a depth the world never reaches: both games' HUDs and menus are at 1/w
+    // from 0.5, their worlds below 0.15), and not a fill across the whole
+    // picture (a fade, a flash: widened with the scene to cover it). A
+    // picture across the whole screen stays a 4:3 picture, never stretched.
+    static bool overlay(const Source& src, const ta::Strip& s, const ta::Vertex* v) {
+        const float z = v[0].z;
+        float x0 = v[0].x, x1 = v[0].x;
+        for (uint32_t k = 1; k < s.count; ++k) {
+            if (v[k].z != z) return false;
+            x0 = std::min(x0, v[k].x), x1 = std::max(x1, v[k].x);
+        }
+        if (depth_mode(s.isp) != 7 && !(z >= 0.5f)) return false;
+        return s.textured || x0 > 0.0f || x1 < float(src.width);
+    }
+
     void add_strip(const Source& src, const ta::Strip& s, const ta::Vertex* v, bool background, int vol = 0) {
         if (s.count < 3) return;
         const uint32_t tsp = s.tsp[vol];
@@ -655,6 +966,7 @@ struct Renderer::Impl {
                   shading(tsp) << 4;
         d.depth = background ? 7u : depth_mode(s.isp);
         d.depth_write = !z_write_off(s.isp);
+        d.overlay = !background && src.widen != 1.0f && overlay(src, s, v);
         if (opaque_volumes && !translucent) d.stencil = !background && modified(s) ? Stencil::mark_shadow : Stencil::mark_none;
         if (vol == 1 && !translucent) {
             // Where the first volume's surface is the one seen and inside a
@@ -684,9 +996,20 @@ struct Renderer::Impl {
             d.clip = uint32_t{s.clip[0]} | uint32_t{s.clip[1]} << 8 | uint32_t{s.clip[2]} << 16 | uint32_t{s.clip[3]} << 24;
         }
         d.set = s.textured ? set_for(texture_for(src, tsp, s.tcw[vol]), sampler_bits(tsp)) : set_for(white, 0);
-        d.first = uint32_t(vertices.size());
+        d.first = uint32_t(indices.size());
         const bool gouraud = s.pcw & 0x02u;
         const uint32_t cull = s.sprite || background ? 0u : cull_mode(s.isp);
+        // Gouraud: each of the strip's vertices once (when a triangle that's
+        // kept first names it, so a dropped one's never reaches the buffer),
+        // its triangles by index. Flat: each triangle's own three, its last
+        // vertex's colour on all of them.
+        const auto host = [&](const ta::Vertex& a, const ta::Vertex& c) {
+            HostVertex h;
+            h.x = a.x, h.y = a.y, h.z = clean_z(a.z), h.u = a.u[vol], h.v = a.v[vol];
+            std::memcpy(h.base, c.base[vol], sizeof h.base), std::memcpy(h.offset, c.offset[vol], sizeof h.offset);
+            return h;
+        };
+        if (gouraud) strip_at.assign(s.count, ~0u);
         for (uint32_t i = 0; i + 2 < s.count; ++i) {
             const ta::Vertex* t[3] = {&v[i], &v[i + 1], &v[i + 2]};
             // A vertex off in the infinite (or not a number) is the game's
@@ -705,17 +1028,18 @@ struct Renderer::Impl {
                     continue;
                 }
             }
-            for (int k = 0; k < 3; ++k) {
-                const ta::Vertex& a = *t[k];
-                const ta::Vertex& c = gouraud ? a : *t[2];  // flat: the triangle's last vertex colours it
-                HostVertex h;
-                h.x = a.x, h.y = a.y, h.z = clean_z(a.z), h.u = a.u[vol], h.v = a.v[vol];
-                std::memcpy(h.base, c.base[vol], sizeof h.base), std::memcpy(h.offset, c.offset[vol], sizeof h.offset);
-                vertices.push_back(h);
+            for (uint32_t k = 0; k < 3; ++k) {
+                if (!gouraud) {
+                    emit(host(*t[k], *t[2]));
+                    continue;
+                }
+                uint32_t& at = strip_at[i + k];
+                if (at == ~0u) at = uint32_t(vertices.size()), vertices.push_back(host(*t[k], *t[k]));
+                indices.push_back(at);
             }
             ++stats.triangles;
         }
-        d.count = uint32_t(vertices.size()) - d.first;
+        d.count = uint32_t(indices.size()) - d.first;
         if (d.count == 0) return;
         if (!draws.empty() && draws.back().same_state(d) && draws.back().first + draws.back().count == d.first) draws.back().count += d.count;
         else draws.push_back(d);
@@ -791,13 +1115,13 @@ struct Renderer::Impl {
         float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;  // the volume's bounds on screen
         bool any = false, drawn_apart = false;  // drawn_apart: some of this volume's faces are already in draws
         auto rectangle = [&](Draw d, float l, float t, float r, float b, float shade) {
-            d.first = uint32_t(vertices.size()), d.count = 6;
+            d.first = uint32_t(indices.size()), d.count = 6;
             const float corners[6][2] = {{l, t}, {r, t}, {l, b}, {r, t}, {r, b}, {l, b}};
             for (const auto& c : corners) {
                 HostVertex v{};
                 v.x = c[0], v.y = c[1], v.z = 1.0f;
                 v.base[0] = v.base[1] = v.base[2] = shade, v.base[3] = 1.0f;
-                vertices.push_back(v);
+                emit(v);
             }
             draws.push_back(d);
         };
@@ -829,13 +1153,13 @@ struct Renderer::Impl {
             }
             faces.flags = clipped.flags, faces.clip = clipped.clip;
             for (uint32_t t = m.first; t < m.first + m.count; ++t) {
-                if (faces.count == 0) faces.first = uint32_t(vertices.size());
+                if (faces.count == 0) faces.first = uint32_t(indices.size());
                 const float* f = scene.modifier_triangles.data() + size_t{t} * 9;
                 for (int k = 0; k < 3; ++k) {
                     HostVertex h{};
                     h.x = f[3 * k], h.y = f[3 * k + 1], h.z = clean_z(f[3 * k + 2]);
                     x0 = std::min(x0, h.x), y0 = std::min(y0, h.y), x1 = std::max(x1, h.x), y1 = std::max(y1, h.y);
-                    vertices.push_back(h);
+                    emit(h);
                 }
                 faces.count += 3;
             }
@@ -862,27 +1186,27 @@ struct Renderer::Impl {
     // away is blended first. Here its triangles are drawn from the farthest
     // to the nearest, by their mean z (1/w: smaller is farther), the order
     // sent kept between equals.
-    void sort_translucent(size_t first_draw, size_t first_vertex) {
+    void sort_translucent(size_t first_draw, size_t first_index) {
         struct Tri {
             float depth;
             uint32_t draw, at;
         };
         std::vector<Tri> tris;
         for (size_t d = first_draw; d < draws.size(); ++d)
-            for (uint32_t v = draws[d].first; v < draws[d].first + draws[d].count; v += 3)
-                tris.push_back({vertices[v].z + vertices[v + 1].z + vertices[v + 2].z, uint32_t(d), v});
+            for (uint32_t k = draws[d].first; k < draws[d].first + draws[d].count; k += 3)
+                tris.push_back({vertices[indices[k]].z + vertices[indices[k + 1]].z + vertices[indices[k + 2]].z, uint32_t(d), k});
         std::stable_sort(tris.begin(), tris.end(), [](const Tri& a, const Tri& b) { return a.depth < b.depth; });
-        std::vector<HostVertex> sorted;
+        std::vector<uint32_t> sorted;
         sorted.reserve(tris.size() * 3);
         std::vector<Draw> out(draws.begin(), draws.begin() + std::ptrdiff_t(first_draw));
         for (const Tri& t : tris) {
             Draw d = draws[t.draw];
-            d.first = uint32_t(first_vertex + sorted.size()), d.count = 3;
-            sorted.insert(sorted.end(), vertices.begin() + t.at, vertices.begin() + t.at + 3);
+            d.first = uint32_t(first_index + sorted.size()), d.count = 3;
+            sorted.insert(sorted.end(), indices.begin() + t.at, indices.begin() + t.at + 3);
             if (out.size() > first_draw && out.back().same_state(d)) out.back().count += 3;
             else out.push_back(d);
         }
-        std::copy(sorted.begin(), sorted.end(), vertices.begin() + std::ptrdiff_t(first_vertex));
+        std::copy(sorted.begin(), sorted.end(), indices.begin() + std::ptrdiff_t(first_index));
         draws = std::move(out);
     }
 
@@ -959,15 +1283,21 @@ struct Renderer::Impl {
         b = Buffer::host_visible(gpu, std::max<VkDeviceSize>(need * 3 / 2, 1u << 20), usage);
     }
 
+    // The scene is built (its vertices, draws and textures decoded) on the
+    // CPU while the previous render's work may still run on the GPU: until
+    // the wait below, nothing that work uses is written or freed (new images,
+    // samplers and descriptor sets only; target() waits itself before it
+    // replaces an attachment).
     Picture draw(const Source& src) {
-        wait();
         ++frame;
-        sweep_textures();
+        collect_pack_images();
         stats.draws = stats.triangles = stats.culled = stats.uploads = stats.dropped = 0;
-        Target& t = target(src.frame_buffer, src.width, src.height);
+        const float wide_width = float(src.width) * src.widen;  // the picture's width in the game's pixels
+        Target& t = target(src.frame_buffer, static_cast<uint32_t>(std::lround(wide_width)), src.height);
+        t.widen = src.widen;
         current = &t;
         const Image& colour = t.colour;
-        vertices.clear(), draws.clear(), uploads.clear(), upload_bytes.clear();
+        vertices.clear(), indices.clear(), draws.clear(), uploads.clear(), upload_bytes.clear();
         if (frame == 1) {
             const uint32_t opaque_white = 0xFFFFFFFFu;
             queue_upload(white.image, &opaque_white, true);
@@ -984,11 +1314,11 @@ struct Renderer::Impl {
         opaque_volumes = any_opaque;
         translucent_volumes = any_translucent && collect_translucent_volumes(src, scene);
         if (src.background.count) add_strip(src, src.background, src.background_vertices, true);
-        size_t translucent_draws = 0, translucent_vertices = 0;
+        size_t translucent_draws = 0, translucent_indices = 0;
         for (const ta::List list : {ta::kOpaque, ta::kPunchThrough, ta::kTranslucent}) {
             if (list == ta::kTranslucent) {
                 if (opaque_volumes) add_volumes(src, scene);
-                translucent_draws = draws.size(), translucent_vertices = vertices.size();
+                translucent_draws = draws.size(), translucent_indices = indices.size();
             }
             for (const ta::Strip& s : scene.strips) {
                 if (s.list != list) continue;
@@ -996,11 +1326,16 @@ struct Renderer::Impl {
                 if (list == ta::kTranslucent && !cheap && modified(s)) add_strip(src, s, scene.vertices.data() + s.first, false, 1);
             }
         }
+        // From here on, the buffers, the per-pixel lists and the texture
+        // cache's sets are written or freed: the previous render must be done.
+        wait();
+        if (frame % kEvictEvery == 0) evict_textures();  // keeps what this scene uses (used == frame)
+        free_retired();
         // The translucent list in auto-sort mode: sorted for each pixel where
         // the device can (each draw onto the per-pixel lists, with its blend
         // factors and its place in the order sent), else triangle by triangle.
-        const bool sorted = !src.presort && sorting && draws.size() > translucent_draws;
-        if (!src.presort && !sorted) sort_translucent(translucent_draws, translucent_vertices);
+        const bool sorted = !src.presort && sorting && per_pixel_sort && draws.size() > translucent_draws;
+        if (!src.presort && !sorted) sort_translucent(translucent_draws, translucent_indices);
         if (sorted) {
             size_lists(colour.width * colour.height);
             for (size_t i = translucent_draws; i < draws.size(); ++i) {
@@ -1011,20 +1346,24 @@ struct Renderer::Impl {
             }
         }
         stats.draws = uint32_t(draws.size());
+        stats.cached = uint32_t(textures.size());
 
         float z_max = 0.0f;
         for (const HostVertex& v : vertices) z_max = std::max(z_max, v.z);
         Push push{};
-        push.screen[0] = 2.0f / float(src.width), push.screen[1] = 2.0f / float(src.height);
+        push.screen[0] = 2.0f / wide_width, push.screen[1] = 2.0f / float(src.height);
         push.screen[2] = z_max > 0.0f ? 1.0f / z_max : 1.0f;
         push.alpha_ref = float(src.punch_alpha_ref & 0xFFu) / 255.0f;
 
         grow(vertex_buffer, vertices.size() * sizeof(HostVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
         if (!vertices.empty()) std::memcpy(vertex_buffer.mapped, vertices.data(), vertices.size() * sizeof(HostVertex));
+        grow(index_buffer, indices.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        if (!indices.empty()) std::memcpy(index_buffer.mapped, indices.data(), indices.size() * sizeof(uint32_t));
         // The frame's buffer: the volumes (if any) and the table fog's registers, every frame.
         if (!translucent_volumes) volume_data.assign(kTrianglesAt, 0.0f);
         volume_data[3] = push.screen[2];  // the depth scale, for the volumes' z
         volume_data[4] = float(scale);
+        volume_data[5] = src.widen;  // the volumes are the world's: widened with it
         volume_data[kFogColourAt] = float(src.fog_colour >> 16 & 0xFFu) / 255.0f;
         volume_data[kFogColourAt + 1] = float(src.fog_colour >> 8 & 0xFFu) / 255.0f;
         volume_data[kFogColourAt + 2] = float(src.fog_colour & 0xFFu) / 255.0f;
@@ -1074,6 +1413,8 @@ struct Renderer::Impl {
         }
         qilin::host::transition(cmd, colour.image, t.ready ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
                                 VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        const bool msaa = samples > 1;
+        if (msaa) qilin::host::transition(cmd, multisampled.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
         qilin::host::transition(cmd, depth.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                                 VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
         if (sorted) {  // empty lists: every head none, no nodes
@@ -1084,11 +1425,18 @@ struct Renderer::Impl {
                            VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
         }
         VkRenderingAttachmentInfo ca{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        ca.imageView = colour.view;
+        // The render's area starts black (then the background plane): never
+        // loaded, since every pixel in it is drawn again.
+        ca.imageView = msaa ? multisampled.view : colour.view;
         ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        ca.loadOp = t.ready ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
-        ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        ca.storeOp = msaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE : VK_ATTACHMENT_STORE_OP_STORE;
         ca.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+        if (msaa) {  // each pixel's samples averaged into the picture at the end
+            ca.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+            ca.resolveImageView = colour.view;
+            ca.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        }
         VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
         da.imageView = depth.view;
         da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -1096,11 +1444,20 @@ struct Renderer::Impl {
         da.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         da.clearValue.depthStencil = {0.0f, 0};  // the farthest: z = 1/w
         VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
-        ri.renderArea = {{0, 0}, {colour.width, colour.height}};
         // The clip, in the target's pixels.
-        const uint32_t x0 = std::min(src.clip_x0, src.width - 1) * scale, y0 = std::min(src.clip_y0, src.height - 1) * scale;
-        const uint32_t x1 = (std::min(src.clip_x1, src.width - 1) + 1) * scale, y1 = (std::min(src.clip_y1, src.height - 1) + 1) * scale;
+        // Widened, it's widened with the scene (its edges at the pixels that hold them).
+        const float across = src.widen * float(scale);
+        const uint32_t x0 = static_cast<uint32_t>(std::floor(float(std::min(src.clip_x0, src.width - 1)) * across)),
+                       y0 = std::min(src.clip_y0, src.height - 1) * scale;
+        const uint32_t x1 = std::min(static_cast<uint32_t>(std::ceil(float(std::min(src.clip_x1, src.width - 1) + 1) * across)), colour.width),
+                       y1 = (std::min(src.clip_y1, src.height - 1) + 1) * scale;
         const VkRect2D clip{{int32_t(x0), int32_t(y0)}, {x1 > x0 ? x1 - x0 : 1, y1 > y0 ? y1 - y0 : 1}};
+        // The render area is the clip: only it is cleared, drawn, stored (and
+        // resolved), and the picture outside it is kept as it was: another
+        // render's part of the frame (Toy Racer's races are two), including
+        // what the per-pixel sort blended into it after its own resolve. A
+        // picture's first render makes the whole of it, black outside the clip.
+        ri.renderArea = t.ready ? clip : VkRect2D{{0, 0}, {colour.width, colour.height}};
         ri.layerCount = 1;
         ri.colorAttachmentCount = 1;
         ri.pColorAttachments = &ca;
@@ -1108,19 +1465,13 @@ struct Renderer::Impl {
         ri.pStencilAttachment = &da;
         vkCmdBeginRendering(cmd, &ri);
         // The game's pixels map onto the image one to `scale` (the image may be larger than this render's frame).
-        const VkViewport viewport{0.0f, 0.0f, float(src.width * scale), float(src.height * scale), 0.0f, 1.0f};
+        const VkViewport viewport{0.0f, 0.0f, wide_width * float(scale), float(src.height * scale), 0.0f, 1.0f};
         vkCmdSetViewport(cmd, 0, 1, &viewport);
         vkCmdSetScissor(cmd, 0, 1, &clip);
-        {
-            // The tiles this render covers start black (then the background plane).
-            VkClearAttachment clear{VK_IMAGE_ASPECT_COLOR_BIT, 0, {}};
-            clear.clearValue.color = {{0.0f, 0.0f, 0.0f, 1.0f}};
-            const VkClearRect rect{clip, 0, 1};
-            vkCmdClearAttachments(cmd, 1, &clear, 1, &rect);
-        }
         if (!draws.empty()) {
             const VkDeviceSize zero = 0;
             vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.buffer, &zero);
+            vkCmdBindIndexBuffer(cmd, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
         }
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &volume_set, 0, nullptr);
         // Each piece of state is set only when it changes from the draw before (all the
@@ -1133,15 +1484,18 @@ struct Renderer::Impl {
                 vkCmdSetDepthCompareOp(cmd, static_cast<VkCompareOp>(d.depth));  // the hardware's modes are Vulkan's, in order
             if (!last || d.stencil != last->stencil) set_stencil(d.stencil);
             if (!last || d.set != last->set) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &d.set, 0, nullptr);
-            if (!last || d.flags != last->flags || d.sort_word != last->sort_word || d.clip != last->clip) {
+            if (!last || d.flags != last->flags || d.sort_word != last->sort_word || d.clip != last->clip || d.overlay != last->overlay) {
                 push.flags = d.flags;
                 push.sort_word = d.sort_word;
+                // The scene widened about its middle; an overlay moved to the middle, its shape kept.
+                push.screen[3] = d.overlay ? 1.0f : src.widen;
+                push.shift = d.overlay ? (src.widen - 1.0f) * float(src.width) * 0.5f : 0.0f;
                 // The user tile clip, in scene pixels (tiles of 32), its maximum tile included.
                 push.clip[0] = float(d.clip & 0xFFu) * 32.0f, push.clip[1] = float(d.clip >> 8 & 0xFFu) * 32.0f;
                 push.clip[2] = float((d.clip >> 16 & 0xFFu) + 1) * 32.0f, push.clip[3] = float((d.clip >> 24) + 1) * 32.0f;
                 vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
             }
-            vkCmdDraw(cmd, d.count, 1, d.first, 0);
+            vkCmdDrawIndexed(cmd, d.count, 1, d.first, 0, 0);
             last = &d;
         }
         vkCmdEndRendering(cmd);
@@ -1159,7 +1513,22 @@ struct Renderer::Impl {
         si.pCommandBufferInfos = &cbi;
         check(vkQueueSubmit2(gpu.queue, 1, &si, fence), "vkQueueSubmit2");
         t.ready = true;
-        return {colour.image, colour.view, colour.width, colour.height};
+        return {colour.image, colour.view, colour.width, colour.height, src.widen};
+    }
+
+    // Multisampling: `count` samples a pixel (1 none; 2, 4, 8), at most what
+    // the device has. The pipelines (their sample count is fixed in them),
+    // the depth buffer and the multisampled image are made again for it; the
+    // pictures already drawn stay.
+    void set_msaa(unsigned count) {
+        uint32_t n = 1;
+        while (n * 2 <= count && n * 2 <= gpu.max_samples) n *= 2;
+        if (n == samples) return;
+        wait();  // only this renderer's work uses them
+        for (auto& [k, p] : pipelines) vkDestroyPipeline(gpu.device, p, nullptr);
+        pipelines.clear();
+        depth.destroy(gpu), multisampled.destroy(gpu);
+        samples = n;
     }
 
     void set_anisotropy(unsigned level) {
@@ -1179,7 +1548,7 @@ struct Renderer::Impl {
         const auto it = targets.find(key);
         if (it == targets.end() || !it->second.ready) return {};
         const Image& c = it->second.colour;
-        return {c.image, c.view, c.width, c.height};
+        return {c.image, c.view, c.width, c.height, it->second.widen};
     }
 
     std::vector<uint8_t> read_back() {
@@ -1210,8 +1579,10 @@ struct Renderer::Impl {
     }
 
     void destroy() {
+        loader.reset();  // its thread stopped (after what it's reading)
         wait();
         for (auto& [k, t] : textures) t.image.destroy(gpu);
+        for (Texture& t : retired) t.image.destroy(gpu);
         white.image.destroy(gpu);
         for (auto& [k, p] : pipelines) vkDestroyPipeline(gpu.device, p, nullptr);
         for (auto& [k, s] : samplers) vkDestroySampler(gpu.device, s, nullptr);
@@ -1228,11 +1599,11 @@ struct Renderer::Impl {
         heads.destroy(gpu), nodes.destroy(gpu), node_count.destroy(gpu);
         vkDestroyPipelineLayout(gpu.device, layout, nullptr);
         vkDestroyDescriptorSetLayout(gpu.device, set_layout, nullptr);
-        vertex_buffer.destroy(gpu), staging.destroy(gpu), volume_buffer.destroy(gpu);
+        vertex_buffer.destroy(gpu), index_buffer.destroy(gpu), staging.destroy(gpu), volume_buffer.destroy(gpu);
         vkDestroyDescriptorPool(gpu.device, volume_pool, nullptr);
         vkDestroyDescriptorSetLayout(gpu.device, volume_layout, nullptr);
         for (auto& [k, t] : targets) t.colour.destroy(gpu);
-        depth.destroy(gpu);
+        depth.destroy(gpu), multisampled.destroy(gpu);
         vkDestroyFence(gpu.device, fence, nullptr);
         vkDestroyCommandPool(gpu.device, pool, nullptr);
     }
@@ -1242,6 +1613,14 @@ Renderer::Renderer(Gpu& gpu, uint32_t scale) : impl_(std::make_unique<Impl>(gpu,
 Renderer::~Renderer() { impl_->destroy(); }
 Picture Renderer::draw(const Source& source) { return impl_->draw(source); }
 void Renderer::set_anisotropy(unsigned level) { impl_->set_anisotropy(level); }
+void Renderer::set_msaa(unsigned samples) { impl_->set_msaa(samples); }
+void Renderer::set_texture_packs(const std::filesystem::path& load, const std::filesystem::path& dump) { impl_->set_texture_packs(load, dump); }
+void Renderer::reload_texture_packs() { impl_->set_texture_packs(impl_->pack_load, impl_->pack_dump, true); }
+void Renderer::wait_texture_packs() {
+    if (impl_->loader) impl_->loader->wait_idle();
+}
+unsigned Renderer::msaa() const { return impl_->samples; }
+void Renderer::set_per_pixel_sort(bool on) { impl_->per_pixel_sort = on; }
 std::vector<uint8_t> Renderer::read_back() { return impl_->read_back(); }
 Picture Renderer::picture(uint32_t frame_buffer) const { return impl_->picture(frame_buffer); }
 const Renderer::Stats& Renderer::stats() const { return impl_->stats; }

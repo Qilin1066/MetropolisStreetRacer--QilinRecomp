@@ -20,6 +20,17 @@ struct Picture {
     float scanlines = 0.6f;   // CRT: how dark the gaps between raster lines are, 0..1
     float mask = 0.3f;        // CRT: the phosphor stripes' strength, 0..1
     bool vsync = true;        // at the display's refresh, no tearing; off: the lowest latency
+    // With vsync: the fewest window images the driver allows, so at most one finished picture
+    // waits for the display; off, one more (smoother where the GPU's time varies).
+    bool low_latency = true;
+    // SMAA 1x (MIT, iryoku/smaa): jagged edges smoothed, on the picture at its own size, before
+    // it is scaled to the window.
+    bool smaa = false;
+    // AMD FidelityFX Super Resolution 1 (MIT): where the picture is shown larger than it is
+    // drawn and not at whole multiples, scaled up edge-adaptively (EASU) and sharpened (RCAS)
+    // at `sharpness`, 0 (least) to 1 (RCAS's sharpest).
+    bool fsr = false;
+    float sharpness = 0.8f;
     // Fullscreen on a display whose refresh isn't a whole multiple of 60 Hz
     // (75, 144, 165 Hz): switch to the highest mode at the same resolution
     // that is (120 Hz on a 144 Hz monitor), so every frame is shown alike.

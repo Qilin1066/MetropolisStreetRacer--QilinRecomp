@@ -98,8 +98,27 @@ public:
 
 private:
     // One for data and one for audio: read is the game's thread's, read_audio the sound
-    // mixer's. Neither is shared between threads.
+    // mixer's (or its read-ahead task's, one at a time). Neither is shared between threads.
     mutable GdReader data_, audio_;
 };
+
+namespace gdrom {
+// CD audio's reader, as Toy Commander's sound.cpp uses it: `count` sectors from `sector` into
+// `out` (replacing what it held), through the disc's audio reader, which keeps the track's file
+// open. One thread at a time; the disc must outlive it.
+class AudioReader {
+public:
+    explicit AudioReader(const GdRom& disc) : disc_(&disc) {}
+    std::expected<void, std::string> read(uint32_t sector, uint32_t count, std::vector<int16_t>& out) {
+        auto pcm = disc_->read_audio(sector, count);
+        if (!pcm) return std::unexpected(pcm.error());
+        out = std::move(*pcm);
+        return {};
+    }
+
+private:
+    const GdRom* disc_;
+};
+}  // namespace gdrom
 
 }  // namespace qilin

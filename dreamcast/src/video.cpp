@@ -2,6 +2,7 @@
 #include "video.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <iterator>
 #include <cstdio>
@@ -44,6 +45,14 @@ std::string g_shot_folder;
 uint64_t g_shot_every = 60, g_pictures = 0;
 uint32_t g_scale = 2, g_last_drawn = 0;
 bool g_drawn = false;  // a render since the last picture shown
+// The widening the screen asks for (screen_widening), kept by the window's
+// thread for the guest's.
+std::atomic<float> g_screen_widening{1.0f};
+
+void measure_screen() {
+    const float aspect = g_display->screen_aspect();
+    if (aspect > 0.0f) g_screen_widening.store(std::clamp(aspect * 0.75f, 1.0f, 3.0f), std::memory_order_relaxed);
+}
 
 // The registers the renderer reads (the console's names).
 constexpr uint32_t kFbRCtrl = 0x005F8044u, kFbRSof1 = 0x005F8050u, kFbRSize = 0x005F805Cu, kFbWSof1 = 0x005F8060u,
@@ -125,6 +134,13 @@ void shot(const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h) {
     if (std::fclose(f) != 0 || !written) rt::fatal("can't write %s", path.c_str());
 }
 
+// The texture packs' folders, as the settings say: in the data folder.
+void set_texture_packs() {
+    const std::filesystem::path folder = g_data / "textures";
+    g_renderer->set_texture_packs(g_settings.texture_packs ? folder / "load" : std::filesystem::path{},
+                                  g_settings.dump_textures ? folder / "dump" : std::filesystem::path{});
+}
+
 }  // namespace
 
 void start() {
@@ -134,6 +150,7 @@ void start() {
         rt::log("saves: the restore asked for wasn't done (%s); restore-save.txt is kept", error.c_str());
     g_settings = load_settings(g_data);
     game::set_console(g_settings.language, g_settings.stereo);
+    sound::set_device(g_settings.sound_device);
     // The game's own sound option writes the console's setting: keep it.
     game::on_sound_mode([](bool stereo) {
         g_settings.stereo = stereo;
@@ -143,6 +160,14 @@ void start() {
     o.width = 1280, o.height = 960;
     const char* headless = std::getenv("QILIN_HEADLESS");
     o.headless = headless && *headless && *headless != '0';
+    // QILIN_SCREEN=<width>x<height>: the headless target's size (the screen's
+    // shape, which the picture is widened for), 1280x960 if not given.
+    if (const char* screen = std::getenv("QILIN_SCREEN"); screen && o.headless) {
+        unsigned w = 0, h = 0;
+        if (std::sscanf(screen, "%ux%u", &w, &h) != 2 || w < 64 || h < 64 || w > 8192 || h > 8192)
+            rt::fatal("QILIN_SCREEN must be <width>x<height>, 64 to 8192 each");
+        o.width = w, o.height = h;
+    }
     o.fullscreen = g_settings.fullscreen;
     o.monitor = g_settings.monitor;
     o.picture = picture_of(g_settings);
@@ -161,6 +186,8 @@ void start() {
     if (g_scale < 1 || g_scale > 8) rt::fatal("QILIN_SCALE must be 1 to 8");
     g_renderer = std::make_unique<renderer::Renderer>(g_display->gpu(), g_scale);
     g_renderer->set_anisotropy(g_settings.anisotropy);
+    g_renderer->set_msaa(g_settings.msaa);
+    set_texture_packs();
     if (!o.headless) {
         g_menu = std::make_unique<Menu>(*g_display, g_settings, g_data);
         g_menu->set_running_scale(g_scale);
@@ -173,6 +200,7 @@ void start() {
             if (g_shot_every == 0) rt::fatal("QILIN_SHOT: every 0th picture?");
         }
     }
+    measure_screen();
     std::fprintf(stderr, QILIN_APP ": drawing with %s\n", g_display->device_name().c_str());
 }
 
@@ -204,6 +232,7 @@ static void dump_ram_if_asked() {
     const bool written = f && std::fwrite(ram, 1, 0x01000000u, f) == 0x01000000u;
     if (!f || std::fclose(f) != 0 || !written) rt::fatal("QILIN_DUMP: cannot write %s", path.c_str());
 }
+float screen_widening() { return g_screen_widening.load(std::memory_order_relaxed); }
 
 void render() {
     if (!g_renderer) return;
@@ -235,6 +264,10 @@ void render() {
     src.read = vram64_read;
     src.generation = vram64_generation;
     background(src);
+    // The game's camera widened for the screen (game.hpp): the picture too,
+    // but never a movie's, a 4:3 picture as it is.
+    game::widen_to(screen_widening());
+    src.widen = game::movie_playing() ? 1.0f : std::clamp(game::widening(), 1.0f, 3.0f);
     // QILIN_TRACE_RENDERS: each render's frame buffer and format, the frame
     // buffer the display reads, and any texture read from where a render wrote.
     static const bool trace = std::getenv("QILIN_TRACE_RENDERS") != nullptr;
@@ -253,6 +286,25 @@ void render() {
                 if (at >= 0x100000u && at < 0x800000u && (at & 0xFFF00000u) != 0 && at % 0x1000u == 0)
                     std::fprintf(stderr, "  texture at %06X (TCW %08X)\n", at, s.tcw[0]);
             }
+    }
+    // QILIN_DUMP_SCENE=<picture>: the first render at or after that picture,
+    // strip by strip (list, words, vertex count, x/y extent, 1/w range), to stderr.
+    static const long dump_at = std::getenv("QILIN_DUMP_SCENE") ? std::atol(std::getenv("QILIN_DUMP_SCENE")) : -1;
+    if (dump_at >= 0 && static_cast<long>(g_pictures) >= dump_at) {
+        static bool dumped = false;
+        if (!dumped) {
+            dumped = true;
+            for (const ta::Strip& s : src.scene->strips) {
+                float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f, z0 = 1e9f, z1 = -1e9f;
+                for (uint32_t k = s.first; k < s.first + s.count; ++k) {
+                    const ta::Vertex& v = src.scene->vertices[k];
+                    x0 = std::min(x0, v.x), x1 = std::max(x1, v.x), y0 = std::min(y0, v.y), y1 = std::max(y1, v.y);
+                    z0 = std::min(z0, v.z), z1 = std::max(z1, v.z);
+                }
+                std::fprintf(stderr, "strip list %d pcw %08X isp %08X tsp %08X tcw %08X n %u x %.1f..%.1f y %.1f..%.1f z %g..%g\n",
+                             int(s.list), s.pcw, s.isp, s.tsp[0], s.tcw[0], s.count, x0, x1, y0, y1, z0, z1);
+            }
+        }
     }
     g_renderer->draw(src);
     g_last_drawn = src.frame_buffer;
@@ -295,9 +347,13 @@ void vblank() {
     if (g_blank_hook) g_blank_hook();
     if (!g_renderer) return;
     poll();
+    measure_screen();
     run_menu();
     // The settings the menu may have changed: each is nothing to do while unchanged.
     g_renderer->set_anisotropy(g_settings.anisotropy);
+    g_renderer->set_msaa(g_settings.msaa);
+    set_texture_packs();
+    if (g_menu && g_menu->take_reload_textures()) g_renderer->reload_texture_packs();
     sound::set_volume(g_settings.volume, g_settings.mute_unfocused && g_display->sdl_window() && !g_display->focused());
     const float strength = g_settings.rumble ? float(g_settings.rumble_strength) / 100.0f : 0.0f;
     for (unsigned port = 0; port < 4; ++port) g_display->rumble(port, strength * maple::vibration(port));
@@ -311,7 +367,8 @@ void vblank() {
     ++g_pictures;
     if (!g_shot_folder.empty() && g_pictures % g_shot_every == 0) shot(g_renderer->read_back(), p.width, p.height);
     dump_ram_if_asked();
-    g_display->present_image(p.image, p.view, p.width, p.height, 4.0f / 3.0f, p.height / g_scale);
+    // 4:3, widened as it was drawn: never stretched (a movie is never widened).
+    g_display->present_image(p.image, p.view, p.width, p.height, 4.0f / 3.0f * p.widen, p.height / g_scale);
 }
 
 void show(uint32_t width, uint32_t height, const uint8_t* rgba) {

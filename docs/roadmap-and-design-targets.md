@@ -77,14 +77,14 @@ The same menu as the other recomps, found on 2026-11-22. Its model is Punch-Out'
 - **Display:**
   - the window: full screen with F11 or Alt+Enter, and which display;
   - the picture: whole multiples, fit or fill the window; plain or CRT television with scanlines and phosphor stripes; smooth;
-  - vsync, and frame times (F3);
+  - vsync, low latency (with vsync, at most one frame waiting), and frame times (F3);
   - refresh rate: full screen at a multiple of 60 Hz, or variable refresh;
   - "look at the picture": the menu hidden while held.
 - **Game:**
-  - the enhancements: internal resolution, AF, MSAA, widescreen to 21:9 and high refresh, each as its roadmap step arrives;
+  - the enhancements: internal resolution, AF, MSAA, SMAA, AMD FSR 1 with its sharpness, texture packs and texture dumps; widescreen to 21:9 and high refresh as their roadmap steps arrive;
   - the graphics device;
   - the console's own settings (language, sound mode), read the next time the game starts;
-  - sound;
+  - sound: volume, muting when another window has the keyboard, and the playback device;
   - about.
 - **Conventions around it:**
   - the window is named after the game and opens at the largest whole multiple of 640×480 that fits;

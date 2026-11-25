@@ -24,5 +24,22 @@ void set_console(unsigned language, bool stereo);
 // Called when the game changes the console's sound mode itself (the system
 // software writes it to flash memory): the settings file keeps it.
 void on_sound_mode(void (*save)(bool stereo));
+// How much the game's camera is widened now (1: its own 4:3). Both games
+// have a 16:9 screen mode (Toy Commander's "Wide Screen (16/9)", Toy Racer's
+// "Screen mode: 16/9") that widens the cameras' view by 4/3 and draws
+// anamorphic, for a widescreen television to stretch. Each port replaces the
+// function that switches it (natives) with one that widens the cameras by
+// what the screen asks for (video::screen_widening) whatever the option, so
+// the renderer draws that much wider and nothing is stretched.
+float widening();
+// Widens the game's cameras by this (from 1), as its screen mode switch does
+// by 4/3: the cameras in use scaled now, new ones taking the factor. The
+// switch's native calls it, and video.cpp at each render, so the picture
+// follows the screen from the first frame and when the window is resized.
+// Guest thread only.
+void widen_to(float target);
+// A movie is playing. The movies are 4:3 pictures in the game's 640x480
+// whatever its screen mode, so they're shown at 4:3, never stretched.
+bool movie_playing();
 
 }  // namespace dreamcast::game

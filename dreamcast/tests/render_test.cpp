@@ -2,14 +2,18 @@
 // decoded and checked texel by texel, then a scene drawn headless and read
 // back. The renderer's part skips (exit 77) where there's no Vulkan 1.3
 // device, as on CI runners; the decoder's part always runs.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <initializer_list>
 #include <iterator>
 #include <vector>
 
 #include "qilin/host/display.hpp"
+#include "qilin/host/image.hpp"
 #include "renderer.hpp"
 #include "ta.hpp"
 #include "texture.hpp"
@@ -36,6 +40,18 @@ void decoder() {
            "twiddle: the first 2x2 block");
     expect(tex::twiddle(2, 0, 8, 8) == 8 && tex::twiddle(7, 7, 8, 8) == 63, "twiddle: further out");
     expect(tex::twiddle(8, 0, 16, 8) == 64 && tex::twiddle(0, 8, 8, 16) == 64, "twiddle: rectangles");
+    // The decoder's tables give twiddle's place for every texel of every size, squares and rectangles.
+    {
+        bool same = true;
+        static uint32_t cols[tex::kMaxSide], rows[tex::kMaxSide];
+        for (uint32_t w = 1; w <= tex::kMaxSide; w *= 2)
+            for (uint32_t h = 1; h <= tex::kMaxSide; h *= 2) {
+                tex::twiddle_tables(w, h, cols, rows);
+                for (uint32_t y = 0; y < h && same; ++y)
+                    for (uint32_t x = 0; x < w && same; ++x) same = cols[x] + rows[y] == tex::twiddle(x, y, w, h);
+            }
+        expect(same, "twiddle tables: twiddle's place for every texel, every size from 1x1 to 1024x1024");
+    }
 
     // RGB565, raster order, 8x8: texel k = k (so red/green/blue bits vary).
     {
@@ -215,6 +231,81 @@ int renderer() {
     const std::vector<uint8_t> again = r.read_back();
     expect(again == px, "renderer: the same picture with anisotropic filtering on");
     r.set_anisotropy(1);
+
+    // Multisampling: the quads' edges lie on pixels' edges, so 4x gives the
+    // same picture (drawn twice: the first render makes it whole, the second
+    // loads the samples and resolves its clip). A triangle's diagonal edge
+    // gets pixels of both colours mixed; without multisampling, none.
+    {
+        r.set_msaa(4);
+        expect(r.msaa() == std::min(4u, display.gpu().max_samples), "renderer: 4x multisampling, or the device's most");
+        r.draw(src);
+        expect(r.read_back() == px, "renderer: the same picture multisampled (the edges on pixels' edges)");
+        r.draw(src);
+        expect(r.read_back() == px, "renderer: and again, into a picture already made");
+        ta::Scene diag;
+        auto strip = [&](std::initializer_list<ta::Vertex> vs) {
+            ta::Strip s{};
+            s.list = ta::kOpaque, s.pcw = gouraud, s.isp = isp_ge;
+            s.first = uint32_t(diag.vertices.size()), s.count = uint32_t(vs.size());
+            diag.vertices.insert(diag.vertices.end(), vs);
+            diag.strips.push_back(s);
+        };
+        strip({vertex(0, 0, 0.1f, 1, 0, 0), vertex(64, 0, 0.1f, 1, 0, 0), vertex(0, 48, 0.1f, 1, 0, 0), vertex(64, 48, 0.1f, 1, 0, 0)});
+        strip({vertex(0, 0, 0.5f, 0, 1, 0), vertex(64, 0, 0.5f, 0, 1, 0), vertex(0, 48, 0.5f, 0, 1, 0)});
+        dreamcast::renderer::Source dsrc = src;
+        dsrc.scene = &diag;
+        dsrc.frame_buffer = 0x180000;  // a frame buffer of its own (the others' are 0, 0x200000, 0x300000 and from 0x400000)
+        const auto mixed = [&] {
+            r.draw(dsrc);
+            const std::vector<uint8_t> d = r.read_back();
+            int n = 0;
+            for (size_t i = 0; i < d.size(); i += 4)
+                if ((d[i] != 0 && d[i] != 255) || (d[i + 1] != 0 && d[i + 1] != 255)) ++n;
+            return n;
+        };
+        const int smooth = mixed();
+        r.set_msaa(1);
+        expect(r.msaa() == 1, "renderer: multisampling off");
+        const int hard = mixed();
+        expect(hard == 0, "renderer: without multisampling every pixel is one colour or the other");
+        if (display.gpu().max_samples > 1) expect(smooth > 0, "renderer: multisampled, the diagonal edge's pixels are mixed");
+        r.draw(src);
+        expect(r.read_back() == px, "renderer: the first picture again, multisampling off");
+    }
+
+    // A frame in two renders (Toy Racer's races): the second's clip is the
+    // bottom half, where it draws a white quad over everything. Only its clip
+    // changes; the top half is the first render's, with and without
+    // multisampling (the render area is the clip: nothing else is cleared,
+    // stored or resolved).
+    for (const unsigned samples : {1u, 4u}) {
+        r.set_msaa(samples);
+        dreamcast::renderer::Source first = src;
+        first.frame_buffer = 0x1C0000;
+        r.draw(first);
+        const std::vector<uint8_t> whole = r.read_back();
+        ta::Scene white;
+        {
+            ta::Strip s{};
+            s.list = ta::kOpaque, s.pcw = gouraud, s.isp = isp_ge, s.count = 4;
+            white.vertices = {vertex(0, 0, 0.9f, 1, 1, 1), vertex(64, 0, 0.9f, 1, 1, 1), vertex(0, 48, 0.9f, 1, 1, 1), vertex(64, 48, 0.9f, 1, 1, 1)};
+            white.strips.push_back(s);
+        }
+        dreamcast::renderer::Source second = first;
+        second.scene = &white;
+        second.clip_y0 = 24;
+        r.draw(second);
+        const std::vector<uint8_t> parts = r.read_back();
+        const size_t half = size_t(64) * 24 * 4;
+        expect(std::equal(parts.begin(), parts.begin() + std::ptrdiff_t(half), whole.begin()),
+               samples == 1 ? "renderer: a second render leaves the picture outside its clip as it was"
+                            : "renderer: multisampled, a second render leaves the picture outside its clip as it was");
+        bool all_white = true;
+        for (size_t i = half; i < parts.size(); i += 4) all_white = all_white && parts[i] == 255 && parts[i + 1] == 255 && parts[i + 2] == 255;
+        expect(all_white, samples == 1 ? "renderer: and draws its clip" : "renderer: multisampled, and draws its clip");
+    }
+    r.set_msaa(1);
 
     // Cheap shadows: an opaque red quad over everything and a translucent
     // green one over the left quarter, both taking shadows (PCW bit 7); one
@@ -432,6 +523,16 @@ int renderer() {
         expect(pixel_is(pic, 60, 24, 0, 0, 255), "auto-sort: nothing behind an opaque surface");
         const auto sent = draw(sc, [](dreamcast::renderer::Source& s) { s.presort = true; });
         expect(pixel_is(sent, 6, 44, 64, 127, 0) && pixel_is(sent, 44, 4, 64, 127, 0), "presort: in the order sent everywhere");
+        // The fallback, triangle by triangle by mean depth: the green quad's
+        // lower-right triangle (mean 0.58) is nearer than the red, its upper-
+        // left one (0.42) farther, so each point is blended the other way
+        // from the per-pixel order.
+        r.set_per_pixel_sort(false);
+        const auto by_triangle = draw(sc, [](dreamcast::renderer::Source& s) { s.presort = false; });
+        r.set_per_pixel_sort(true);
+        expect(pixel_is(by_triangle, 6, 44, 64, 127, 0), "triangle sort: the lower-right triangle, nearer, blended last");
+        expect(pixel_is(by_triangle, 44, 4, 127, 64, 0), "triangle sort: the upper-left triangle, farther, blended first");
+        expect(pixel_is(by_triangle, 60, 24, 0, 0, 255), "triangle sort: nothing behind an opaque surface");
     }
     // More fragments a pixel than the lists hold (one a pixel at first):
     // five additive layers of a tenth of red. The renderer reads the count
@@ -463,6 +564,78 @@ int renderer() {
         expect(pixel_is(pic, 20, 36, 255, 0, 0), "volume clip: the opaque surface inside the volume, outside the clip");
         expect(pixel_is(pic, 12, 20, 0, 128, 0), "volume clip: the translucent surface inside the volume and the clip, halved");
         expect(pixel_is(pic, 12, 36, 0, 255, 0), "volume clip: the translucent surface inside the volume, outside the clip");
+    }
+
+    // The texture cache lets go of what no render has used for a while (1,200
+    // renders): the first scene's texture, after that many renders of a scene
+    // without it, is gone, and drawing the first scene again decodes it anew
+    // into the same picture.
+    {
+        r.draw(src);
+        const uint32_t decoded = r.stats().textures, evicted = r.stats().evicted;
+        expect(r.stats().cached >= 1, "texture cache: the scene's texture is held");
+        dreamcast::renderer::Source plain = src;
+        plain.scene = &shadow;  // untextured
+        for (int k = 0; k < 1300; ++k) r.draw(plain);
+        expect(r.stats().evicted > evicted, "texture cache: a texture unused for 1,200 renders is let go");
+        expect(r.stats().cached == 0, "texture cache: nothing unused is held (the scene since has no texture)");
+        r.draw(src);
+        expect(r.stats().textures == decoded + 1, "texture cache: drawn again, it's decoded anew");
+        expect(r.read_back() == px, "texture cache: into the same picture");
+    }
+
+    // Texture packs: the scene's texture dumped once, named by its size and
+    // hash, as decoded; a replacement of another size (16x16 yellow) under
+    // that name, in a folder in the load folder, drawn in its place; without
+    // packs, the original again.
+    {
+        namespace fs = std::filesystem;
+        const fs::path root = fs::temp_directory_path() / "qilin_render_test_packs";
+        std::error_code ec;
+        fs::remove_all(root, ec);
+        r.set_texture_packs({}, root / "dump");
+        r.draw(src);
+        std::vector<fs::path> dumped;
+        for (const auto& e : fs::directory_iterator(root / "dump", ec)) dumped.push_back(e.path());
+        expect(dumped.size() == 1 && r.stats().dumped == 1, "texture packs: the scene's one texture dumped");
+        uint64_t hash = 0;
+        const std::string name = dumped.empty() ? std::string() : dumped[0].filename().string();
+        expect(dreamcast::renderer::pack_hash(name, hash) && name == dreamcast::renderer::pack_name(8, 8, hash),
+               "texture packs: named by its size and hash");
+        uint32_t w = 0, h = 0;
+        std::vector<uint32_t> rgba;
+        std::string error;
+        expect(!dumped.empty() && qilin::host::load_png(dumped[0], w, h, rgba, error) && w == 8 && h == 8 &&
+                   std::ranges::all_of(rgba, [](uint32_t v) { return v == 0xFFFF0000u; }),
+               "texture packs: dumped as decoded (opaque blue)");
+        r.draw(src);
+        expect(r.stats().dumped == 1, "texture packs: dumped once a run");
+        fs::create_directories(root / "load" / "folder", ec);
+        const std::vector<uint32_t> yellow(16 * 16, 0xFF00FFFFu);
+        expect(qilin::host::save_png(root / "load" / "folder" / name, 16, 16, yellow.data(), error), "texture packs: a replacement written");
+        r.set_texture_packs(root / "load", {});
+        expect(r.stats().pack_files == 1, "texture packs: the replacement found, in a folder in the load folder");
+        r.draw(src);
+        expect(r.read_back() == px, "texture packs: the original drawn while its replacement is read");
+        r.wait_texture_packs();
+        r.draw(src);
+        const std::vector<uint8_t> packed = r.read_back();
+        const auto packed_is = [&](int x, int y, uint8_t red, uint8_t green, uint8_t blue) {
+            const uint8_t* q = &packed[size_t(y * 64 + x) * 4];
+            return q[0] == red && q[1] == green && q[2] == blue;
+        };
+        expect(packed_is(56, 8, 255, 255, 0), "texture packs: the replacement drawn in the texture's place");
+        expect(packed_is(10, 10, 0, 255, 0) && r.stats().replaced >= 1, "texture packs: the rest as before");
+        // Reloaded after the file is gone: the original again.
+        fs::remove(root / "load" / "folder" / name, ec);
+        r.reload_texture_packs();
+        expect(r.stats().pack_files == 0, "texture packs: reloaded, the removed file isn't found");
+        r.draw(src);
+        expect(r.read_back() == px, "texture packs: reloaded without the replacement, the original again");
+        r.set_texture_packs({}, {});
+        r.draw(src);
+        expect(r.read_back() == px, "texture packs: without them, the original again");
+        fs::remove_all(root, ec);
     }
     return 0;
 }

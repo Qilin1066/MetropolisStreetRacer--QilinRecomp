@@ -58,7 +58,14 @@ struct Settings {
     unsigned mask = 30;               // CRT: the phosphor stripes, 0-100
     unsigned scale = 1;               // internal_scale: 1-8x the console's 640x480; 0: auto (the screen's height)
     unsigned anisotropy = 1;          // filtered textures' filtering: 1 (the console's), 2, 4, 8 or 16
+    unsigned msaa = 1;                // multisampling, samples a pixel: 1 (none, the console's), 2, 4 or 8
+    bool texture_packs = true;        // draw the replacements in textures/load in the data folder
+    bool dump_textures = false;       // save every texture to textures/dump in the data folder
+    bool smaa = false;                // SMAA 1x on the picture (antialiasing = smaa)
+    bool fsr = false;                 // AMD FSR 1 where the picture is shown larger than drawn, not at whole multiples
+    unsigned sharpness = 80;          // FSR's sharpening, 0-100
     bool vsync = true;                // at the display's refresh (no tearing); off: the lowest latency
+    bool low_latency = true;          // with vsync: at most one finished picture waiting for the display
     std::string gpu;                  // the graphics device's name (empty: the best one)
     bool performance_overlay = false; // frame rate, 1% and 0.1% lows and frame times in a corner (F3 switches it)
     bool match_refresh = true;        // fullscreen: a refresh that's a multiple of 60 Hz when the desktop's isn't
@@ -68,6 +75,7 @@ struct Settings {
     unsigned rumble_strength = 100;  // how strong, in percent
     unsigned volume = 100;           // the sound's, in percent
     bool mute_unfocused = false;     // silent while another window has the keyboard
+    std::string sound_device;        // the playback device by name (empty: the system's default), from the next start
     std::vector<Binding> controls[kControlCount];
     // [console]: what the game reads as the Dreamcast's own settings
     unsigned language = 1;  // 1 English, 2 German, 3 French, 4 Spanish (the disc's)

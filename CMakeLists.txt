@@ -60,6 +60,16 @@ function(qilin_tool target)
     endif()
 endfunction()
 
+# Checked file storage (whole files through a temporary, read with their size checked), independent
+# of SDL and Vulkan: the settings, the saves' history, flash memory (Toy Commander's, kept in step).
+add_library(qilin_file_store STATIC host/src/file_store.cpp)
+target_include_directories(qilin_file_store PUBLIC host/include)
+target_link_libraries(qilin_file_store PRIVATE qilin_warnings)
+add_executable(qilin_file_store_test host/tests/file_store_test.cpp)
+target_include_directories(qilin_file_store_test PRIVATE recomp/runtime)
+target_link_libraries(qilin_file_store_test PRIVATE qilin_file_store qilin_warnings)
+add_test(NAME qilin_file_store_test COMMAND qilin_file_store_test)
+
 # ---- Disc image, IP.BIN and boot-file loaders: runtime code too (no std::format) ----
 add_library(qilin_disc STATIC recomp/src/gdrom.cpp recomp/src/bootfile.cpp recomp/src/sha256.cpp)
 target_include_directories(qilin_disc PUBLIC recomp/src)
@@ -169,13 +179,41 @@ if(QILIN_HOST)
 
     # The host layer and the settings menu: the game's name in messages, the
     # window's title, the data folder (qilin/msr) and the settings file (msr.ini).
-    add_library(qilin_host STATIC host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp)
-    target_include_directories(qilin_host PUBLIC host/include)
+    # SMAA 1x and AMD FidelityFX FSR 1 for the picture (host/src/smaa, host/src/fsr): the upstream
+    # files the port builds with, downloaded once at their pinned commits and checked by hash
+    # (THIRD_PARTY.md). Their shaders are compiled once to SPIR-V and committed (tools/*_spirv.sh).
+    set(QILIN_THIRD_PARTY ${CMAKE_BINARY_DIR}/third_party)
+    function(qilin_fetch_file url file sha256)
+        if(NOT EXISTS ${QILIN_THIRD_PARTY}/${file})
+            file(DOWNLOAD ${url} ${QILIN_THIRD_PARTY}/${file} EXPECTED_HASH SHA256=${sha256} TLS_VERIFY ON STATUS status)
+            list(GET status 0 code)
+            if(NOT code EQUAL 0)
+                message(FATAL_ERROR "can't download ${url}: ${status}")
+            endif()
+        endif()
+        file(SHA256 ${QILIN_THIRD_PARTY}/${file} got)
+        if(NOT got STREQUAL sha256)
+            message(FATAL_ERROR "${QILIN_THIRD_PARTY}/${file} isn't the pinned file (SHA-256 ${got}); delete it to download it again")
+        endif()
+    endfunction()
+    set(fsr https://raw.githubusercontent.com/GPUOpen-Effects/FidelityFX-FSR/a21ffb8f6c13233ba336352bdff293894c706575)
+    set(smaa https://raw.githubusercontent.com/iryoku/smaa/71c806a838bdd7d517df19192a20f0c61b3ca29d)
+    qilin_fetch_file(${fsr}/ffx-fsr/ffx_a.h fsr1/ffx_a.h f60e2722fcd13989523b9164d776ab382b3692791767f3bf8bb19967f763f3fb)
+    qilin_fetch_file(${fsr}/ffx-fsr/ffx_fsr1.h fsr1/ffx_fsr1.h 93c3922362ea7fc99cbcc698ca30c98de4f8c246d1fbb0b09e015ddef38ce3a5)
+    qilin_fetch_file(${fsr}/license.txt fsr1/LICENSE.txt db089274ce766da70f5b7d791029c3486f9f9e27c8c79c652689603d3192e802)
+    qilin_fetch_file(${smaa}/Textures/AreaTex.h smaa/AreaTex.h 1933bf43ce86ba71f7ed5f0fa94b148610c634dc3395b9bc67a817d51ee73af2)
+    qilin_fetch_file(${smaa}/Textures/SearchTex.h smaa/SearchTex.h 1fac315ab5f87b60083c9b8387af17f056204d3d1bf21500f2acc5b3e8c1a37a)
+    qilin_fetch_file(${smaa}/SMAA.hlsl smaa/SMAA.hlsl 4db53d92ef0b45661f8450303589ffabce93c352cae4282a6f32dd2b80efbeb9)
+    qilin_fetch_file(${smaa}/LICENSE.txt smaa/LICENSE.txt 2b848b67ba50ac40b53e11cf1ccdaee2a190ca83b4652cba695a5f1ce81f52ae)
+
+    add_library(qilin_host STATIC host/src/vulkan.cpp host/src/display.cpp host/src/audio.cpp host/src/paths.cpp host/src/image.cpp
+        host/src/fsr/fsr_constants.cpp)
+    target_include_directories(qilin_host PUBLIC host/include PRIVATE host/src ${QILIN_THIRD_PARTY}/fsr1 ${QILIN_THIRD_PARTY}/smaa)
     target_compile_definitions(qilin_host PUBLIC QILIN_APP="msr" QILIN_APP_TITLE="Metropolis Street Racer")
     target_link_libraries(qilin_host PUBLIC qilin_volk PRIVATE SDL3::SDL3-static qilin_warnings)
     add_library(dreamcast_menu STATIC dreamcast/src/settings.cpp dreamcast/src/menu.cpp dreamcast/src/save_history.cpp)
     target_include_directories(dreamcast_menu PUBLIC dreamcast/src recomp/runtime)
-    target_link_libraries(dreamcast_menu PUBLIC qilin_host qilin_imgui PRIVATE SDL3::SDL3-static qilin_warnings)
+    target_link_libraries(dreamcast_menu PUBLIC qilin_host qilin_imgui PRIVATE SDL3::SDL3-static qilin_warnings qilin_file_store)
     target_compile_definitions(dreamcast_menu PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
     # The Dreamcast's hardware as the port provides it (Toy Commander's dreamcast/ layer, kept in
     # step): the PowerVR2 and system bus registers, video memory, the tile accelerator, the
@@ -185,7 +223,7 @@ if(QILIN_HOST)
         dreamcast/src/video.cpp dreamcast/src/maple.cpp dreamcast/src/sh4.cpp dreamcast/src/clock.cpp dreamcast/src/ta.cpp
         dreamcast/src/interrupts.cpp dreamcast/src/sound.cpp dreamcast/src/flash.cpp dreamcast/src/aica.cpp)
     target_include_directories(dreamcast_hw PUBLIC dreamcast/src)
-    target_link_libraries(dreamcast_hw PUBLIC qilin_runtime dreamcast_menu qilin_disc PRIVATE SDL3::SDL3-static qilin_warnings)
+    target_link_libraries(dreamcast_hw PUBLIC qilin_runtime dreamcast_menu qilin_disc qilin_file_store PRIVATE SDL3::SDL3-static qilin_warnings)
     target_compile_definitions(dreamcast_hw PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
     # Vulkan structures are written {sType} with the rest zeroed: that's the idiom, not a mistake.
     if(NOT MSVC)
@@ -214,12 +252,12 @@ if(QILIN_HOST)
     # The settings file's reader and writer, and the saves' history.
     add_executable(dreamcast_settings_test dreamcast/tests/settings_test.cpp dreamcast/src/settings.cpp)
     target_include_directories(dreamcast_settings_test PRIVATE dreamcast/src recomp/runtime host/include)
-    target_link_libraries(dreamcast_settings_test PRIVATE qilin_warnings)
+    target_link_libraries(dreamcast_settings_test PRIVATE qilin_warnings qilin_file_store)
     target_compile_definitions(dreamcast_settings_test PRIVATE QILIN_APP="msr" QILIN_APP_TITLE="Metropolis Street Racer")
     add_test(NAME dreamcast_settings_test COMMAND dreamcast_settings_test)
     add_executable(dreamcast_save_history_test dreamcast/tests/save_history_test.cpp dreamcast/src/save_history.cpp)
     target_include_directories(dreamcast_save_history_test PRIVATE dreamcast/src recomp/runtime)
-    target_link_libraries(dreamcast_save_history_test PRIVATE qilin_warnings)
+    target_link_libraries(dreamcast_save_history_test PRIVATE qilin_warnings qilin_file_store)
     add_test(NAME dreamcast_save_history_test COMMAND dreamcast_save_history_test)
     add_executable(qilin_frame_times_test host/tests/frame_times_test.cpp)
     target_include_directories(qilin_frame_times_test PRIVATE host/include)

@@ -105,6 +105,56 @@ int main() {
             ++failures;
         }
     }
+    // SMAA: a hard diagonal edge (white below it, black above), shown with nearest sampling, is
+    // only black and white without it; with it, the edge's pixels are blended.
+    {
+        constexpr int kSide = 32;
+        std::vector<uint8_t> edge(kSide * kSide * 4);
+        for (int y = 0; y < kSide; ++y)
+            for (int x = 0; x < kSide; ++x) {
+                const uint8_t v = 2 * x < y ? 255 : 0;  // a shallow slope: long steps, SMAA's case
+                uint8_t* p = &edge[size_t(y * kSide + x) * 4];
+                p[0] = p[1] = p[2] = v, p[3] = 255;
+            }
+        qilin::host::Picture plain;
+        plain.scaling = qilin::host::Scaling::stretch;
+        plain.smooth = false;
+        const auto blended = [&](const qilin::host::Picture& p) {
+            d.set_picture(p);
+            d.present(kSide, kSide, edge.data(), 64.0f / 36.0f, kSide);
+            const std::vector<uint8_t> s = d.read_back();
+            int n = 0;
+            for (size_t i = 0; i < s.size(); i += 4) n += s[i] > 24 && s[i] < 231;
+            return n;
+        };
+        const int without = blended(plain);
+        qilin::host::Picture smaa = plain;
+        smaa.smaa = true;
+        const int with = blended(smaa);
+        if (without != 0 || with == 0) {
+            std::printf("vktest: SMAA: %d blended pixels without it, %d with\n", without, with);
+            ++failures;
+        }
+    }
+    // FSR 1: a flat red picture scaled up (fit, not whole multiples) stays flat red inside the
+    // same bars: EASU and RCAS ran, at the shown size, and wrote every pixel of it.
+    {
+        qilin::host::Picture fsr;
+        fsr.fsr = true;
+        fsr.sharpness = 1.0f;
+        d.set_picture(fsr);
+        d.present(8, 4, frame.data(), 2.0f, 4);
+        const std::vector<uint8_t> s = d.read_back();
+        auto px2 = [&](int x, int y) { return &s[static_cast<size_t>(y * 64 + x) * 4]; };
+        bool flat = true;
+        for (int y = 2; y < 34; ++y)
+            for (int x = 0; x < 64; ++x) flat = flat && px2(x, y)[0] >= 250 && px2(x, y)[1] <= 5 && px2(x, y)[2] <= 5;
+        if (!flat || px2(32, 0)[0] != 0 || px2(32, 35)[0] != 0) {
+            std::printf("vktest: FSR: the picture isn't flat red inside its bars (centre %u,%u,%u; top bar %u)\n", px2(32, 18)[0],
+                        px2(32, 18)[1], px2(32, 18)[2], px2(32, 0)[0]);
+            ++failures;
+        }
+    }
     std::printf("vktest: %s on %s\n", failures ? "FAILED" : "passed", d.device_name().c_str());
     return failures ? 1 : 0;
 }

@@ -37,14 +37,18 @@ uint32_t& reg(uint32_t a) { return g_regs[(a - kLo) / 4]; }
 // (0x005F6904) and errors (0x005F6908). The hardware sets their bits; writing
 // ones clears them.
 constexpr uint32_t kStatusNormal = 0x005F6900u, kStatusExternal = 0x005F6904u, kStatusError = 0x005F6908u;
-// Other threads raise events too (the sound chip's: its driver's messages, the sound CPU's
-// interrupt) while the game acknowledges others, so the three words are atomic, apart from the
-// register file: no event is lost and none comes back.
-std::atomic<uint32_t> g_status[3];
-std::atomic<uint32_t>* status(uint32_t a) { return a >= kStatusNormal && a <= kStatusError && !(a & 3u) ? &g_status[(a - kStatusNormal) / 4] : nullptr; }
-uint32_t load(uint32_t a) {
-    if (std::atomic<uint32_t>* s = status(a)) return s->load(std::memory_order_acquire);
-    return reg(a);
+
+// External events raised from another thread (the sound chip's interrupt,
+// from the mixer's 5 ms tick, aica.cpp): the register file is the guest
+// thread's alone, so they wait here and the guest thread takes them in
+// whenever it reads or acknowledges the external status. One raised just as
+// the guest looks is seen at its next look (the next interrupt service, at
+// most a frame later), as a hardware interrupt arriving a moment later would be.
+std::atomic<uint32_t> g_external_raised{0};
+uint32_t& external_status() {
+    uint32_t& r = reg(kStatusExternal);
+    if (g_external_raised.load(std::memory_order_relaxed) != 0) r |= g_external_raised.exchange(0, std::memory_order_acquire);
+    return r;
 }
 
 uint32_t read(uint32_t a, unsigned n) {
@@ -52,7 +56,8 @@ uint32_t read(uint32_t a, unsigned n) {
     switch (a) {
     case kId: return 0x17FD11DBu;
     case kRevision: return 0x11u;
-    default: return load(a);
+    case kStatusExternal: return external_status();
+    default: return reg(a);
     }
 }
 
@@ -200,9 +205,9 @@ void write(uint32_t a, uint32_t v, unsigned n) {
         reg(a) = v;
         start_render();
         return;
+    case kStatusExternal: external_status() &= ~v; return;  // what was raised meanwhile, then the acknowledgement
     case kStatusNormal:
-    case kStatusExternal:
-    case kStatusError: status(a)->fetch_and(~v, std::memory_order_acq_rel); return;
+    case kStatusError: reg(a) &= ~v; return;
     default: reg(a) = v; return;
     }
 }
@@ -286,15 +291,18 @@ uint64_t vram64_generation(uint32_t offset, uint32_t n) {
     return newest;
 }
 
-uint32_t pvr_register(uint32_t a) { return load(a & 0x1FFFFFFFu); }
+uint32_t pvr_register(uint32_t a) {
+    a &= 0x1FFFFFFFu;
+    return a == kStatusExternal ? external_status() : reg(a);
+}
 const uint32_t* pvr_palette() { return &reg(0x005F9000u); }
 void set_pvr_register(uint32_t a, uint32_t v) { write(a & 0x1FFFFFFFu, v, 4); }
 void raise_event(unsigned bit) {
-    g_status[0].fetch_or(1u << bit, std::memory_order_acq_rel);
+    reg(kStatusNormal) |= 1u << bit;  // the guest thread's alone
     interrupt_pending();
 }
-void raise_external_event(unsigned bit) {
-    g_status[1].fetch_or(1u << bit, std::memory_order_acq_rel);
+void raise_external_event(unsigned bit) {  // any thread
+    g_external_raised.fetch_or(1u << bit, std::memory_order_release);
     interrupt_pending();
 }
 

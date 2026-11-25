@@ -8,6 +8,8 @@
 
 #include "qilin/host/pad.hpp"
 #include "system.hpp"
+#include "qilin/host/file_store.hpp"
+#include "path.hpp"
 
 namespace dreamcast {
 namespace host = qilin::host;
@@ -153,9 +155,9 @@ Settings default_settings() {
 
 bool apply_preset(Settings& s, const std::string& name) {
     if (name == "original" || name == "low-end") {  // the console's picture: 1x, its filtering (a Pi 4 does exactly this)
-        s.scale = 1, s.anisotropy = 1, s.vsync = true;
-    } else if (name == "desktop") {  // a desktop GPU: the screen's height (auto), 16x anisotropic
-        s.scale = 0, s.anisotropy = 16, s.vsync = true;
+        s.scale = 1, s.anisotropy = 1, s.msaa = 1, s.vsync = true;
+    } else if (name == "desktop") {  // a desktop GPU: the screen's height (auto), 16x anisotropic, 4x MSAA
+        s.scale = 0, s.anisotropy = 16, s.msaa = 4, s.vsync = true;
     } else {
         return false;
     }
@@ -171,6 +173,10 @@ host::Picture picture_of(const Settings& s) {
     p.scanlines = float(s.scanlines) / 100.0f;
     p.mask = float(s.mask) / 100.0f;
     p.vsync = s.vsync;
+    p.low_latency = s.low_latency;
+    p.smaa = s.smaa;
+    p.fsr = s.fsr;
+    p.sharpness = float(s.sharpness) / 100.0f;
     p.match_refresh = s.match_refresh;
     p.variable_refresh = s.variable_refresh;
     return p;
@@ -178,7 +184,7 @@ host::Picture picture_of(const Settings& s) {
 
 bool parse_settings(const std::string& text, Settings& out, std::string& error) {
     Settings s = default_settings();
-    std::istringstream in(text);
+    std::istringstream in(text.starts_with("\xEF\xBB\xBF") ? text.substr(3) : text);
     std::string line, section;
     bool seen[kControlCount] = {};
     for (int n = 1; std::getline(in, line); ++n) {
@@ -244,8 +250,24 @@ bool parse_settings(const std::string& text, Settings& out, std::string& error) 
             } else if (name == "anisotropy") {
                 if (!number(s.anisotropy, 1, 16)) return false;
                 if (s.anisotropy & (s.anisotropy - 1)) return fail("anisotropy is 1, 2, 4, 8 or 16");
+            } else if (name == "msaa") {
+                if (!number(s.msaa, 1, 8) || (s.msaa & (s.msaa - 1))) return fail("msaa is 1, 2, 4 or 8");
+            } else if (name == "texture_packs") {
+                if (!boolean(s.texture_packs)) return false;
+            } else if (name == "dump_textures") {
+                if (!boolean(s.dump_textures)) return false;
+            } else if (name == "antialiasing") {
+                if (v == "smaa") s.smaa = true;
+                else if (v == "off") s.smaa = false;
+                else return fail("antialiasing is off or smaa");
+            } else if (name == "fsr") {
+                if (!boolean(s.fsr)) return false;
+            } else if (name == "sharpness") {
+                if (!number(s.sharpness, 0, 100)) return false;
             } else if (name == "vsync") {
                 if (!boolean(s.vsync)) return false;
+            } else if (name == "low_latency") {
+                if (!boolean(s.low_latency)) return false;
             } else if (name == "gpu") {
                 s.gpu = value;
             } else if (name == "performance_overlay") {
@@ -256,7 +278,8 @@ bool parse_settings(const std::string& text, Settings& out, std::string& error) 
                 if (!boolean(s.variable_refresh)) return false;
             } else {
                 return fail("[display] has no '" + name +
-                            "' (preset fullscreen monitor scaling smooth look scanlines mask internal_scale anisotropy vsync gpu "
+                            "' (preset fullscreen monitor scaling smooth look scanlines mask internal_scale anisotropy msaa texture_packs "
+                            "dump_textures antialiasing fsr sharpness vsync low_latency gpu "
                             "performance_overlay match_refresh variable_refresh)");
             }
             continue;
@@ -290,10 +313,14 @@ bool parse_settings(const std::string& text, Settings& out, std::string& error) 
             if (!boolean(s.mute_unfocused)) return false;
             continue;
         }
+        if (name == "sound_device") {
+            s.sound_device = value;
+            continue;
+        }
         unsigned c = 0;
         while (c < kControlCount && name != kControlNames[c]) ++c;
         if (c == kControlCount)
-            return fail("'" + name + "' isn't a control (a b x y start up down left right stick_up stick_down stick_left stick_right l r), rumble, rumble_strength, volume or mute_unfocused");
+            return fail("'" + name + "' isn't a control (a b x y start up down left right stick_up stick_down stick_left stick_right l r), rumble, rumble_strength, volume mute_unfocused or sound_device");
         if (seen[c]) return fail("'" + name + "' is set twice");
         seen[c] = true;
         s.controls[c].clear();
@@ -340,8 +367,25 @@ std::string settings_text(const Settings& s) {
         "# Anisotropic filtering of the textures the game filters: 1 (the console's), 2, 4, 8 or 16. Sharper\n"
         "# textures at a grazing angle (a floor far off); the game's unfiltered textures stay as they are.\n"
         "anisotropy = " + std::to_string(s.anisotropy) + "\n"
-        "# vsync: true, no tearing; false, the lowest latency.\n"
+        "# Multisample anti-aliasing: 1 (none, the console's), 2, 4 or 8 samples a pixel (at most what the\n"
+        "# GPU has). Smooths polygons' edges; with internal_scale above 1 they're smoother still.\n"
+        "msaa = " + std::to_string(s.msaa) + "\n"
+        "# Texture packs: PNG files in the data folder's textures/load (or folders in it), each drawn in place\n"
+        "# of the texture its name gives (<width>x<height>_<hash>.png), at any size. dump_textures saves every\n"
+        "# texture the game draws to textures/dump, so named, to make one from.\n"
+        "texture_packs = " + b(s.texture_packs) + "\n"
+        "dump_textures = " + b(s.dump_textures) + "\n"
+        "# Anti-aliasing on the picture: off, or smaa (SMAA 1x: jagged edges smoothed at the game's\n"
+        "# resolution, before the picture is scaled to the window; with msaa or internal_scale, smoother still).\n"
+        "antialiasing = " + (s.smaa ? "smaa" : "off") + "\n"
+        "# AMD FidelityFX Super Resolution 1 where the picture is shown larger than it's drawn (not with\n"
+        "# scaling = integer): scaled up edge-adaptively and sharpened, sharpness 0 (least) to 100.\n"
+        "fsr = " + b(s.fsr) + "\n"
+        "sharpness = " + std::to_string(s.sharpness) + "\n"
+        "# vsync: true, no tearing; false, the lowest latency. low_latency, with vsync: at most one finished\n"
+        "# picture waits for the display (false: one more, smoother where the GPU's time varies).\n"
         "vsync = " + b(s.vsync) + "\n"
+        "low_latency = " + b(s.low_latency) + "\n"
         "# The graphics device, by name (empty: the best one).\n"
         "gpu = " + s.gpu + "\n"
         "# Frame rate, 1% and 0.1% lows and recent frame times in a corner (F3 switches it).\n"
@@ -361,6 +405,8 @@ std::string settings_text(const Settings& s) {
         "# The sound's volume, 0 to 100, and whether it's silent while another window has the keyboard.\n"
         "volume = " + std::to_string(s.volume) + "\n"
         "mute_unfocused = " + b(s.mute_unfocused) + "\n"
+        "# The playback device, by name (empty: the system's default, followed when it changes), from the next start.\n"
+        "sound_device = " + s.sound_device + "\n"
         "# The Dreamcast controller on port A. A gamepad's left stick and triggers work its stick and triggers\n"
         "# in full; the inputs below press its buttons, its stick all the way or its triggers all the way in.\n"
         "# Each control takes a list of inputs, separated by commas; an empty list leaves it unused. The\n"
@@ -389,33 +435,25 @@ std::string settings_text(const Settings& s) {
 std::filesystem::path settings_file(const std::filesystem::path& folder) { return folder / (QILIN_APP ".ini"); }
 
 bool save_settings(const std::filesystem::path& folder, const Settings& s) {
-    const std::filesystem::path file = settings_file(folder), tmp = file.string() + ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        out << settings_text(s);
-        if (!out.flush()) return false;
-    }
-    std::error_code ec;
-    std::filesystem::rename(tmp, file, ec);
-    return !ec;
+    return qilin::host::atomic_write(settings_file(folder), settings_text(s));
 }
 
 Settings load_settings(const std::filesystem::path& folder) {
     const std::filesystem::path file = settings_file(folder);
-    std::ifstream in(file, std::ios::binary);
-    if (in) {
-        std::stringstream buf;
-        buf << in.rdbuf();
+    std::string text;
+    bool missing = false;
+    if (qilin::host::read_file(file, text, &missing)) {
         Settings s;
         std::string error;
-        if (!parse_settings(buf.str(), s, error))
-            qilin::rt::fatal("%s, %s (fix it, or delete the file to get the defaults back)", file.string().c_str(), error.c_str());
-        qilin::rt::log("settings: read %s", file.string().c_str());
+        if (!parse_settings(text, s, error))
+            qilin::rt::fatal("settings: %s (fix it, or delete the file to get the defaults back)", error.c_str());
+        qilin::rt::log("settings: read %s", qilin::utf8_path(file).c_str());
         return s;
     }
+    if (!missing) qilin::rt::fatal("cannot read existing settings; the file has been left unchanged");
     const Settings s = default_settings();
-    if (!save_settings(folder, s)) qilin::rt::fatal("cannot write %s", file.string().c_str());
-    qilin::rt::log("settings: wrote the defaults to %s", file.string().c_str());
+    if (!save_settings(folder, s)) qilin::rt::fatal("cannot write %s", qilin::utf8_path(file).c_str());
+    qilin::rt::log("settings: wrote the defaults to %s", qilin::utf8_path(file).c_str());
     return s;
 }
 

@@ -59,7 +59,10 @@ void report(std::FILE* out, const Stop& s, const Context* c);
 // The return addresses on the guest stack from r15 up to `stack_top`, as a
 // call chain.
 void backtrace(std::FILE* out, const Context& c, uint32_t stack_top, unsigned most = 24);
-[[noreturn]] void fatal(const char* format, ...) QILIN_PRINTF(1, 2);
+// Ends the program with `code`, everything written out first. No static destructors run: guest
+// threads may be parked on host threads (fibers), and other threads (sound) still running.
+[[noreturn]] void end(int code);
+[[noreturn]] void fatal(const char* format, ...) QILIN_PRINTF(1, 2);  // the message, then end(3)
 void log(const char* format, ...) QILIN_PRINTF(1, 2);
 
 }  // namespace qilin::rt

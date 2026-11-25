@@ -45,5 +45,9 @@ void show(uint32_t width, uint32_t height, const uint8_t* rgba);
 // The window's events, from the thread that opened it (a call from any other
 // does nothing). Ends the program when the player closes the window.
 void poll();
+// How much wider than 4:3 the screen is (its width over height, times 3/4),
+// from 1 (4:3 or narrower) to 3: what the game's camera is widened by
+// (game.hpp). Safe from any thread.
+float screen_widening();
 
 }  // namespace dreamcast::video

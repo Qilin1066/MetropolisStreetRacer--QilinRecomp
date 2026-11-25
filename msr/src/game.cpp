@@ -92,4 +92,10 @@ void raise_bus_event(rt::Context& c, uint32_t event) {
 
 // set_console and on_sound_mode: msr/src/console.cpp, with Shinobi's settings queries.
 
+// Widescreen: not yet for this game. Its cameras aren't widened (the picture is the console's
+// 4:3, shown at 4:3), and the intro movie is shown by video::show, apart from the renderer.
+float widening() { return 1.0f; }
+void widen_to(float) {}
+bool movie_playing() { return false; }
+
 }  // namespace dreamcast::game
