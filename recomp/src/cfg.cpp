@@ -590,7 +590,9 @@ std::vector<Cfg::Kind> Cfg::claims() const {
 
 // Is a function explored on trial good enough to keep on weak evidence?
 bool Cfg::acceptable(const Function& f, const std::vector<Kind>& kinds) const {
-    if (!f.clean() || f.insns.empty() || f.falls_into) return false;
+    if (!f.clean() || f.insns.empty()) return false;
+    // Running into the next function is kept only as the compiler's tail call: its epilogue done.
+    if (f.falls_into && !(starts_.contains(f.falls_into) && epilogue_before(f.falls_into))) return false;
     const uint32_t base = boot_.base();
     const auto free_or = [&](uint32_t a, uint32_t n, Kind also) {
         for (uint32_t i = 0; i < n; ++i) {
@@ -616,10 +618,33 @@ bool Cfg::acceptable(const Function& f, const std::vector<Kind>& kinds) const {
         return k == Kind::Code ? starts_.contains(t) : k == Kind::Unknown;
     };
     for (const auto& [site, target] : f.calls)
-        if (!could_be_code(target) && !std::ranges::binary_search(f.insns, target)) return false;
+        if (!could_be_code(target) && !std::ranges::binary_search(f.insns, target) && !hidden_entry(target)) return false;
     for (const auto& [site, target] : f.tails)
         if (!could_be_code(target)) return false;
     return true;
+}
+
+bool Cfg::epilogue_before(uint32_t t) const {
+    // Back over the pops of saved registers (mov.l @r15+,rN; fmov @r15+,frN) to lds.l @r15+,pr.
+    for (uint32_t a = t - 2, pops = 0; a >= boot_.base() && pops <= 16; a -= 2, ++pops) {
+        const Insn in = insn(a);
+        if (in.op == Op::lds_l_pr && in.n() == 15) return true;
+        const bool pop = (in.op == Op::mov_l_load_inc || in.op == Op::fmov_load_inc) && in.m() == 15 && in.n() != 15;
+        if (!pop) return false;
+    }
+    return false;
+}
+
+bool Cfg::hidden_entry(uint32_t t) const {
+    if ((t & 1u) || starts_.contains(t) || !in_image(t) || t < boot_.base() + 4) return false;
+    const auto owner = funcs_.upper_bound(t);
+    if (owner == funcs_.begin()) return false;
+    const Function& o = std::prev(owner)->second;
+    if (!std::ranges::binary_search(o.insns, t) || o.slots.contains(t)) return false;
+    if (epilogue_before(t)) return true;
+    const Insn ender = insn(t - 4);
+    const bool ends = ender.op == Op::rts || ender.op == Op::bra || ender.op == Op::jmp || ender.op == Op::braf;
+    return ends && o.slots.contains(t - 2);
 }
 
 bool Cfg::acceptable_stub(uint32_t c, const std::vector<Kind>& kinds) const {
@@ -680,7 +705,7 @@ bool Cfg::targets_acceptable(const Function& f, const std::vector<Kind>& kinds) 
         return acceptable(explore(target, bound_of(target)), with);
     };
     for (const auto& [site, target] : f.calls)
-        if (!ok(target)) return false;
+        if (!hidden_entry(target) && !ok(target)) return false;
     for (const auto& [site, target] : f.tails)
         if (!ok(target)) return false;
     return true;

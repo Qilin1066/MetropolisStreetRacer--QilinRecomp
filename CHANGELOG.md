@@ -13,6 +13,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ### Fixed
 - **The sound driver's jumps into straight-line code** (`add rP, pc, #0; add pc, rP, rI`, at `0x5ED4`, `0xA1C` and `0xA94` in `MANATEE.DRV`) were lifted as returns, and the driver stopped as soon as the game played its real sound archives. They are now `switch`es over the entries the index can reach: the offsets an `and` with a mask allows just before, or, for an index loaded from memory, every word to the block's end. Any other value stops. With the whole disc, the game now runs past Clock Settings to its title cards.
+- **Functions called only from code found through data, and buried in other functions** (the game's `0x8C0AEA42`, `0x8C053106`): a call target inside a known function is an entry of its own when it follows a delayed return or jump and its slot, or an epilogue (`lds.l @r15+,pr` and pops). A candidate that runs into a known function with its epilogue done is kept (a tail call by falling through). 13 functions the analysis had missed (5,309 in all, 870 bytes left unknown, was 8,158), the code the game calls after its title screen: the attract demo now plays.
 
 ### Added
 - **The game reaches its first screen** (Clock Settings, drawn correctly; run headless in the cloud workspace on the extracted disc). What it took:

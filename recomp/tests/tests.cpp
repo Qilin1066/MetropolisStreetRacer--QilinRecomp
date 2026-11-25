@@ -452,6 +452,40 @@ void test_cfg() {
         const Coverage c3 = cfg3.coverage();
         CHECK(cfg3.functions().size() == 1 && c3.code == 8 && c3.dead == 6 && c3.unknown == 0);
     }
+    // A function falling into the one it tail-calls, once its epilogue is done (the game's
+    // 0x8C07D9E6 into 0x8C07DB88): a call from code found later makes the second one a function
+    // of its own, and the caller is kept though the first runs into it.
+    {
+        const BootFile fall = program({
+            /* 00 main */ 0xD102,  // mov.l 0x0c,r1     (the address of X)
+            /* 02 */ 0x410B,       // jsr @r1
+            /* 04 */ 0x0009,       // nop
+            /* 06 */ 0x000B,       // rts
+            /* 08 */ 0x0009,       // nop
+            /* 0a */ 0x0000,
+            /* 0c */ 0x0010, 0x8C01,
+            /* 10 X */ 0x4F22,     // sts.l pr,@-r15
+            /* 12 */ 0xE001,       // mov #1,r0
+            /* 14 */ 0x4F26,       // lds.l @r15+,pr    (and on into Y)
+            /* 16 Y */ 0xE002,     // mov #2,r0
+            /* 18 */ 0x000B,       // rts
+            /* 1a */ 0x0009,       // nop
+            /* 1c Z */ 0x4F22,     // sts.l pr,@-r15    (the gap after X: nothing else names it)
+            /* 1e */ 0xBFFA,       // bsr 0x16          (Y, inside X until now)
+            /* 20 */ 0x0009,       // nop
+            /* 22 */ 0x4F26,       // lds.l @r15+,pr
+            /* 24 */ 0x000B,       // rts
+            /* 26 */ 0x0009,       // nop
+        });
+        Cfg cfg4(fall);
+        cfg4.run();
+        const auto& fns4 = cfg4.functions();
+        CHECK(fns4.size() == 4);
+        CHECK(fns4.contains(B + 0x16) && fns4.at(B + 0x16).origin == Origin::Call);
+        CHECK(fns4.contains(B + 0x1C) && fns4.at(B + 0x1C).origin == Origin::Gap);
+        CHECK(fns4.contains(B + 0x10) && fns4.at(B + 0x10).falls_into == B + 0x16 && fns4.at(B + 0x10).end == B + 0x16);
+        CHECK(cfg4.coverage().unknown == 0);
+    }
 
     // Floating-point mode: FPSCR's PR, SZ and FR followed through the function.
     {

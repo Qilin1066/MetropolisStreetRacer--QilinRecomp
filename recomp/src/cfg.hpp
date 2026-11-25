@@ -198,6 +198,13 @@ private:
     // function of its own, splitting the function that had it.
     bool acceptable_stub(uint32_t c, const std::vector<Kind>& kinds) const;
     bool targets_acceptable(const Function& f, const std::vector<Kind>& kinds) const;
+    // A call target inside a known function's code that can only be an entry of its own: an
+    // instruction of that function (not a delay slot) right after a delayed rts/bra/jmp/braf and
+    // its slot, or right after an epilogue (a function falling into the one it tail-calls).
+    // The game's 0x8C0AEA42 and 0x8C053106, called only from code found through data.
+    bool hidden_entry(uint32_t t) const;
+    // `lds.l @r15+,pr` then only pops of saved registers, ending just before `t`.
+    bool epilogue_before(uint32_t t) const;
     bool seed_literals();
     bool seed_stubs();
     bool seed_gaps();

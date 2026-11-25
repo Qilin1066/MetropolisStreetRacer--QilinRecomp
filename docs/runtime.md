@@ -102,7 +102,7 @@ Each step: run `msr`, read where it stops, provide what it needs, run again.
    - timer interrupts;
    - the interrupt entry's FPSCR;
    - ARM functions whose code reaches below their start.
-18. **Past Clock Settings** (2026-11-25, on the author's PC with the whole extracted disc, real sound archives included, headless). The sound driver stopped at once on "a return to an unexpected address": two kinds of computed jump into straight-line code that the ARM lifter took for returns (`docs/sound.md`). With them lifted as switches, the game runs at 60 pictures a second: Clock Settings waits 60 seconds with no input, then the KUDOS title card and the CRI Sofdec/ADX logos follow.
+18. **Past Clock Settings** (2026-11-25, on the author's PC with the whole extracted disc, real sound archives included, headless). The sound driver stopped at once on "a return to an unexpected address": two kinds of computed jump into straight-line code that the ARM lifter took for returns (`docs/sound.md`). With them lifted as switches, the game runs at 60 pictures a second: Clock Settings waits 60 seconds with no input, then the KUDOS title card and the CRI Sofdec/ADX logos follow, and the title screen ("PRESS START BUTTON"). Left there, the game called `0x8C03B3E2`, a function the analysis had missed; with the hidden entries found (`docs/recompiler-core.md`) the attract demo plays: a 3D flyover of London ("London, Trafalgar, 12.39pm") and a recorded race, at 30 pictures a second, for as long as it was left (240 s).
 
 ## The Dreamcast and host layers
 
