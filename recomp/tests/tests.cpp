@@ -19,6 +19,7 @@
 #include "bootfile.hpp"
 #include "cfg.hpp"
 #include "arm/decoder.hpp"
+#include "arm/lifter.hpp"
 #include "decoder.hpp"
 #include "drive.hpp"
 #include "adx.hpp"
@@ -1437,6 +1438,49 @@ void test_arm_decoder() {
     CHECK(decode(0x03020100u).op == Op::undefined);
 }
 
+// The sound driver's jumps into straight-line code (`add rP, pc, #0; add pc, rP, rI`): with the
+// index masked just before (0x5ed4), and loaded from memory (0xa94). Both become switches over
+// their entries, not returns.
+void test_arm_lifter_jumps() {
+    const uint32_t words[] = {
+        0xEA000006u,  // 00 b 0x20
+        0xEA00000Du,  // 04 b 0x40
+        0xE1A0F00Eu, 0xE1A0F00Eu, 0xE1A0F00Eu, 0xE1A0F00Eu, 0xE1A0F00Eu, 0xE1A0F00Eu,  // 08-1c mov pc, lr
+        0xE200000Cu,  // 20 and r0, r0, #0xc
+        0xE28F3000u,  // 24 add r3, pc, #0
+        0xE083F000u,  // 28 add pc, r3, r0
+        0xE1A04084u,  // 2c mov r4, r4, lsl #1
+        0xEA000001u,  // 30 b 0x3c
+        0xE1A00000u,  // 34 nop
+        0xE1A040A4u,  // 38 mov r4, r4, lsr #1
+        0xE1A0F00Eu,  // 3c mov pc, lr
+        0xE5D5103Du,  // 40 ldrb r1, [r5, #0x3d]
+        0xE28F2000u,  // 44 add r2, pc, #0
+        0xE082F001u,  // 48 add pc, r2, r1
+        0xE1A04084u,  // 4c mov r4, r4, lsl #1
+        0xEA000001u,  // 50 b 0x5c
+        0xE1A00000u,  // 54 nop
+        0xE1A040A4u,  // 58 mov r4, r4, lsr #1
+        0xE5854034u,  // 5c str r4, [r5, #0x34]
+        0xE1A0F00Eu,  // 60 mov pc, lr
+    };
+    qilin::arm::Image image;
+    for (const uint32_t w : words)
+        for (int b = 0; b < 4; ++b) image.bytes.push_back(static_cast<uint8_t>(w >> (8 * b)));
+    qilin::arm::ArmLifter lifter(image);
+    lifter.run();
+    const auto& fns = lifter.functions();
+    CHECK(fns.contains(0x00) && fns.contains(0x04));
+    if (!fns.contains(0x00) || !fns.contains(0x04)) return;
+    const auto& masked = fns.at(0x00).tables;
+    CHECK(masked.contains(0x28) && masked.at(0x28) == std::vector<uint32_t>({0x2C, 0x30, 0x34, 0x38}));
+    const auto& loaded = fns.at(0x04).tables;
+    CHECK(loaded.contains(0x48) && loaded.at(0x48) == std::vector<uint32_t>({0x4C, 0x50, 0x54, 0x58, 0x5C, 0x60}));
+    const std::string code = lifter.emit(fns.at(0x00));
+    CHECK(code.contains("switch (r) { case 0x0000002cu: goto L_00002c; "));
+    CHECK(code.contains("default: rt::stop(rt::Stop::BadJump, 0x00000028u, r); }"));
+}
+
 void test_folder_drive() {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "qilin_folder_drive_test";
@@ -1545,6 +1589,7 @@ int main() {
     test_launcher();
     test_adx();
     test_arm_decoder();
+    test_arm_lifter_jumps();
     if (failures) {
         std::println(stderr, "{} check(s) failed", failures);
         return 1;

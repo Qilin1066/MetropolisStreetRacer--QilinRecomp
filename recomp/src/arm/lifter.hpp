@@ -48,7 +48,9 @@ private:
     bool is_call_jump(uint32_t pc) const;  // a pc write after `mov lr, pc`: a call through a register
     // A jump through a table of branch instructions, as the driver writes them: `add pc, pc,
     // rN, lsl #2`, or `add rP, pc, #k` then `add rT, rP, rN` (or `add pc, rP, rN`) and `mov pc,
-    // rT`. The targets (the table's branches' own addresses), or none.
+    // rT`. The targets (the table's branches' own addresses), or none. `add pc, rP, rI` into
+    // straight-line code: the word offsets an `and rI, rX, #mask` just before allows, or, with the
+    // index not bounded there, every word to the block's end (docs/sound.md).
     std::vector<uint32_t> branch_table(uint32_t pc) const;
     // A jump through a table of addresses: `ldr rT, [pc, #k]` (the table), `ldr rT, [rT, rN,
     // lsl #2]`, `mov pc, rT`. Its entries, which become functions.

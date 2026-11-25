@@ -19,6 +19,22 @@ const char* cond_expr(unsigned cond) {
     return k[cond];
 }
 
+// Whether `in` may write register `r` (unknown forms answer yes).
+bool writes_register(const Insn& in, unsigned r) {
+    switch (in.op) {
+    case Op::tst: case Op::teq: case Op::cmp: case Op::cmn: case Op::b: case Op::msr: return false;
+    case Op::str: case Op::strb: return in.writeback || !in.pre ? in.rn == r : false;
+    case Op::ldr: case Op::ldrb: return in.rd == r || ((in.writeback || !in.pre) && in.rn == r);
+    case Op::stm: return in.writeback && in.rn == r;
+    case Op::ldm: return ((in.list >> r) & 1u) || (in.writeback && in.rn == r);
+    case Op::bl: return r == 14;
+    case Op::and_: case Op::eor: case Op::sub: case Op::rsb: case Op::add: case Op::adc: case Op::sbc: case Op::rsc:
+    case Op::orr: case Op::mov: case Op::bic: case Op::mvn: case Op::mul: case Op::mla: case Op::mrs:
+        return in.rd == r;
+    default: return true;
+    }
+}
+
 }  // namespace
 
 Image Image::of_driver(const std::vector<uint8_t>& file) {
@@ -47,21 +63,59 @@ std::vector<uint32_t> ArmLifter::branch_table(uint32_t pc) const {
         if (is_add(in) && in.rd == 15 && !in.imm && in.amount == 0) jump_reg = 17;  // add pc, rA, rB
         else if (in.op == Op::mov && in.rd == 15 && !in.imm && in.amount == 0 && in.shift == Shift::lsl && !in.by_register) jump_reg = in.rm;
         if (jump_reg == 16) return {};
+        unsigned index_reg = 16;
         for (uint32_t back = 4; back <= 20 && pc >= back; back += 4) {
             const Insn p = decode(image_.u32(pc - back));
             if (!(is_add(p) && p.rn == 15 && p.imm && p.rd != 15)) continue;
             const unsigned rp = p.rd;
             bool made = false;
-            if (jump_reg == 17) made = in.rn == rp || in.rm == rp;
-            else
+            if (jump_reg == 17) {
+                made = in.rn == rp || in.rm == rp;
+                index_reg = in.rn == rp ? in.rm : in.rn;
+            } else {
                 for (uint32_t k = pc - back + 4; k < pc; k += 4) {
                     const Insn m = decode(image_.u32(k));
                     if (is_add(m) && !m.imm && m.amount == 0 && m.rd == jump_reg && (m.rn == rp || m.rm == rp)) made = true;
                 }
+            }
             if (made) base = pc - back + 8 + p.value;
             break;
         }
         if (!base) return {};
+        // add pc, rP, rI with rI last set by an unconditional `and rI, rX, #mask` a few instructions
+        // before: a jump into straight-line code at any word offset the mask allows (the sound
+        // driver's 0x5ed4 picks one of four instructions: mask 0xc). Every such offset is an entry,
+        // whatever instruction is there; the emitted switch stops on any other value.
+        if (index_reg < 15) {
+            for (uint32_t k = pc - 4; k + 24 >= pc && k >= 0x20; k -= 4) {
+                const Insn m = decode(image_.u32(k));
+                if (!writes_register(m, index_reg)) continue;
+                if (m.op != Op::and_ || !m.imm || m.cond != 14 || m.rd != index_reg) break;
+                const uint32_t mask = m.value;
+                if ((mask & 3u) || mask == 0 || mask > 0x3FCu) break;
+                std::vector<uint32_t> t;
+                for (uint32_t v = 0; v <= mask; v += 4)
+                    if (!(v & ~mask)) {
+                        if (!code_at(base + v)) return {};
+                        t.push_back(base + v);
+                    }
+                return t;
+            }
+            // The index not bounded here (the driver's 0xa94 loads it from a structure, stored
+            // masked elsewhere) and no table of branches at the base: a jump into the straight-line
+            // code there. Every word up to the block's end (an unconditional jump other than b, at
+            // most 64) is an entry; the emitted switch stops on any other value.
+            if (const Insn first = decode(image_.u32(base)); !(first.op == Op::b && first.cond == 14)) {
+                std::vector<uint32_t> t;
+                for (uint32_t a = base; t.size() < 64; a += 4) {
+                    if (!code_at(a)) return {};
+                    t.push_back(a);
+                    const Insn e = decode(image_.u32(a));
+                    if (e.cond == 14 && e.writes_pc() && e.op != Op::b) break;
+                }
+                return t;
+            }
+        }
     }
     std::vector<uint32_t> t;
     for (uint32_t a = base; image_.mapped(a) && t.size() < 256; a += 4) {

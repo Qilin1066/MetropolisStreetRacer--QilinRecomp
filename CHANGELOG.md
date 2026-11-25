@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Fixed
+- **The sound driver's jumps into straight-line code** (`add rP, pc, #0; add pc, rP, rI`, at `0x5ED4`, `0xA1C` and `0xA94` in `MANATEE.DRV`) were lifted as returns, and the driver stopped as soon as the game played its real sound archives. They are now `switch`es over the entries the index can reach: the offsets an `and` with a mask allows just before, or, for an index loaded from memory, every word to the block's end. Any other value stops. With the whole disc, the game now runs past Clock Settings to its title cards.
+
 ### Added
 - **The game reaches its first screen** (Clock Settings, drawn correctly; run headless in the cloud workspace on the extracted disc). What it took:
   - **GD-ROM streams**, answered the way the game's library reads them: call 7 gives the data left; call 1 answers "processing" between pieces; the DMA's end is raised at once for the interrupt system to deliver; call 5 calls the game's DMA-end callback; a request past the end fails.
