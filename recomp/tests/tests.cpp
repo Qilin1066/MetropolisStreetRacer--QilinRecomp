@@ -1587,7 +1587,7 @@ void test_folder_drive() {
     CHECK(msr::Drive::of_folder(dir, why) == nullptr);  // A.BIN's size differs
     write(dir / "disc.json", R"({"files": [{"path": "A.BIN", "sector": 50000, "size": 5},
         {"path": "SUB/B.TXT", "sector": 50010, "size": 3000}]})");
-    const auto drive = msr::Drive::of_folder(dir, why);
+    auto drive = msr::Drive::of_folder(dir, why);
     CHECK(drive != nullptr);
     if (!drive) return;
     uint8_t s[2048];
@@ -1614,6 +1614,7 @@ void test_folder_drive() {
     CHECK(names.contains("B.TXT;1") && names["B.TXT;1"].second == 3000 && names["B.TXT;1"].first == 50010);
     CHECK(drive->read(names["B.TXT;1"].first + 1, s) && s[951] == 'b' && s[952] == 0);
     CHECK(!drive->read(44999, s));
+    drive.reset();  // it keeps the file it read last open (which Windows won't remove)
     fs::remove_all(dir);
 }
 

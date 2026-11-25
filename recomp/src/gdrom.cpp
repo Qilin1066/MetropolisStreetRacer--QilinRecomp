@@ -265,26 +265,69 @@ std::expected<GdRom, std::string> GdRom::open(const std::filesystem::path& image
     return disc;
 }
 
+namespace {
+// Positions `r` at sector `s` of the track holding it, opening the track's file only when it is
+// another file and seeking only when the read isn't of the next sector.
+enum class Seek { ok, nowhere, wrong_kind, cannot_open };
+Seek seek(const std::vector<GdTrack>& tracks, GdReader& r, uint32_t s, bool data) {
+    if (r.track >= tracks.size() || s < tracks[r.track].start || s >= tracks[r.track].end()) {
+        size_t found = SIZE_MAX;
+        for (size_t k = 0; k < tracks.size(); ++k)
+            if (s >= tracks[k].start && s < tracks[k].end()) found = k;
+        if (found == SIZE_MAX) return Seek::nowhere;
+        if (tracks[found].data != data) return Seek::wrong_kind;
+        if (r.track >= tracks.size() || tracks[r.track].file != tracks[found].file) {
+            r.close();
+            r.file = std::ifstream(tracks[found].file, std::ios::binary);
+            if (!r.file) {
+                r.close();
+                r.track = found;  // for the caller's message
+                return Seek::cannot_open;
+            }
+        }
+        r.track = found;
+        r.next = UINT32_MAX;
+    }
+    if (r.next != s) {
+        const GdTrack& t = tracks[r.track];
+        r.file.clear();
+        r.file.seekg(static_cast<std::streamoff>(t.file_offset + uint64_t(s - t.start) * t.sector_size));
+        r.next = s;
+    }
+    return Seek::ok;
+}
+
+unsigned track_number(const std::vector<GdTrack>& tracks, uint32_t s) {
+    for (const GdTrack& t : tracks)
+        if (s >= t.start && s < t.end()) return t.number;
+    return 0;
+}
+}  // namespace
+
 std::expected<std::vector<int16_t>, std::string> GdRom::read_audio(uint32_t sector, uint32_t count) const {
     std::vector<int16_t> out;
     out.reserve(size_t{count} * (kRawSector / 2));
-    const GdTrack* track = nullptr;
-    std::ifstream f;
     uint8_t raw[kRawSector];
     for (uint32_t n = 0; n < count; ++n, ++sector) {
         const std::string name = "sector " + std::to_string(sector);
-        if (!track || sector < track->start || sector >= track->end()) {
-            track = nullptr;
-            for (const GdTrack& t : tracks)
-                if (sector >= t.start && sector < t.end()) track = &t;
-            if (!track) return fail(name + " is not on the disc");
-            if (track->data) return fail(name + " is in data track " + std::to_string(track->number));
-            f = std::ifstream(track->file, std::ios::binary);
-            if (!f) return fail("cannot open " + track->file.string());
-            f.seekg(static_cast<std::streamoff>(track->file_offset + uint64_t(sector - track->start) * kRawSector));
+        switch (seek(tracks, audio_, sector, false)) {
+        case Seek::ok: break;
+        case Seek::nowhere: return fail(name + " is not on the disc");
+        case Seek::wrong_kind: return fail(name + " is in data track " + std::to_string(track_number(tracks, sector)));
+        case Seek::cannot_open: {
+            const std::string file = tracks[audio_.track].file.string();
+            audio_.close();
+            return fail("cannot open " + file);
         }
-        f.read(reinterpret_cast<char*>(raw), kRawSector);
-        if (!f) return fail("cannot read " + name + " from " + track->file.filename().string());
+        }
+        const GdTrack& track = tracks[audio_.track];
+        audio_.file.read(reinterpret_cast<char*>(raw), kRawSector);
+        if (!audio_.file) {
+            const std::string file = track.file.filename().string();
+            audio_.close();
+            return fail("cannot read " + name + " from " + file);
+        }
+        audio_.next = sector + 1;
         for (uint32_t k = 0; k < kRawSector; k += 2) out.push_back(static_cast<int16_t>(raw[k] | raw[k + 1] << 8));
     }
     return out;
@@ -292,42 +335,51 @@ std::expected<std::vector<int16_t>, std::string> GdRom::read_audio(uint32_t sect
 
 std::expected<void, std::string> GdRom::read(uint32_t sector, uint32_t count, std::span<uint8_t> out) const {
     if (out.size() != uint64_t(count) * kSectorData) return fail("GdRom::read: buffer size doesn't match the count");
-    const GdTrack* track = nullptr;
-    std::ifstream f;
-    std::vector<uint8_t> raw(kRawSector);
+    uint8_t raw[kRawSector];
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t s = sector + i;
-        if (!track || s >= track->end()) {
-            track = nullptr;
-            for (const GdTrack& t : tracks)
-                if (s >= t.start && s < t.end()) track = &t;
-            if (!track) return fail("sector " + std::to_string(s) + " isn't in any track of the image");
-            if (!track->data)
-                return fail("sector " + std::to_string(s) + " is in audio track " + std::to_string(track->number));
-            f = std::ifstream(track->file, std::ios::binary);
-            if (!f) return fail("cannot open " + track->file.string());
-            f.seekg(static_cast<std::streamoff>(track->file_offset + uint64_t(s - track->start) * track->sector_size));
+        switch (seek(tracks, data_, s, true)) {
+        case Seek::ok: break;
+        case Seek::nowhere: return fail("sector " + std::to_string(s) + " isn't in any track of the image");
+        case Seek::wrong_kind:
+            return fail("sector " + std::to_string(s) + " is in audio track " + std::to_string(track_number(tracks, s)));
+        case Seek::cannot_open: {
+            const std::string file = tracks[data_.track].file.string();
+            data_.close();
+            return fail("cannot open " + file);
         }
+        }
+        const GdTrack& track = tracks[data_.track];
+        std::ifstream& f = data_.file;
         uint8_t* dest = out.data() + size_t(i) * kSectorData;
-        if (track->sector_size == kSectorData) {
+        if (track.sector_size == kSectorData) {
             f.read(reinterpret_cast<char*>(dest), kSectorData);
         } else {
-            f.read(reinterpret_cast<char*>(raw.data()), kRawSector);
+            f.read(reinterpret_cast<char*>(raw), kRawSector);
             if (f) {
                 // A raw sector says what it is and where it is: check both,
                 // which also proves the track layout worked out above.
                 static constexpr uint8_t kSync[12] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0};
-                const std::string name = "sector " + std::to_string(s) + " (track " + std::to_string(track->number) + ")";
-                if (std::memcmp(raw.data(), kSync, sizeof kSync) != 0) return fail(name + " has no sync pattern");
-                if (raw[15] != 1) return fail(name + " isn't a Mode 1 sector");
-                const uint32_t address = (from_bcd(raw[12]) * 60 + from_bcd(raw[13])) * 75 + from_bcd(raw[14]);
-                if (address != s + 150)
-                    return fail(name + " carries the address of sector " + std::to_string(int64_t(address) - 150) +
-                                ": the image's track layout isn't what it says");
-                std::memcpy(dest, raw.data() + kRawHeader, kSectorData);
+                const std::string name = "sector " + std::to_string(s) + " (track " + std::to_string(track.number) + ")";
+                std::string wrong;
+                if (std::memcmp(raw, kSync, sizeof kSync) != 0) wrong = name + " has no sync pattern";
+                else if (raw[15] != 1) wrong = name + " isn't a Mode 1 sector";
+                else if (const uint32_t address = (from_bcd(raw[12]) * 60 + from_bcd(raw[13])) * 75 + from_bcd(raw[14]); address != s + 150)
+                    wrong = name + " carries the address of sector " + std::to_string(int64_t(address) - 150) +
+                            ": the image's track layout isn't what it says";
+                if (!wrong.empty()) {
+                    data_.close();
+                    return fail(wrong);
+                }
+                std::memcpy(dest, raw + kRawHeader, kSectorData);
             }
         }
-        if (!f) return fail("cannot read sector " + std::to_string(s) + " from " + track->file.string());
+        if (!f) {
+            const std::string file = track.file.string();
+            data_.close();
+            return fail("cannot read sector " + std::to_string(s) + " from " + file);
+        }
+        data_.next = s + 1;
     }
     return {};
 }

@@ -257,6 +257,19 @@ inline uint32_t ld32(uint32_t a) {
     QILIN_TRACE_LOAD(a, v, 4);
     return v;
 }
+// Main RAM's bytes at [a, a + n) as host memory, when the range is all in one view of it (not
+// past its 16 MB): for block copies (DMA, the drive), which would otherwise go a word at a time.
+// Null otherwise, and always in checked builds, where every access is checked and logged.
+inline uint8_t* ram_range(uint32_t a, uint32_t n) {
+#ifdef QILIN_CHECKED_MEMORY
+    (void)a, (void)n;
+    return nullptr;
+#else
+    if (n == 0 || !in_ram(a) || (a & 0x00FFFFFFu) + uint64_t{n} > 0x01000000u) return nullptr;
+    return g_mem + a;
+#endif
+}
+
 // Sign-extending loads: what mov.b and mov.w do.
 inline uint32_t ld8s(uint32_t a) { return static_cast<uint32_t>(static_cast<int8_t>(ld8(a))); }
 inline uint32_t ld16s(uint32_t a) { return static_cast<uint32_t>(static_cast<int16_t>(ld16(a))); }
@@ -504,7 +517,11 @@ void idle_wait();
 // Called whenever g_irq_pending is set: ends an idle_wait at once.
 void wake_idle();
 #ifndef QILIN_CHECKED_MEMORY
-#define QILIN_IDLE(r15)                                                                                 do {                                                                                                    if (!::qilin::rt::g_irq_pending.load(std::memory_order_seq_cst)) ::qilin::rt::idle_wait();         QILIN_POLL_IRQ(r15);                                                                            } while (0)
+#define QILIN_IDLE(r15)                                                                                    \
+    do {                                                                                                   \
+        if (!::qilin::rt::g_irq_pending.load(std::memory_order_seq_cst)) ::qilin::rt::idle_wait();         \
+        QILIN_POLL_IRQ(r15);                                                                               \
+    } while (0)
 #define QILIN_POLL_IRQ(r15)                                                                                          \
     do {                                                                                                             \
         if (::qilin::rt::g_irq_pending.load(std::memory_order_relaxed)) [[unlikely]] ::qilin::rt::poll_irq(c, (r15)); \

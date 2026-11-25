@@ -136,8 +136,16 @@ struct Texture {
     uint64_t palette_hash = 0;
     uint32_t bytes = 0;
     uint64_t used = 0;  // the frame it was last checked in
-    std::vector<std::pair<uint32_t, VkDescriptorSet>> sets;  // by sampler bits
+    struct Set {
+        uint32_t bits;  // the sampler's
+        VkDescriptorSet set;
+        VkDescriptorPool pool;  // what it came from, to free it to
+    };
+    std::vector<Set> sets;
 };
+// A texture no polygon has named for this many frames (a minute at 60) is let go: its image and
+// sets are freed, and it is decoded again if it comes back.
+constexpr uint64_t kTextureIdleFrames = 3600, kTextureSweepEvery = 600;
 
 uint64_t hash_words(const uint32_t* w, uint32_t n, uint64_t h) {
     for (uint32_t k = 0; k < n; ++k) h = (h ^ w[k]) * 0x100000001B3ull;
@@ -519,20 +527,25 @@ struct Renderer::Impl {
     }
 
     VkDescriptorSet set_for(Texture& t, uint32_t bits) {
-        for (const auto& [b, s] : t.sets)
-            if (b == bits) return s;
+        for (const Texture::Set& s : t.sets)
+            if (s.bits == bits) return s.set;
         VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDescriptorPool from = VK_NULL_HANDLE;
         for (int attempt = 0; attempt < 2 && !set; ++attempt) {
             if (!set_pools.empty()) {
                 VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
                 ai.descriptorPool = set_pools.back();
                 ai.descriptorSetCount = 1;
                 ai.pSetLayouts = &set_layout;
-                if (vkAllocateDescriptorSets(gpu.device, &ai, &set) == VK_SUCCESS) break;
+                if (vkAllocateDescriptorSets(gpu.device, &ai, &set) == VK_SUCCESS) {
+                    from = set_pools.back();
+                    break;
+                }
                 set = VK_NULL_HANDLE;
             }
             const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1024};
             VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            pci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;  // a texture let go frees its sets
             pci.maxSets = 1024;
             pci.poolSizeCount = 1;
             pci.pPoolSizes = &size;
@@ -548,7 +561,7 @@ struct Renderer::Impl {
         w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         w.pImageInfo = &info;
         vkUpdateDescriptorSets(gpu.device, 1, &w, 0, nullptr);
-        t.sets.emplace_back(bits, set);
+        t.sets.push_back({bits, set, from});
         return set;
     }
 
@@ -561,6 +574,23 @@ struct Renderer::Impl {
         std::memcpy(upload_bytes.data() + at, rgba, n);
         uploads.push_back({image.image, image.width, image.height, image.levels, at, fresh});
         ++stats.uploads;
+    }
+
+    // The textures no polygon has named for kTextureIdleFrames, let go. Only after the last
+    // frame's fence (draw waits for it first): nothing in flight uses them.
+    void sweep_textures() {
+        if (frame % kTextureSweepEvery != 0) return;
+        for (auto it = textures.begin(); it != textures.end();) {
+            Texture& t = it->second;
+            if (t.used + kTextureIdleFrames > frame) {
+                ++it;
+                continue;
+            }
+            for (const Texture::Set& s : t.sets) check(vkFreeDescriptorSets(gpu.device, s.pool, 1, &s.set), "vkFreeDescriptorSets");
+            t.image.destroy(gpu);
+            it = textures.erase(it);
+            ++stats.textures_freed;
+        }
     }
 
     // The texture a polygon names, decoded again if video memory or its
@@ -932,6 +962,7 @@ struct Renderer::Impl {
     Picture draw(const Source& src) {
         wait();
         ++frame;
+        sweep_textures();
         stats.draws = stats.triangles = stats.culled = stats.uploads = stats.dropped = 0;
         Target& t = target(src.frame_buffer, src.width, src.height);
         current = &t;
@@ -1091,21 +1122,27 @@ struct Renderer::Impl {
             const VkDeviceSize zero = 0;
             vkCmdBindVertexBuffers(cmd, 0, 1, &vertex_buffer.buffer, &zero);
         }
-        uint32_t bound = ~0u;
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 1, 1, &volume_set, 0, nullptr);
+        // Each piece of state is set only when it changes from the draw before (all the
+        // pipelines share the layout and make these states dynamic, so they carry over).
+        const Draw* last = nullptr;
         for (const Draw& d : draws) {
-            if (d.pipeline != bound) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(d.pipeline)), bound = d.pipeline;
-            vkCmdSetDepthWriteEnable(cmd, d.depth_write);
-            vkCmdSetDepthCompareOp(cmd, static_cast<VkCompareOp>(d.depth));  // the hardware's modes are Vulkan's, in order
-            set_stencil(d.stencil);
-            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &d.set, 0, nullptr);
-            push.flags = d.flags;
-            push.sort_word = d.sort_word;
-            // The user tile clip, in scene pixels (tiles of 32), its maximum tile included.
-            push.clip[0] = float(d.clip & 0xFFu) * 32.0f, push.clip[1] = float(d.clip >> 8 & 0xFFu) * 32.0f;
-            push.clip[2] = float((d.clip >> 16 & 0xFFu) + 1) * 32.0f, push.clip[3] = float((d.clip >> 24) + 1) * 32.0f;
-            vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
+            if (!last || d.pipeline != last->pipeline) vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline(d.pipeline));
+            if (!last || d.depth_write != last->depth_write) vkCmdSetDepthWriteEnable(cmd, d.depth_write);
+            if (!last || d.depth != last->depth)
+                vkCmdSetDepthCompareOp(cmd, static_cast<VkCompareOp>(d.depth));  // the hardware's modes are Vulkan's, in order
+            if (!last || d.stencil != last->stencil) set_stencil(d.stencil);
+            if (!last || d.set != last->set) vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &d.set, 0, nullptr);
+            if (!last || d.flags != last->flags || d.sort_word != last->sort_word || d.clip != last->clip) {
+                push.flags = d.flags;
+                push.sort_word = d.sort_word;
+                // The user tile clip, in scene pixels (tiles of 32), its maximum tile included.
+                push.clip[0] = float(d.clip & 0xFFu) * 32.0f, push.clip[1] = float(d.clip >> 8 & 0xFFu) * 32.0f;
+                push.clip[2] = float((d.clip >> 16 & 0xFFu) + 1) * 32.0f, push.clip[3] = float((d.clip >> 24) + 1) * 32.0f;
+                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
+            }
             vkCmdDraw(cmd, d.count, 1, d.first, 0);
+            last = &d;
         }
         vkCmdEndRendering(cmd);
         if (sorted) {

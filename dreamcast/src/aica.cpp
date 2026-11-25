@@ -403,6 +403,8 @@ void ram_block(uint32_t a, const uint8_t* data, unsigned n) {
     if (off + n > kRamBytes) throw rt::Stop{rt::Stop::Unsupported, 0, a};
     auto held = sound::lock();
     std::memcpy(g_ram + off, data, n);
+    // As word by word: a block that sets the commands' flag has the driver take them.
+    if (g_driver_started && off <= kFlag && kFlag + 4 <= off + n && rd32(kFlag) != 0) take_commands();
 }
 
 // The registers are 32-bit words on the G2 bus, of which the chip uses the

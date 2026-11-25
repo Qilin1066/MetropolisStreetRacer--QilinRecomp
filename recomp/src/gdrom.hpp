@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <fstream>
 #include <span>
 #include <string>
 #include <vector>
@@ -52,6 +53,25 @@ struct GdFile {
     uint32_t size = 0;    // bytes
 };
 
+// A track's file kept open between reads, positioned at the sector after the last read, so a
+// run of reads one sector at a time (the drive's) is one open and no seeks. A copy of a disc
+// starts with none open.
+struct GdReader {
+    std::ifstream file;
+    size_t track = SIZE_MAX;  // the open file's track (an index into GdRom::tracks); SIZE_MAX: none
+    uint32_t next = 0;        // the sector the file is positioned at
+    GdReader() = default;
+    GdReader(const GdReader&) {}
+    GdReader& operator=(const GdReader&) {
+        close();
+        return *this;
+    }
+    void close() {
+        file = std::ifstream();
+        track = SIZE_MAX;
+    }
+};
+
 class GdRom {
 public:
     // Opens a .cue or .gdi (by its extension). Errors come back as a message.
@@ -75,6 +95,11 @@ public:
     // Every file of the high-density area's ISO 9660 file system, sorted by path.
     std::expected<std::vector<GdFile>, std::string> files() const;
     std::expected<std::vector<uint8_t>, std::string> read_file(const GdFile& file) const;
+
+private:
+    // One for data and one for audio: read is the game's thread's, read_audio the sound
+    // mixer's. Neither is shared between threads.
+    mutable GdReader data_, audio_;
 };
 
 }  // namespace qilin

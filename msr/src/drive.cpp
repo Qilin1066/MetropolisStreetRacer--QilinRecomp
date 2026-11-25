@@ -143,10 +143,20 @@ public:
         const Entry& f = entries_[std::prev(it)->second];
         const uint64_t offset = uint64_t(sector - f.sector) * kSector;
         if (offset >= f.size) return true;
-        std::ifstream in(f.path, std::ios::binary);
-        in.seekg(static_cast<std::streamoff>(offset));
-        in.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(std::min<uint64_t>(kSector, f.size - offset)));
-        if (!in) return error_ = "cannot read " + f.path.string(), false;
+        // The file read last stays open, positioned after it: the drive reads a file's sectors
+        // one after another, so that is one open and no seeks for the run.
+        if (&f != open_entry_) {
+            open_ = std::ifstream(f.path, std::ios::binary);
+            open_entry_ = &f, open_at_ = UINT64_MAX;
+        }
+        if (open_at_ != offset) open_.clear(), open_.seekg(static_cast<std::streamoff>(offset));
+        const uint64_t n = std::min<uint64_t>(kSector, f.size - offset);
+        open_.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(n));
+        if (!open_) {
+            open_ = std::ifstream(), open_entry_ = nullptr;
+            return error_ = "cannot read " + f.path.string(), false;
+        }
+        open_at_ = offset + n;
         return true;
     }
 
@@ -298,6 +308,9 @@ private:
     std::vector<uint8_t> path_l_, path_m_;
     std::map<uint32_t, size_t> files_;  // first sector -> entry
     uint32_t end_ = 0;
+    std::ifstream open_;                  // the file read last (read)
+    const Entry* open_entry_ = nullptr;   // its entry
+    uint64_t open_at_ = 0;                // where it is positioned
 };
 
 }  // namespace

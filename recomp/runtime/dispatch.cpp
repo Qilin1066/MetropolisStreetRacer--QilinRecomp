@@ -23,11 +23,35 @@ uint32_t cached(uint32_t target) {
     return area == 5 || area <= 3 ? (target & 0x1FFFFFFFu) | 0x80000000u : target;
 }
 
+// The function table by address, open-addressed, at most half full: an indirect call finds its
+// callee in a probe or two, where a binary search of the thousands of functions takes a dozen.
+struct FunctionIndex {
+    std::vector<const FnEntry*> slots;
+    uint32_t mask = 0, shift = 0;
+    // Fibonacci hashing: the product's top bits, which every bit of the address moves.
+    uint32_t hash(uint32_t a) const { return ((a >> 1) * 0x9E3779B1u) >> shift; }
+    FunctionIndex() {
+        unsigned bits = 4;
+        while ((size_t{1} << bits) < size_t{g_function_count} * 2) ++bits;
+        slots.assign(size_t{1} << bits, nullptr);
+        mask = static_cast<uint32_t>((size_t{1} << bits) - 1), shift = 32 - bits;
+        for (size_t k = 0; k < g_function_count; ++k) {
+            uint32_t i = hash(g_functions[k].addr);
+            while (slots[i]) i = (i + 1) & mask;
+            slots[i] = &g_functions[k];
+        }
+    }
+    const FnEntry* find(uint32_t a) const {
+        for (uint32_t i = hash(a);; i = (i + 1) & mask) {
+            const FnEntry* e = slots[i];
+            if (!e || e->addr == a) return e;
+        }
+    }
+};
+
 const FnEntry* find(uint32_t target) {
-    const FnEntry* end = g_functions + g_function_count;
-    const uint32_t a = cached(target);
-    const FnEntry* it = std::lower_bound(g_functions, end, a, [](const FnEntry& e, uint32_t x) { return e.addr < x; });
-    return it == end || it->addr != a ? nullptr : it;
+    static const FunctionIndex index;
+    return index.find(cached(target));
 }
 
 // An address with no lifted function: native code the runtime provides (the

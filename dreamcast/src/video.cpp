@@ -119,8 +119,10 @@ void shot(const std::vector<uint8_t>& rgba, uint32_t w, uint32_t h) {
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) rt::fatal("can't write %s", path.c_str());
     std::fprintf(f, "P6\n%u %u\n255\n", w, h);
-    for (size_t k = 0; k < rgba.size(); k += 4) std::fwrite(rgba.data() + k, 1, 3, f);
-    std::fclose(f);
+    std::vector<uint8_t> rgb(rgba.size() / 4 * 3);
+    for (size_t k = 0, o = 0; k + 3 < rgba.size(); k += 4, o += 3) rgb[o] = rgba[k], rgb[o + 1] = rgba[k + 1], rgb[o + 2] = rgba[k + 2];
+    const bool written = std::fwrite(rgb.data(), 1, rgb.size(), f) == rgb.size();
+    if (std::fclose(f) != 0 || !written) rt::fatal("can't write %s", path.c_str());
 }
 
 }  // namespace
@@ -195,12 +197,12 @@ static void dump_ram_if_asked() {
         return v;
     }();
     if (std::find(at.begin(), at.end(), g_pictures) == at.end()) return;
-    std::vector<uint8_t> ram(0x01000000u);
-    for (uint32_t k = 0; k < ram.size(); ++k) ram[k] = static_cast<uint8_t>(rt::ld8(0x8C000000u + k));
+    const uint8_t* ram = rt::ram_range(0x8C000000u, 0x01000000u);
+    if (!ram) rt::fatal("QILIN_DUMP: main RAM isn't mapped");
     const std::string path = folder + "/ram_" + std::to_string(g_pictures) + ".bin";
     std::FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f || std::fwrite(ram.data(), 1, ram.size(), f) != ram.size()) rt::fatal("QILIN_DUMP: cannot write %s", path.c_str());
-    std::fclose(f);
+    const bool written = f && std::fwrite(ram, 1, 0x01000000u, f) == 0x01000000u;
+    if (!f || std::fclose(f) != 0 || !written) rt::fatal("QILIN_DUMP: cannot write %s", path.c_str());
 }
 
 void render() {
@@ -328,6 +330,15 @@ struct Press {
     bool lt, rt;
     uint64_t from, length = 10;
 };
+// A whole number at `p`, digits only, with where it ends in `rest`; anything else stops.
+uint64_t press_number(const std::string& item, const char* p, const char*& rest) {
+    if (*p < '0' || *p > '9') rt::fatal("QILIN_PRESS: %s: a picture number expected at \"%s\"", item.c_str(), p);
+    char* e = nullptr;
+    const uint64_t v = std::strtoull(p, &e, 10);
+    rest = e;
+    return v;
+}
+
 std::vector<Press> scripted_presses() {
     std::vector<Press> out;
     const char* s = std::getenv("QILIN_PRESS");
@@ -338,42 +349,40 @@ std::vector<Press> scripted_presses() {
     } kNames[] = {{"a", maple::kA},      {"b", maple::kB},      {"x", maple::kX},        {"y", maple::kY},
                   {"start", maple::kStart}, {"up", maple::kUp}, {"down", maple::kDown}, {"left", maple::kLeft},
                   {"right", maple::kRight}, {"lt", 0},          {"rt", 0}};
-    std::string all = s;
-    size_t at = 0;
-    while (at < all.size()) {
-        size_t end = all.find(',', at);
-        if (end == std::string::npos) end = all.size();
+    const std::string all = s;
+    for (size_t at = 0; at < all.size();) {
+        const size_t end = std::min(all.find(',', at), all.size());
         const std::string item = all.substr(at, end - at);
+        at = end + 1;
         const size_t sign = item.find('@');
         if (sign == std::string::npos) rt::fatal("QILIN_PRESS: %s has no @<picture>", item.c_str());
         const std::string name = item.substr(0, sign);
-        bool found = false;
-        for (const auto& n : kNames)
-            if (name == n.name) {
-            {
-                // <picture>, or <first>-<last>/<every>: a press every so many pictures.
-                char* rest = nullptr;
-                const uint64_t first = std::strtoull(item.c_str() + sign + 1, &rest, 10);
-                uint64_t last = first, every = 1;
-                if (*rest == '+') {
-                    const uint64_t length = std::strtoull(rest + 1, &rest, 10);
-                    if (length == 0) rt::fatal("QILIN_PRESS: %s: held for no pictures", item.c_str());
-                    out.push_back({n.button, name == "lt", name == "rt", first, length});
-                    found = true;
-                    continue;
-                }
-                if (*rest == '-') {
-                    last = std::strtoull(rest + 1, &rest, 10);
-                    if (*rest != '/') rt::fatal("QILIN_PRESS: %s: <first>-<last>/<every>", item.c_str());
-                    every = std::strtoull(rest + 1, &rest, 10);
-                    if (every < 20) rt::fatal("QILIN_PRESS: %s: presses at least 20 pictures apart", item.c_str());
-                }
-                for (uint64_t at2 = first; at2 <= last; at2 += every) out.push_back({n.button, name == "lt", name == "rt", at2, 10});
-            }
-                found = true;
-            }
-        if (!found) rt::fatal("QILIN_PRESS: no button called %s", name.c_str());
-        at = end + 1;
+        const auto* button = std::find_if(std::begin(kNames), std::end(kNames), [&](const auto& n) { return name == n.name; });
+        if (button == std::end(kNames)) rt::fatal("QILIN_PRESS: no button called %s", name.c_str());
+        const Press press{button->button, name == "lt", name == "rt", 0, 10};
+        const char* rest = nullptr;
+        const uint64_t first = press_number(item, item.c_str() + sign + 1, rest);
+        if (*rest == '+') {  // <first>+<pictures>: held
+            Press held = press;
+            held.from = first, held.length = press_number(item, rest + 1, rest);
+            if (held.length == 0) rt::fatal("QILIN_PRESS: %s: held for no pictures", item.c_str());
+            if (*rest) rt::fatal("QILIN_PRESS: %s: something after the pictures held", item.c_str());
+            out.push_back(held);
+            continue;
+        }
+        uint64_t last = first, every = 1;
+        if (*rest == '-') {  // <first>-<last>/<every>: a press every so many pictures
+            last = press_number(item, rest + 1, rest);
+            if (*rest != '/') rt::fatal("QILIN_PRESS: %s: <first>-<last>/<every>", item.c_str());
+            every = press_number(item, rest + 1, rest);
+            if (every < 20) rt::fatal("QILIN_PRESS: %s: presses at least 20 pictures apart", item.c_str());
+        }
+        if (*rest) rt::fatal("QILIN_PRESS: %s: something after the picture", item.c_str());
+        for (uint64_t when = first; when <= last; when += every) {
+            Press p = press;
+            p.from = when;
+            out.push_back(p);
+        }
     }
     return out;
 }

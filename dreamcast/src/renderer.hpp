@@ -104,6 +104,7 @@ public:
 
     struct Stats {
         uint32_t draws = 0, triangles = 0, culled = 0, textures = 0, uploads = 0, dropped = 0;
+        uint32_t textures_freed = 0;  // let go, unused for a while (renderer.cpp, kTextureIdleFrames)
     };
     const Stats& stats() const;
 

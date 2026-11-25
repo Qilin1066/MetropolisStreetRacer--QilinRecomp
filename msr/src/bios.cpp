@@ -204,16 +204,24 @@ constexpr uint32_t kFrameOffset = 150;
     throw rt::Stop{rt::Stop::Unsupported, c.pr, value};
 }
 
+// Bytes from the drive into guest memory: straight into RAM when the range is RAM, else a word
+// at a time through the bus (an odd count or address stops: the drive's DMA moves words).
+void to_guest(rt::Context& c, uint32_t to, const uint8_t* data, uint32_t n) {
+    if (uint8_t* p = rt::ram_range(to, n)) return (void)std::memcpy(p, data, n);
+    if ((n & 3u) || (to & 3u)) gd_stop(c, "a transfer of an odd size or to an odd address", to);
+    for (uint32_t i = 0; i < n; i += 4) {
+        uint32_t w;
+        std::memcpy(&w, data + i, 4);
+        rt::st32(to + i, w);
+    }
+}
+
 uint32_t read_sectors(rt::Context& c, uint32_t frame, uint32_t count, uint32_t to) {
     if (frame < kFrameOffset || count == 0) gd_stop(c, "a read from before the disc's start, or of nothing", frame);
     uint8_t data[2048];
     for (uint32_t k = 0; k < count; ++k) {
         if (!g_drive->read(frame - kFrameOffset + k, data)) rt::fatal("GD-ROM: %s", g_drive->error().c_str());
-        for (uint32_t i = 0; i < 2048; i += 4) {
-            uint32_t w;
-            std::memcpy(&w, data + i, 4);
-            rt::st32(to + k * 2048 + i, w);
-        }
+        to_guest(c, to + k * 2048, data, 2048);
     }
     return count * 2048;
 }
@@ -325,12 +333,7 @@ void gd_dma_transfer(rt::Context& c) {
             g_stream.in_buffer = 2048;
         }
         const uint32_t n = std::min(bytes, g_stream.in_buffer);
-        const uint8_t* from = g_stream.buffer + (2048 - g_stream.in_buffer);
-        for (uint32_t i = 0; i < n; i += 4) {
-            uint32_t w;
-            std::memcpy(&w, from + i, 4);
-            rt::st32(to + i, w);
-        }
+        to_guest(c, to, g_stream.buffer + (2048 - g_stream.in_buffer), n);
         to += n, bytes -= n, g_stream.in_buffer -= n, g_stream.left -= n, g_stream.sent += n;
     }
     g_dma_end_pending = true;

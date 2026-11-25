@@ -12,6 +12,8 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 ## [Unreleased]
 
 ### Fixed
+- **Interrupt events raised from the sound threads could be lost.** The sound mixer's thread (the driver's messages) and the sound CPU's thread raise events in the system bus's interrupt status words while the game's thread acknowledges others; both read, changed and wrote the same plain word, so one could undo the other, losing an event (the game then waits for ever) or bringing back one already taken. The three status words are now atomic (`dreamcast/src/pvr.cpp`).
+- **The renderer never let a texture go**: every texture any polygon had named kept its GPU image and descriptor sets for the whole session. One no polygon has named for 3,600 frames (a minute) is now freed, and decoded again if it comes back.
 - **A race stopped on a read of the boot ROM.** Accelerating away, the game reads a byte at address `0x5D` through a null pointer (`0x8C09C9E2`) and ignores it; on the console that's the boot ROM. The boot ROM's code area (below its font) is now mapped and reads as 0, logged once. The car now drives: 64 MPH in 3rd gear in eight seconds. (The "0 MPH" noted before was right: a pulsed trigger only made the car creep.)
 - **The memory card's buzzer.** Once the player's name is confirmed, the game sends the Visual Memory a set-condition command for its clock function (the buzzer's tone), and the port stopped on it. The card now answers that it's done (the PC has no buzzer), and any other command for a function other than storage logs the function and its data before stopping. With it, a new game is saved to the card (`MSRSINGL.SAV`) and the menus go on to the garage, the showroom and the car's options.
 - **The sound driver's jumps into straight-line code** (`add rP, pc, #0; add pc, rP, rI`, at `0x5ED4`, `0xA1C` and `0xA94` in `MANATEE.DRV`) were lifted as returns, and the driver stopped as soon as the game played its real sound archives. They are now `switch`es over the entries the index can reach: the offsets an `and` with a mask allows just before, or, for an index loaded from memory, every word to the block's end. Any other value stops. With the whole disc, the game now runs past Clock Settings to its title cards.
@@ -63,6 +65,16 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **Fibers** for the guest's cooperative threads: switching in assembly on x86-64 and AArch64, the Windows fiber API on Windows; AddressSanitizer is told about each switch.
 - **`longjmp` across lifted frames**: the functions that call the program's `setjmp` are lifted to be resumable after the call, and a return to an armed `setjmp` site unwinds the host stack to its frame. `setjmp`'s address is in the known-build table; `table.cpp` lists the sites.
 - **Guest threads**: a `longjmp` to a site armed in a suspended thread switches to it; one to a `setjmp` site or a function that no frame holds starts a new thread there, on its own fiber (the libraries' tasks start so). A suspended thread whose guest stack a new one starts in is ended, its frames unwound; a stop on any thread reaches the thread that switched to it. Off in the differential test.
+
+### Changed
+- **Less work on the paths outside RAM** (`docs/runtime.md`, "Design"):
+  - the disc: the drive kept no file open, so every 2 KB sector (streamed through loading and races) opened, positioned and closed the file; the folder drive and the disc image now keep the file read last open and positioned, and sectors go into RAM in one copy instead of 512 stores;
+  - G2 DMA from RAM to the sound chip's memory (the game's samples) is one block under one lock, where each word was a bus lookup and a lock;
+  - channel 2's DMA reads RAM as a block; video memory is read four bytes at a time for textures; twiddled texels are found by spreading bits instead of a loop per texel;
+  - the bus finds a device through a table of 64 KB pages instead of searching the list, and indirect calls find their function through a hash table instead of a binary search of the 5,309;
+  - the renderer sets each piece of a draw's state (pipeline, depth, stencil, texture, push constants) only when it changes from the draw before.
+  - over the race run (160 s, new game to 64 MPH in 3rd), `msr` used 26 seconds of CPU, down from 33, and the race's sky texture streams in about 200 pictures sooner; the race is otherwise the same (lap clock 5.958 at picture 6240).
+- **`QILIN_PRESS` is stricter**: anything after a picture number (`a@300x`) stops with a message, where it was ignored. Screenshots and `QILIN_DUMP` are written with one call instead of one a pixel or byte, so taking them changes the run's timing less.
 
 ### Checked
 - The generated code and the difftest harness build under MSVC 19.44 (Visual Studio 2022 Build Tools) with warnings as errors.

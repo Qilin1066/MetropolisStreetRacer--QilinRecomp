@@ -6,6 +6,7 @@
 #include "pvr.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -36,13 +37,22 @@ uint32_t& reg(uint32_t a) { return g_regs[(a - kLo) / 4]; }
 // (0x005F6904) and errors (0x005F6908). The hardware sets their bits; writing
 // ones clears them.
 constexpr uint32_t kStatusNormal = 0x005F6900u, kStatusExternal = 0x005F6904u, kStatusError = 0x005F6908u;
+// Other threads raise events too (the sound chip's: its driver's messages, the sound CPU's
+// interrupt) while the game acknowledges others, so the three words are atomic, apart from the
+// register file: no event is lost and none comes back.
+std::atomic<uint32_t> g_status[3];
+std::atomic<uint32_t>* status(uint32_t a) { return a >= kStatusNormal && a <= kStatusError && !(a & 3u) ? &g_status[(a - kStatusNormal) / 4] : nullptr; }
+uint32_t load(uint32_t a) {
+    if (std::atomic<uint32_t>* s = status(a)) return s->load(std::memory_order_acquire);
+    return reg(a);
+}
 
 uint32_t read(uint32_t a, unsigned n) {
     if (n != 4 || (a & 3u)) throw rt::Stop{rt::Stop::Unsupported, 0, a};
     switch (a) {
     case kId: return 0x17FD11DBu;
     case kRevision: return 0x11u;
-    default: return reg(a);
+    default: return load(a);
     }
 }
 
@@ -87,13 +97,16 @@ void dma_to_chip() {
     const bool to_ta = area == 0, to_texture = (area & 0x03000000u) == 0x01000000u;
     if (!to_ta && !to_texture) throw rt::Stop{rt::Stop::Unsupported, 0, to};
     uint8_t block[32];
+    const uint8_t* from = rt::ram_range(ch.sar, bytes);  // the source as host memory, when it is all RAM
     for (uint32_t k = 0; k < bytes; k += 32) {
-        for (uint32_t i = 0; i < 32; i += 4) {
-            const uint32_t w = rt::ld32(ch.sar + k + i);
-            std::memcpy(block + i, &w, 4);
-        }
-        if (to_ta) ta::feed(block, 32);
-        else vram_block(texture_path(to + k), block, 32);
+        const uint8_t* b = from ? from + k : block;
+        if (!from)
+            for (uint32_t i = 0; i < 32; i += 4) {
+                const uint32_t w = rt::ld32(ch.sar + k + i);
+                std::memcpy(block + i, &w, 4);
+            }
+        if (to_ta) ta::feed(b, 32);
+        else vram_block(texture_path(to + k), b, 32);
     }
     end_dma_channel2(bytes);
     reg(kC2Dst) = 0;
@@ -149,7 +162,11 @@ void g2_dma(uint32_t base) {
         throw rt::Stop{rt::Stop::Unsupported, 0, ram};
     const uint32_t from = 0xA0000000u | ((to_ram ? g2 : ram) & 0x1FFFFFFFu);
     const uint32_t dest = 0xA0000000u | ((to_ram ? ram : g2) & 0x1FFFFFFFu);
-    for (uint32_t k = 0; k < bytes; k += 4) rt::st32(dest + k, rt::ld32(from + k));
+    // From RAM (sound samples, the driver): one block to the sound chip's memory, which takes
+    // it under one lock, instead of a bus access and a lock for each word.
+    if (const uint8_t* src = to_ram ? nullptr : rt::ram_range(from, bytes)) rt::bus_write_block(dest, src, bytes);
+    else
+        for (uint32_t k = 0; k < bytes; k += 4) rt::st32(dest + k, rt::ld32(from + k));
     if (len & 0x80000000u) reg(base + 0x14) = 0;
     reg(base + 0x18) = 0;
     raise_event(15 + (base - kG2Lo) / 0x20u);
@@ -185,7 +202,7 @@ void write(uint32_t a, uint32_t v, unsigned n) {
         return;
     case kStatusNormal:
     case kStatusExternal:
-    case kStatusError: reg(a) &= ~v; return;
+    case kStatusError: status(a)->fetch_and(~v, std::memory_order_acq_rel); return;
     default: reg(a) = v; return;
     }
 }
@@ -247,9 +264,12 @@ const uint8_t* vram() { return g_vram; }
 // as on the console.
 void vram64_read(uint32_t offset, uint8_t* out, uint32_t n) {
     if (offset >= sizeof g_vram || n > sizeof g_vram) throw rt::Stop{rt::Stop::Unsupported, 0, offset};
-    for (uint32_t k = 0; k < n; ++k) {
+    // Four bytes at a time: each aligned four of the 64-bit view are together in one bank.
+    for (uint32_t k = 0; k < n;) {
         const uint32_t off = (offset + k) & (sizeof g_vram - 1);
-        out[k] = g_vram[((off & 4u) << 20) | ((off >> 1) & 0x003FFFFCu) | (off & 3u)];
+        const uint32_t run = std::min(4u - (off & 3u), n - k);
+        std::memcpy(out + k, g_vram + (((off & 4u) << 20) | ((off >> 1) & 0x003FFFFCu) | (off & 3u)), run);
+        k += run;
     }
 }
 uint64_t vram64_generation(uint32_t offset, uint32_t n) {
@@ -266,15 +286,15 @@ uint64_t vram64_generation(uint32_t offset, uint32_t n) {
     return newest;
 }
 
-uint32_t pvr_register(uint32_t a) { return reg(a & 0x1FFFFFFFu); }
+uint32_t pvr_register(uint32_t a) { return load(a & 0x1FFFFFFFu); }
 const uint32_t* pvr_palette() { return &reg(0x005F9000u); }
 void set_pvr_register(uint32_t a, uint32_t v) { write(a & 0x1FFFFFFFu, v, 4); }
 void raise_event(unsigned bit) {
-    reg(kStatusNormal) |= 1u << bit;
+    g_status[0].fetch_or(1u << bit, std::memory_order_acq_rel);
     interrupt_pending();
 }
 void raise_external_event(unsigned bit) {
-    reg(kStatusExternal) |= 1u << bit;
+    g_status[1].fetch_or(1u << bit, std::memory_order_acq_rel);
     interrupt_pending();
 }
 

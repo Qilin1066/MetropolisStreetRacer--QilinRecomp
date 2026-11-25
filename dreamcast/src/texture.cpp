@@ -81,10 +81,24 @@ void yuv_pair(uint32_t w0, uint32_t w1, uint32_t* out) {
 
 }  // namespace
 
+namespace {
+// v's low 16 bits moved to the even bit positions (bit k to bit 2k).
+constexpr uint32_t spread(uint32_t v) {
+    v &= 0xFFFFu;
+    v = (v | v << 8) & 0x00FF00FFu;
+    v = (v | v << 4) & 0x0F0F0F0Fu;
+    v = (v | v << 2) & 0x33333333u;
+    return (v | v << 1) & 0x55555555u;
+}
+}  // namespace
+
 uint32_t twiddle(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     const uint32_t m = std::min(w, h);
     uint32_t i = 0;
-    for (uint32_t bit = 0; (1u << bit) < m; ++bit) i |= ((y >> bit) & 1u) << (2 * bit) | ((x >> bit) & 1u) << (2 * bit + 1);
+    // The low bits of y and x, interleaved (y in the even bits), as many as m's side has.
+    if (m != 0 && !(m & (m - 1)) && m <= 0x10000u) i = spread(y & (m - 1)) | spread(x & (m - 1)) << 1;
+    else
+        for (uint32_t bit = 0; (1u << bit) < m; ++bit) i |= ((y >> bit) & 1u) << (2 * bit) | ((x >> bit) & 1u) << (2 * bit + 1);
     // A rectangle is a row of squares along its longer side.
     if (w > h) i += (x / m) * m * m;
     else if (h > w) i += (y / m) * m * m;

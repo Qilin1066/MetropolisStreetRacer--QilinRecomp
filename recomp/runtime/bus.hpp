@@ -37,4 +37,8 @@ void trace_bus(bool on);
 // The address a store queue sends its 32 bytes to, from QACR0/QACR1.
 uint32_t store_queue_target(uint32_t sq_address);
 
+// `n` bytes (a multiple of 4) to the device at `a`, for DMA: whole, when it takes blocks; else
+// as 4-byte writes. RAM and an address nothing handles are as for bus_write.
+void bus_write_block(uint32_t a, const uint8_t* data, unsigned n);
+
 }  // namespace qilin::rt
