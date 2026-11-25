@@ -11,8 +11,10 @@ namespace qilin {
 namespace {
 
 // MSR.BIN's start-a-program (0x8C02F68A): the launcher is replaced natively, and with it the
-// library that hands over to it (msr/src/launcher.cpp; docs/disc-and-boot-analysis.md).
-constexpr uint32_t kMsrReplaced[] = {0x8C02F68Au};
+// library that hands over to it (msr/src/launcher.cpp; docs/disc-and-boot-analysis.md). Shinobi's
+// settings queries, the language (0x8C1304BC) and the sound mode (0x8C13043E, set 0x8C130408):
+// answered from msr.ini (msr/src/console.cpp).
+constexpr uint32_t kMsrReplaced[] = {0x8C02F68Au, 0x8C130408u, 0x8C13043Eu, 0x8C1304BCu};
 
 // The North American disc, MK-51012 V1.010, dated 2000-11-30. Hashes
 // recorded from the Redump image in v0.3.0; docs/disc-and-boot-analysis.md

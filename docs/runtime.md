@@ -119,7 +119,23 @@ Pixels are packed row after row, most significant bit first: the game's unpackin
 
 **The glyphs.** `tools/make_romfont.py` takes GNU Unifont 18.0.01's Japanese variant (`unifont_jp-18.0.01.hex.gz`, SHA-256 checked), maps each slot's JIS X 0208 code to Unicode with Python's own EUC-JP codec, and writes the 8x16 and 16x16 glyphs in slot order to `msr/src/romfont_glyphs.inc` (committed, about 0.5 MB): 190 narrow, 6,847 wide, the rest of JIS's slots empty. JIS's Latin-1 symbols (´ ¨ ° ± × ÷ § ¶), half-width in Unifont, are centred in their wide cells; the soft hyphen has no glyph. When the game first reads the font, `msr` scales every glyph by 3/2: Scale3x (Andrea Mazzoleni's algorithm, as described at https://www.scale2x.it/algorithm) to three times the size, then each 2x2 block set if at least two of its pixels are. Unifont is GPL-2.0-or-later with the font embedding exception, and OFL-1.1; the generated file says so and stays under those terms.
 
-**The console's language.** `msr.ini`'s `[console] language` (and the menu's) isn't passed on yet: the game reads its language and sound mode through Shinobi from flash memory's settings partition, which starts blank, so it runs in its default, English. Toy Commander answers those Shinobi queries natively (its `shinobi_language` and friends); MSR's copies of them (Shinobi 1.68) haven't been found yet. `0x8C13733C` and its neighbours, which also read flash, are the backup library's.
+**The language.** This disc (USA) has English text only, and asks for the console's language once (below). Its Japanese strings are drawn whatever the language.
+
+## The console's settings
+
+The game asks Shinobi's settings library (1.68, from `0x8C1303EC`) for the console's language and sound mode. On the console, each query first copies the settings block from flash memory to the boot ROM's copy in RAM: block 5 of partition 2, through `0x8C1411D4`, into `0x8C000078`-`0x8C00007F`. The language is that copy's byte 5 (`0x8C00007D`) and the sound mode its byte 6 (`0x8C00007E`, 0 stereo, 1 mono). With blank flash memory the sound-mode query failed, and the game wrote stereo there itself at every first start.
+
+`msr` answers the three functions natively from `msr.ini`'s `[console]` (`msr/src/console.cpp`; `recomp/src/bootfile.cpp` lists them as replaced), as Toy Commander's port does:
+
+| Address | Called by | Native |
+|---|---|---|
+| `0x8C1304BC` | `0x8C05B630`, once | The language through r4 (Shinobi's numbers: 1 English, 2 German, 3 French, 4 Spanish), and into `0x8C00007D`. |
+| `0x8C13043E` | `0x8C06BB4C` (stereo when 0) | The sound mode through r4, and into `0x8C00007E`. |
+| `0x8C130408` | `0x8C06BB82`, the game's sound option | Sets the sound mode (0 or 1, else -1) in `0x8C00007E`, and `msr.ini` keeps it (`video.cpp`). Flash memory isn't written: the settings file is the record. |
+
+Each fails (-1) with a null r4 or with no work area (the word at `0x8C151E08`, set by the library's start), as the lifted code does. The library's start and end stay lifted. Nothing else in the game reads flash memory at start-up now (`QILIN_TRACE_FLASH=1` logs every FLASHROM call and its caller). The clock code (`0x8C1411D4` with a field mask) would still write the date to block 5; it hasn't been called so far.
+
+Clock Settings, at every start, is the game's own screen: its races follow the real time of day, and it asks the player to check the local time each time.
 
 ## The Dreamcast and host layers
 

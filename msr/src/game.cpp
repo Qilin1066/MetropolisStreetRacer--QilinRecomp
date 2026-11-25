@@ -90,14 +90,6 @@ void raise_bus_event(rt::Context& c, uint32_t event) {
     call_handler(c, h, 0x360u);
 }
 
-// The console's own settings: read by the game from flash memory, which the
-// boot ROM's FLASHROM calls provide (bios.cpp). Kept for when they arrive.
-namespace {
-unsigned g_language = 1;
-bool g_stereo = true;
-void (*g_save_sound_mode)(bool) = nullptr;
-}  // namespace
-void set_console(unsigned language, bool stereo) { g_language = language, g_stereo = stereo; }
-void on_sound_mode(void (*save)(bool stereo)) { g_save_sound_mode = save; }
+// set_console and on_sound_mode: msr/src/console.cpp, with Shinobi's settings queries.
 
 }  // namespace dreamcast::game

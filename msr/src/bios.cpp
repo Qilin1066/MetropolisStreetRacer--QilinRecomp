@@ -91,7 +91,10 @@ void rom_font(rt::Context& c) {
 // partition, two words at r5), 1 read (r4 offset, r5 to, r6 bytes), 2 write (r4 offset, r5
 // from, r6 bytes), 3 erase the partition at offset r4. The calls return what the boot ROM's do:
 // 0 or the bytes, -1 on a bad argument.
+// QILIN_TRACE_FLASH logs each call and its caller.
 void flash(rt::Context& c) {
+    static const bool trace = std::getenv("QILIN_TRACE_FLASH") != nullptr;
+    if (trace) rt::log("msr: FLASHROM %u r4 %08X r5 %08X r6 %08X from %08X", c.r[7], c.r[4], c.r[5], c.r[6], c.pr);
     switch (c.r[7]) {
     case 0: {
         uint32_t offset = 0, size = 0;

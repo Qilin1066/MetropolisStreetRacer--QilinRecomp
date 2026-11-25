@@ -31,6 +31,7 @@
 #include "memory.hpp"
 #include "onchip.hpp"
 #include "interrupts.hpp"
+#include "console.hpp"
 #include "launcher.hpp"
 #include "movie.hpp"
 #include "pvr.hpp"
@@ -210,6 +211,7 @@ int main(int argc, char** argv) {
     dreamcast::sound::start();
     msr::install_bios(*disc.drive);
     msr::install_launcher();
+    msr::install_console_settings();
     // A GD-ROM DMA's end is the system bus's normal event 14 (0xA40), delivered at the next poll.
     msr::set_bus_event([](rt::Context&, uint32_t event) { dreamcast::raise_event((event - 0xA00u) / 0x20u + 12u); });
 
