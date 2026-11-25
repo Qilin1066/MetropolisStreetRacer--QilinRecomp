@@ -355,7 +355,11 @@ int cmd_lift(const Args& a) {
     if (!build) throw Failure{std::format("{}: not a supported program (SHA-256 {})", a.input, boot.sha256)};
     Cfg cfg(boot);
     cfg.run();
-    const Lifter lifter(cfg, build->setjmp);
+    const Lifter lifter(cfg, build->setjmp, build->idle);
+    // Each wait loop's head must be in some function (the lifter checks it is a loop's head there).
+    for (const uint32_t head : build->idle)
+        if (!std::ranges::any_of(cfg.functions(), [&](const auto& e) { return std::ranges::binary_search(e.second.insns, head); }))
+            throw Failure{std::format("the wait loop at {:08x} (KnownBuild::idle) is in no function", head)};
     const std::filesystem::path dir(*a.out_dir);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);

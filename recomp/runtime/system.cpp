@@ -2,9 +2,13 @@
 #include "system.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace qilin::rt {
@@ -123,6 +127,27 @@ void log(const char* format, ...) {
     std::vfprintf(stderr, format, args);
     std::fputc('\n', stderr);
     va_end(args);
+}
+
+namespace {
+std::mutex g_idle_mutex;
+std::condition_variable g_idle_wake;
+std::atomic<unsigned> g_idle_waiters{0};
+}  // namespace
+
+// The waiter counts itself, then checks for a pending interrupt under the lock; a raiser sets
+// g_irq_pending first and then looks for waiters, so one of the two sees the other.
+void idle_wait() {
+    std::unique_lock lock(g_idle_mutex);
+    g_idle_waiters.fetch_add(1, std::memory_order_seq_cst);
+    g_idle_wake.wait_for(lock, std::chrono::milliseconds(1), [] { return g_irq_pending.load(std::memory_order_seq_cst); });
+    g_idle_waiters.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+void wake_idle() {
+    if (g_idle_waiters.load(std::memory_order_seq_cst) == 0) return;
+    { std::lock_guard lock(g_idle_mutex); }
+    g_idle_wake.notify_all();
 }
 
 }  // namespace qilin::rt

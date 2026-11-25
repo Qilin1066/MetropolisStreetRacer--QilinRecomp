@@ -42,8 +42,9 @@ uint16_t gpr_uses(const Insn& in) {
 // One function being lifted.
 class Emit {
 public:
-    Emit(const Cfg& cfg, const Function& f, const std::set<uint32_t>& mova_words, uint32_t setjmp)
-        : cfg_(cfg), f_(f), mova_words_(mova_words), setjmp_(setjmp) {
+    Emit(const Cfg& cfg, const Function& f, const std::set<uint32_t>& mova_words, uint32_t setjmp,
+         const std::set<uint32_t>& idle)
+        : cfg_(cfg), f_(f), mova_words_(mova_words), setjmp_(setjmp), idle_(idle) {
         for (const auto& [pc, mode] : f.fp_modes) modes_[pc] = mode;
     }
 
@@ -154,13 +155,18 @@ private:
         for (const uint32_t t : targets_)
             if (!std::ranges::binary_search(f_.insns, t) || (f_.slots.contains(t) && !slot_target(t)))
                 throw Fail{t, "internal: a branch target that isn't an instruction of the function"};
+        // A wait loop's head (KnownBuild::idle) in this function must be a loop's head.
+        for (const uint32_t a : idle_)
+            if (std::ranges::binary_search(f_.insns, a) && !loops_.contains(a))
+                throw Fail{a, "a wait loop's head (KnownBuild::idle) that isn't a loop's head"};
     }
 
     // At a loop's head: where the runtime delivers interrupts (guest.hpp), with the stack pointer
-    // the handlers' frames go below.
+    // the handlers' frames go below. At a wait loop's head (KnownBuild::idle) it waits for one.
     std::string poll(uint32_t pc) const {
         if (!loops_.contains(pc)) return {};
-        return std::format("    QILIN_POLL_IRQ({});\n", used_ >> 15 & 1 ? "r15" : "c.r[15]");
+        return std::format("    {}({});\n", idle_.contains(pc) ? "QILIN_IDLE" : "QILIN_POLL_IRQ",
+                           used_ >> 15 & 1 ? "r15" : "c.r[15]");
     }
 
     bool slot_target(uint32_t pc) const { return std::ranges::find(f_.slot_targets, pc) != f_.slot_targets.end(); }
@@ -652,6 +658,7 @@ private:
     mutable std::optional<uint8_t> forced_;  // the mode fp_statement is lifting for
     const std::set<uint32_t>& mova_words_;
     uint32_t setjmp_ = 0;
+    const std::set<uint32_t>& idle_;
     std::vector<uint32_t> sites_;  // return addresses of this function's calls to setjmp
     std::set<uint32_t> loops_;     // targets of backward branches: loops' heads
     mutable std::vector<std::pair<uint32_t, uint32_t>> folded_;
@@ -669,7 +676,8 @@ bool any_mode(const Function& f) {
            (f.fp_modes.empty() && f.calls.empty() && f.tails.empty() && f.icalls.empty() && f.itails.empty() && !f.falls_into);
 }
 
-Lifter::Lifter(const Cfg& cfg, uint32_t setjmp) : cfg_(cfg), setjmp_(setjmp) {
+Lifter::Lifter(const Cfg& cfg, uint32_t setjmp, std::span<const uint32_t> idle)
+    : cfg_(cfg), setjmp_(setjmp), idle_(idle.begin(), idle.end()) {
     // Pool words code may write: one a mova points at, or one whose address is itself a constant in
     // some pool (cached or uncached alias), as the libraries' handler table is (0x8C130B24).
     std::set<uint32_t> pool;
@@ -687,7 +695,7 @@ Lifter::Lifter(const Cfg& cfg, uint32_t setjmp) : cfg_(cfg), setjmp_(setjmp) {
 LiftResult Lifter::lift(const Function& f) const {
     LiftResult result;
     try {
-        Emit emit(cfg_, f, mova_words_, setjmp_);
+        Emit emit(cfg_, f, mova_words_, setjmp_, idle_);
         const std::string code = emit.run();
         result.code = emit.sync_macros() + code;
         result.dynamic = emit.dynamic();

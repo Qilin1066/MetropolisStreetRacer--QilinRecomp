@@ -70,6 +70,10 @@ struct KnownBuild {
     // Functions the port replaces with native code instead of lifting them: qilin lift emits each
     // as a call to the native registered at its address (rt::replaced), and stops if there is none.
     std::span<const uint32_t> replaced = {};
+    // Wait loops: heads of loops that only an interrupt can end (they poll a flag a handler
+    // changes). qilin lift makes the host wait there for the next interrupt (QILIN_IDLE, guest.hpp)
+    // instead of going round as fast as it can.
+    std::span<const uint32_t> idle = {};
 };
 const KnownBuild* known_build(std::string_view sha256_hex);
 

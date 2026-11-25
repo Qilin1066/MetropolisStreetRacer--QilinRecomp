@@ -635,6 +635,29 @@ void test_lifter() {
         CHECK(r.code.contains("if (u.site == &site_8c010008) { resume = 0x8c010008u; continue; }"));
         CHECK(Lifter(cfg).lift(cfg.functions().at(B)).jump_sites.empty());
     }
+    // A wait loop (KnownBuild::idle): its head waits for an interrupt instead of only polling; an
+    // address that isn't a loop's head is refused.
+    {
+        const BootFile wait = program({
+            /* 00 */ 0xE100,  // mov #0,r1
+            /* 02 */ 0x6042,  // mov.l @r4,r0      (the loop's head)
+            /* 04 */ 0x2008,  // tst r0,r0
+            /* 06 */ 0x89FC,  // bt 0x02
+            /* 08 */ 0x000B,  // rts
+            /* 0a */ 0x0009,
+        });
+        Cfg wcfg(wait);
+        wcfg.run();
+        CHECK(wcfg.functions().contains(B));
+        if (wcfg.functions().contains(B)) {
+            const uint32_t head[] = {B + 2}, not_head[] = {B + 4};
+            const LiftResult plain = Lifter(wcfg).lift(wcfg.functions().at(B));
+            CHECK(plain.ok && plain.code.contains("QILIN_POLL_IRQ(") && !plain.code.contains("QILIN_IDLE("));
+            const LiftResult idle = Lifter(wcfg, 0, head).lift(wcfg.functions().at(B));
+            CHECK(idle.ok && idle.code.contains("L_8c010002:\n    QILIN_TICK(0x8c010002u);\n    QILIN_IDLE("));
+            CHECK(!Lifter(wcfg, 0, not_head).lift(wcfg.functions().at(B)).ok);
+        }
+    }
     // The compiler's switch becomes a switch on the target, and a tail call a call and return.
     {
         const BootFile sw = program({0x0009, 0x0009, 0x6043, 0xE103, 0x3012, 0x890B, 0x4000, 0x6103, 0xC701, 0x001D, 0x0023, 0x0009,

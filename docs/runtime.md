@@ -121,6 +121,12 @@ Pixels are packed row after row, most significant bit first: the game's unpackin
 
 **The language.** This disc (USA) has English text only, and asks for the console's language once (below). Its Japanese strings are drawn whatever the language.
 
+## Waiting
+
+Most of the time outside a race, the game's main thread is in one loop: `0x8C12B980`, in `0x8C12B8DE`. It calls entry 7 of the libraries' table at `0x8C5C35D4` (an `rts`), then tests a bit of `0x8C5BE3FC`, and goes round while it's set. Only an interrupt's handler clears it. The console spins there too; on the PC the loop took a whole core, about 5 seconds of CPU every 5 seconds through the menus.
+
+The known-build table lists such loops (`KnownBuild::idle`). At each listed head, `qilin lift` writes `QILIN_IDLE` in place of the usual interrupt poll. With no interrupt pending, the host thread waits until one is raised (`interrupt_pending` wakes it through `rt::wake_idle`), at most a millisecond, then delivers it as before. Guest time is the host's clock, so the game sees nothing different: the race run reaches the same screens at the same pictures, and the car is at 64 MPH in 3rd at picture 6240 as before. CPU through the menus falls to 0.6 to 1 second every 5 seconds. A listed address that isn't a loop's head, or is in no function, stops `qilin lift`.
+
 ## The console's settings
 
 The game asks Shinobi's settings library (1.68, from `0x8C1303EC`) for the console's language and sound mode. On the console, each query first copies the settings block from flash memory to the boot ROM's copy in RAM: block 5 of partition 2, through `0x8C1411D4`, into `0x8C000078`-`0x8C00007F`. The language is that copy's byte 5 (`0x8C00007D`) and the sound mode its byte 6 (`0x8C00007E`, 0 stereo, 1 mono). With blank flash memory the sound-mode query failed, and the game wrote stereo there itself at every first start.

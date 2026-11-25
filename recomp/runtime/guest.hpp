@@ -172,6 +172,7 @@ inline void check_store(uint32_t a, uint32_t n) {
 #define QILIN_TICK(a) (::qilin::rt::g_pc = (a), ::qilin::rt::count_access(0))
 // Interrupts aren't delivered in checked builds (the differential test runs one function).
 #define QILIN_POLL_IRQ(r15) ((void)0)
+#define QILIN_IDLE(r15) ((void)0)
 // The last longword loads (address, value): when an access faults, the
 // differential test looks here for where the bad pointer came from.
 inline constexpr unsigned kLoadTrace = 64;
@@ -496,7 +497,14 @@ inline void poll_irq(Context& c, uint32_t r15) {
     c.r[15] = r15;
     g_irq_service(c);
 }
+// A wait loop's head (KnownBuild::idle): only an interrupt can end the loop, so with none
+// pending the host thread waits for one to be raised (wake_idle), at most a millisecond, then
+// polls. Guest time is the host's, so the game sees no difference; the host's CPU isn't burnt.
+void idle_wait();
+// Called whenever g_irq_pending is set: ends an idle_wait at once.
+void wake_idle();
 #ifndef QILIN_CHECKED_MEMORY
+#define QILIN_IDLE(r15)                                                                                 do {                                                                                                    if (!::qilin::rt::g_irq_pending.load(std::memory_order_seq_cst)) ::qilin::rt::idle_wait();         QILIN_POLL_IRQ(r15);                                                                            } while (0)
 #define QILIN_POLL_IRQ(r15)                                                                                          \
     do {                                                                                                             \
         if (::qilin::rt::g_irq_pending.load(std::memory_order_relaxed)) [[unlikely]] ::qilin::rt::poll_irq(c, (r15)); \
@@ -506,7 +514,7 @@ inline void poll_irq(Context& c, uint32_t r15) {
 inline void set_sr(Context& c, uint32_t v, uint32_t pc) {
     v &= kSrBits;
     if (!(v & kSrMd) || (v & kSrFd)) throw Stop{Stop::Unsupported, pc, v};
-    if (g_irq_waiting && ((v >> 4) & 15u) < ((c.sr >> 4) & 15u)) g_irq_pending.store(true, std::memory_order_relaxed);
+    if (g_irq_waiting && ((v >> 4) & 15u) < ((c.sr >> 4) & 15u)) g_irq_pending.store(true, std::memory_order_seq_cst);
     if ((v ^ c.sr) & kSrRb)
         for (unsigned i = 0; i < 8; ++i) std::swap(c.r[i], c.rbank[i]);
     c.t = v & 1, c.s = v >> 1 & 1, c.q = v >> 8 & 1, c.m = v >> 9 & 1;

@@ -15,6 +15,10 @@ namespace {
 // settings queries, the language (0x8C1304BC) and the sound mode (0x8C13043E, set 0x8C130408):
 // answered from msr.ini (msr/src/console.cpp).
 constexpr uint32_t kMsrReplaced[] = {0x8C02F68Au, 0x8C130408u, 0x8C13043Eu, 0x8C1304BCu};
+// Wait loops: 0x8C12B980, in 0x8C12B8DE, waits for a bit of 0x8C5BE3FC to clear, calling entry 7 of
+// the libraries' table at 0x8C5C35D4 (an rts) each time round; only an interrupt's handler clears
+// it. The menus spend their time there (docs/runtime.md, "Waiting").
+constexpr uint32_t kMsrIdle[] = {0x8C12B980u};
 
 // The North American disc, MK-51012 V1.010, dated 2000-11-30. Hashes
 // recorded from the Redump image in v0.3.0; docs/disc-and-boot-analysis.md
@@ -23,7 +27,7 @@ constexpr std::array<KnownBuild, 2> kKnownBuilds{{
     {"b5515a96ba7e67dc2dfe08b6adf7d99a4d6c95e7e9fb015fe1f70dffa59af0e9", "1ST_READ.BIN", "MK-51012", "V1.010",
      "Metropolis Street Racer (USA): launcher"},
     {"7780f031bc7124dd68e2b411daf5e6fb636589ab4ea9b36427531d95517d9888", "MSR.BIN", "MK-51012", "V1.010",
-     "Metropolis Street Racer (USA): game", 0x8C0EE5BCu, kMsrReplaced},
+     "Metropolis Street Racer (USA): game", 0x8C0EE5BCu, kMsrReplaced, kMsrIdle},
 }};
 
 std::unexpected<std::string> fail(std::string message) { return std::unexpected(std::move(message)); }
