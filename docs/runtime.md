@@ -135,6 +135,8 @@ The game asks Shinobi's settings library (1.68, from `0x8C1303EC`) for the conso
 
 Each fails (-1) with a null r4 or with no work area (the word at `0x8C151E08`, set by the library's start), as the lifted code does. The library's start and end stay lifted. Nothing else in the game reads flash memory at start-up now (`QILIN_TRACE_FLASH=1` logs every FLASHROM call and its caller). The clock code (`0x8C1411D4` with a field mask) would still write the date to block 5; it hasn't been called so far.
 
+**On to the car's options** (2026-11-25, headless, driven by `QILIN_PRESS`). From the title: Create a new game, Player Details (first name, nickname and last name each need one character at least; CONTINUE asks "You will be known as …", No selected first), then File Save. Confirming the name made the game sound the memory card's buzzer, a command the card didn't take (now answered: the changelog). The save is written to the card, and the menus go on to Your Garage, The Showroom (Challenge) and Car Options Select.
+
 Clock Settings, at every start, is the game's own screen: its races follow the real time of day, and it asks the player to check the local time each time.
 
 ## The Dreamcast and host layers

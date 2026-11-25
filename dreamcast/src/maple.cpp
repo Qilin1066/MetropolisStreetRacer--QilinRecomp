@@ -207,7 +207,17 @@ void memory_card(uint32_t header, uint32_t data_at, uint32_t to) {
     default: break;
     }
     const uint32_t function = words >= 1 ? rt::ld32(data_at) : 0;
-    if (function != kStorage) throw rt::Stop{rt::Stop::Unsupported, 0, header};
+    // The clock's set condition, one word: the buzzer's tone (Metropolis Street Racer sends one
+    // once the player's name is confirmed). The port has no buzzer: the card answers that it's done.
+    if (command == kSetCondition && function == kClock && words == 2) {
+        reply(to, kOk, sender, me, nullptr, 0);
+        return;
+    }
+    if (function != kStorage) {
+        rt::log("maple: the memory card was sent command %u for function %08X, %u words (the second %08X)", command, function, words,
+                words >= 2 ? rt::ld32(data_at + 4) : 0u);
+        throw rt::Stop{rt::Stop::Unsupported, 0, header};
+    }
     // The location: [0] the partition, [1] the part of the block, [2] the block, high byte first.
     const uint32_t location = words >= 2 ? rt::ld32(data_at + 4) : 0;
     const uint32_t partition = location & 0xFFu, part = (location >> 8) & 0xFFu, block = (location >> 24) | ((location >> 8) & 0xFF00u);
