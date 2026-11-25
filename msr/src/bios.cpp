@@ -73,6 +73,17 @@ uint32_t font_read(uint32_t a, unsigned n) {
     return 0;
 }
 void font_write(uint32_t a, uint32_t v, unsigned) { throw rt::Stop{rt::Stop::Unsupported, a, v}; }  // ROM
+
+// The rest of the boot ROM (its code, below the font). It's Sega's: reads give 0, and the first
+// says where. The game reads it by mistake: in the race, 0x8C09C9E2 reads the byte at offset 93
+// of a null pointer (address 0x5D) when both of a list entry's pointers are null, and doesn't
+// use what it read (the comparison's T is overwritten at once).
+uint32_t rom_read(uint32_t a, unsigned) {
+    static bool said = false;
+    if (!said) rt::log("msr: the game reads the boot ROM's code at %08X (0 given: the boot ROM isn't here)", a);
+    said = true;
+    return 0;
+}
 void rom_font(rt::Context& c) {
     switch (c.r[1]) {
     case 0:
@@ -457,6 +468,7 @@ void install_bios(Drive& drive) {
     g_drive = &drive;
     rt::provide(kCalls);
     // The font's part of the boot ROM (its 2 MB at 0x00000000; the font about 0.5 MB from 0x100020).
+    rt::map({0x00000000u, 0x00100000u, "boot ROM (its code: reads give 0)", rom_read, font_write});
     rt::map({0x00100000u, 0x00200000u, "boot ROM font (Unifont)", font_read, font_write});
     set_vector(0x8C0000B0u, kSysinfo);
     set_vector(0x8C0000B4u, kRomFont);

@@ -174,6 +174,35 @@ void start() {
     std::fprintf(stderr, QILIN_APP ": drawing with %s\n", g_display->device_name().c_str());
 }
 
+// QILIN_DUMP=<folder>,<picture>[,...]: main RAM (16 MB from 0x8C000000) to
+// <folder>/ram_<picture>.bin when that picture is shown, for comparing a
+// running game's state between pictures.
+static void dump_ram_if_asked() {
+    static std::string folder;
+    static std::vector<uint64_t> at = [] {
+        std::vector<uint64_t> v;
+        const char* s = std::getenv("QILIN_DUMP");
+        if (!s) return v;
+        std::string all = s;
+        const size_t comma = all.find(',');
+        if (comma == std::string::npos) rt::fatal("QILIN_DUMP: <folder>,<picture>[,...]");
+        folder = all.substr(0, comma);
+        for (const char* c = all.c_str() + comma; *c == ',';) {
+            char* end = nullptr;
+            v.push_back(std::strtoull(c + 1, &end, 10));
+            c = end;
+        }
+        return v;
+    }();
+    if (std::find(at.begin(), at.end(), g_pictures) == at.end()) return;
+    std::vector<uint8_t> ram(0x01000000u);
+    for (uint32_t k = 0; k < ram.size(); ++k) ram[k] = static_cast<uint8_t>(rt::ld8(0x8C000000u + k));
+    const std::string path = folder + "/ram_" + std::to_string(g_pictures) + ".bin";
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f || std::fwrite(ram.data(), 1, ram.size(), f) != ram.size()) rt::fatal("QILIN_DUMP: cannot write %s", path.c_str());
+    std::fclose(f);
+}
+
 void render() {
     if (!g_renderer) return;
     renderer::Source src;
@@ -279,6 +308,7 @@ void vblank() {
     g_drawn = false;
     ++g_pictures;
     if (!g_shot_folder.empty() && g_pictures % g_shot_every == 0) shot(g_renderer->read_back(), p.width, p.height);
+    dump_ram_if_asked();
     g_display->present_image(p.image, p.view, p.width, p.height, 4.0f / 3.0f, p.height / g_scale);
 }
 
@@ -292,11 +322,11 @@ namespace {
 // QILIN_PRESS=<button>@<picture>[,...]: presses a button for ten pictures from
 // the given one (button: a, b, x, y, start, up, down, left, right, lt, rt),
 // for driving a run without a window; <button>@<first>-<last>/<every>
-// presses it every so many pictures.
+// presses it every so many pictures, and <button>@<first>+<pictures> holds it.
 struct Press {
     uint16_t button;
     bool lt, rt;
-    uint64_t from;
+    uint64_t from, length = 10;
 };
 std::vector<Press> scripted_presses() {
     std::vector<Press> out;
@@ -325,13 +355,20 @@ std::vector<Press> scripted_presses() {
                 char* rest = nullptr;
                 const uint64_t first = std::strtoull(item.c_str() + sign + 1, &rest, 10);
                 uint64_t last = first, every = 1;
+                if (*rest == '+') {
+                    const uint64_t length = std::strtoull(rest + 1, &rest, 10);
+                    if (length == 0) rt::fatal("QILIN_PRESS: %s: held for no pictures", item.c_str());
+                    out.push_back({n.button, name == "lt", name == "rt", first, length});
+                    found = true;
+                    continue;
+                }
                 if (*rest == '-') {
                     last = std::strtoull(rest + 1, &rest, 10);
                     if (*rest != '/') rt::fatal("QILIN_PRESS: %s: <first>-<last>/<every>", item.c_str());
                     every = std::strtoull(rest + 1, &rest, 10);
                     if (every < 20) rt::fatal("QILIN_PRESS: %s: presses at least 20 pictures apart", item.c_str());
                 }
-                for (uint64_t at2 = first; at2 <= last; at2 += every) out.push_back({n.button, name == "lt", name == "rt", at2});
+                for (uint64_t at2 = first; at2 <= last; at2 += every) out.push_back({n.button, name == "lt", name == "rt", at2, 10});
             }
                 found = true;
             }
@@ -418,7 +455,7 @@ maple::Controls controls(unsigned port) {
     if (on[kCtlStickUp] != on[kCtlStickDown]) c.y = on[kCtlStickUp] ? 0 : 255;
     static const std::vector<Press> presses = scripted_presses();
     for (const Press& p2 : presses)
-        if (g_pictures >= p2.from && g_pictures < p2.from + 10) {
+        if (g_pictures >= p2.from && g_pictures < p2.from + p2.length) {
             c.buttons |= p2.button;
             if (p2.lt) c.lt = 255;
             if (p2.rt) c.rt = 255;
