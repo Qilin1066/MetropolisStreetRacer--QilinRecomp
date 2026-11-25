@@ -69,6 +69,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **Guest threads**: a `longjmp` to a site armed in a suspended thread switches to it; one to a `setjmp` site or a function that no frame holds starts a new thread there, on its own fiber (the libraries' tasks start so). A suspended thread whose guest stack a new one starts in is ended, its frames unwound; a stop on any thread reaches the thread that switched to it. Off in the differential test.
 
 ### Changed
+- README rewritten to the layout shared by the QilinRecomp projects: what works and how to build and play it, without the development history.
 - **Less work on the paths outside RAM** (`docs/runtime.md`, "Design"):
   - the disc: the drive kept no file open, so every 2 KB sector (streamed through loading and races) opened, positioned and closed the file; the folder drive and the disc image now keep the file read last open and positioned, and sectors go into RAM in one copy instead of 512 stores;
   - G2 DMA from RAM to the sound chip's memory (the game's samples) is one block under one lock, where each word was a bus lookup and a lock;
