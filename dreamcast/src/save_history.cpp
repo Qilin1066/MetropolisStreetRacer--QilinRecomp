@@ -90,6 +90,8 @@ bool backup_path(const fs::path& folder, const fs::path& backup, std::string& na
         if (fs::is_symlink(status)) return fail(error, "a link in the saves' history");
     }
     if (!fs::is_regular_file(backup, ec)) return fail(error, "the copy is missing", ec);
+    const auto size = fs::file_size(backup, ec);
+    if (ec || size != 0x20000u) return fail(error, "the backup is not a complete 128 KB save image", ec);
     name = dir;
     return true;
 }

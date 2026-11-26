@@ -3,6 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
+#include <cctype>
+#include <limits>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -117,8 +120,20 @@ public:
                                  std::to_string(it->second.second) + ")", false;
                 e.sector = it->second.first;
                 if (e.sector < next) return why = rel + ": its sector on the disc is among the file system's own", false;
-                files_.emplace(e.sector, &e - entries_.data());
-                end_ = std::max(end_, e.sector + std::max<uint32_t>(1, (e.size + kSector - 1) / kSector));
+                const uint64_t end = uint64_t(e.sector) + (uint64_t(e.size) + kSector - 1) / kSector;
+                if (end > UINT32_MAX) return why = rel + ": its extent exceeds the sector address range", false;
+                if (e.size) {
+                    const auto after = files_.lower_bound(e.sector);
+                    if (after != files_.end() && end > after->first)
+                        return why = rel + ": overlapping file extents in disc.json", false;
+                    if (after != files_.begin()) {
+                        const Entry& before = entries_[std::prev(after)->second];
+                        const uint64_t previous_end = uint64_t(before.sector) + (uint64_t(before.size) + kSector - 1) / kSector;
+                        if (previous_end > e.sector) return why = rel + ": overlapping file extents in disc.json", false;
+                    }
+                    files_.emplace(e.sector, &e - entries_.data());
+                }
+                end_ = std::max(end_, static_cast<uint32_t>(end));
             }
         end_ = std::max(end_, next);
         fill_path_table(path_l_, false);
@@ -190,18 +205,37 @@ private:
         const std::string text((std::istreambuf_iterator<char>(in)), {});
         size_t at = text.find("\"files\"");
         if (at == std::string::npos) return why = "disc.json has no file list", false;
-        const auto field = [&](size_t from, const char* key) -> size_t {
-            const size_t k = text.find(key, from);
-            return k == std::string::npos ? k : text.find(':', k) + 1;
+        // Fields must belong to the same object. Never let a missing value
+        // consume a later file's field, and never truncate a 64-bit number.
+        const auto number = [&](size_t begin, size_t limit, const char* key, uint32_t& value) {
+            const size_t k = text.find(key, begin);
+            if (k == std::string::npos || k >= limit) return false;
+            size_t colon = text.find(':', k + std::strlen(key));
+            if (colon == std::string::npos || colon >= limit) return false;
+            size_t first = colon + 1;
+            while (first < limit && std::isspace(static_cast<unsigned char>(text[first]))) ++first;
+            const auto result = std::from_chars(text.data() + first, text.data() + limit, value);
+            if (result.ec != std::errc{} || result.ptr == text.data() + first) return false;
+            size_t tail = static_cast<size_t>(result.ptr - text.data());
+            while (tail < limit && std::isspace(static_cast<unsigned char>(text[tail]))) ++tail;
+            return tail == limit || text[tail] == ',';
         };
         while ((at = text.find("\"path\"", at)) != std::string::npos) {
-            const size_t q1 = text.find('"', text.find(':', at) + 1), q2 = text.find('"', q1 + 1);
-            const size_t sec = field(q2, "\"sector\""), size = field(q2, "\"size\"");
-            if (q1 == std::string::npos || q2 == std::string::npos || sec == std::string::npos || size == std::string::npos)
-                return why = "disc.json: a file entry without its path, sector and size", false;
-            out[upper(text.substr(q1 + 1, q2 - q1 - 1))] = {static_cast<uint32_t>(std::stoul(text.substr(sec, 16))),
-                                                           static_cast<uint32_t>(std::stoul(text.substr(size, 16)))};
-            at = q2;
+            const size_t begin = text.rfind('{', at), limit = text.find('}', at);
+            const size_t colon = text.find(':', at + 6);
+            if (begin == std::string::npos || limit == std::string::npos || colon == std::string::npos || colon >= limit)
+                return why = "disc.json: incomplete file object", false;
+            const size_t q1 = text.find_first_not_of(" \t\r\n", colon + 1);
+            if (q1 == std::string::npos || q1 >= limit || text[q1] != '"')
+                return why = "disc.json: path is not a string", false;
+            const size_t q2 = text.find('"', q1 + 1);
+            uint32_t sector = 0, size = 0;
+            if (q2 == std::string::npos || q2 >= limit || !number(begin, limit, "\"sector\"", sector) ||
+                !number(begin, limit, "\"size\"", size))
+                return why = "disc.json: invalid path, sector or size", false;
+            if (!out.emplace(upper(text.substr(q1 + 1, q2 - q1 - 1)), std::pair{sector, size}).second)
+                return why = "disc.json: duplicate file path", false;
+            at = limit + 1;
         }
         if (out.empty()) return why = "disc.json lists no files", false;
         return true;
@@ -225,6 +259,8 @@ private:
                 e.size = static_cast<uint32_t>(size);
                 e.name += ";1";
             }
+            if (record_size(e.name) > 254)
+                return why = "file name is too long for an ISO directory record: " + name, false;
             kids.push_back(std::move(e));
         }
         std::sort(kids.begin(), kids.end(), [](const Entry& a, const Entry& b) { return a.name < b.name; });

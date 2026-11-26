@@ -42,13 +42,16 @@ void check(bool ok, const char* what) {
     if (!ok) ++g_failures;
 }
 
+std::string image(std::string text) { text.resize(0x20000, '\0'); return text; }
+
 std::string read(const fs::path& p) {
     std::ifstream in(p, std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(in), {});
 }
 bool write(const fs::path& p, const std::string& text) {
     std::string error;
-    return dreamcast::write_file_safely(p, reinterpret_cast<const uint8_t*>(text.data()), text.size(), error);
+    const auto bytes = p.filename() == "memory_card_a1.bin" || p.filename() == "flash.bin" ? image(text) : text;
+    return dreamcast::write_file_safely(p, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), error);
 }
 
 }  // namespace
@@ -63,7 +66,7 @@ int main() {
     check(dreamcast::backup_save(dir, "memory_card_a1.bin", error) && dreamcast::save_backups(dir).empty(),
           "no save yet: nothing to keep, and no error");
     check(!dreamcast::backup_save(dir, "notes.txt", error), "only the saves this program keeps");
-    check(write(card, "save 0") && read(card) == "save 0" && !fs::exists(dir / "memory_card_a1.bin.tmp"),
+    check(write(card, image("save 0")) && read(card) == image("save 0") && !fs::exists(dir / "memory_card_a1.bin.tmp"),
           "a whole file written through a temporary one");
 
     // Seven saves: the five latest copies stay, the newest first.
@@ -73,15 +76,15 @@ int main() {
     }
     std::vector<dreamcast::SaveBackup> list = dreamcast::save_backups(dir);
     check(list.size() == 5, "five copies kept");
-    check(list.size() == 5 && read(list[0].file) == "save 6" && read(list[4].file) == "save 2", "the newest first, the oldest two gone");
+    check(list.size() == 5 && read(list[0].file) == image("save 6") && read(list[4].file) == image("save 2"), "the newest first, the oldest two gone");
     check(!list.empty() && list[0].label.rfind("Memory card / ", 0) == 0 && list[0].label.ends_with(" UTC"), "labelled with the save and the time");
 
     // A restore of the oldest kept: at the next start, the present save kept first.
     check(dreamcast::request_save_restore(dir, list[4].file, error) && fs::exists(dir / "restore-save.txt"), "a restore asked for");
-    check(dreamcast::apply_save_restore(dir, error) && read(card) == "save 2", "the copy restored at the start");
+    check(dreamcast::apply_save_restore(dir, error) && read(card) == image("save 2"), "the copy restored at the start");
     check(!fs::exists(dir / "restore-save.txt"), "the request done and removed");
     list = dreamcast::save_backups(dir);
-    check(list.size() == 5 && read(list[0].file) == "save 7", "the save it replaced is kept, so the restore can be undone");
+    check(list.size() == 5 && read(list[0].file) == image("save 7"), "the save it replaced is kept, so the restore can be undone");
     check(dreamcast::apply_save_restore(dir, error), "no request: nothing to do");
 
     // What isn't a copy in the history is refused, asked for or written by hand.
@@ -89,7 +92,7 @@ int main() {
     check(!dreamcast::request_save_restore(dir, dir / "save-backups" / "memory_card_a1.bin.history" / ".." / ".." / "x.bak", error),
           "nor a path out of the history");
     write(dir / "restore-save.txt", "../memory_card_a1.bin\n");
-    check(!dreamcast::apply_save_restore(dir, error) && read(card) == "save 2" && fs::exists(dir / "restore-save.txt"),
+    check(!dreamcast::apply_save_restore(dir, error) && read(card) == image("save 2") && fs::exists(dir / "restore-save.txt"),
           "a request naming something else: refused, the save unchanged, the request kept");
     fs::remove(dir / "restore-save.txt");
 
@@ -114,6 +117,15 @@ int main() {
         break;
     }
     const auto before = read(card);
+    const auto broken = dir / "save-backups" / "memory_card_a1.bin.history" / "99999999999999999999-000000.bak";
+    write(broken, "truncated");
+    check(!dreamcast::request_save_restore(dir, broken, error) && read(card) == before,
+          "truncated backup cannot replace the working memory card");
+    write(dir / "restore-save.txt", "memory_card_a1.bin.history/" + broken.filename().string() + "\n");
+    check(!dreamcast::apply_save_restore(dir, error) && read(card) == before,
+          "hand-written request cannot restore a truncated backup");
+    fs::remove(dir / "restore-save.txt");
+    fs::remove(broken);
     write(dir / "restore-save.txt", std::string(1025, 'x'));
     check(!dreamcast::apply_save_restore(dir, error) && read(card) == before && fs::exists(dir / "restore-save.txt"),
           "oversized restore request refused without changing the save or request");
@@ -123,12 +135,12 @@ int main() {
     // under backup_path's policy. Refuse it before claiming a recoverable copy.
     const auto linked = dir / "linked", outside = dir / "outside";
     fs::create_directories(linked); fs::create_directories(outside);
-    write(linked / "memory_card_a1.bin", "unchanged");
+    write(linked / "memory_card_a1.bin", image("unchanged"));
     std::error_code ec;
     fs::create_directory_symlink(outside, linked / "save-backups", ec);
     if (!ec) {
         check(!dreamcast::backup_save(linked, "memory_card_a1.bin", error) && fs::is_empty(outside) &&
-              read(linked / "memory_card_a1.bin") == "unchanged", "linked history refused before making an unusable backup");
+              read(linked / "memory_card_a1.bin") == image("unchanged"), "linked history refused before making an unusable backup");
     } else std::printf("directory symlink fixture unavailable: %s\n", ec.message().c_str());
 
     fs::remove_all(dir);

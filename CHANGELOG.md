@@ -91,6 +91,18 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **Accesses through two views of the same RAM** at constant addresses could be reordered by the compiler; the access helpers now fold a constant address to its P1 view when compiled (GCC and Clang).
 - The memory test on arm64: the compiler reordered accesses at two views of the same byte (now fenced; the hazard is documented).
 
+## [0.9.2] - 2026-11-26
+
+### Fixed
+- Disc layout numbers are checked without throwing or truncating oversized values. Missing fields cannot borrow values from a later file; duplicate file paths and malformed numeric suffixes are rejected.
+- Folder-backed discs reject overlapping and overflowing file extents, rather than silently serving another file or wrapping the disc's end sector.
+- Filenames too large for an ISO directory record are rejected before its one-byte length can wrap.
+- Save restoration rejects memory-card and flash backups that are not complete 128 KB images, preserving the working save.
+
+### Tests
+- Added malformed layout, extent overlap and overflow cases, oversized ISO names on hosts that support the fixture, and truncated-backup restore requests.
+- Save-history tests now use full-sized images matching the runtime's memory-card and flash formats.
+
 ## [0.9.1] - 2026-11-26
 
 ### Fixed

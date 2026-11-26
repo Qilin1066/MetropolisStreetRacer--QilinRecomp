@@ -1618,6 +1618,24 @@ void test_folder_drive() {
     CHECK(msr::Drive::of_folder(dir, why) == nullptr);  // A.BIN's size differs
     write(dir / "disc.json", R"({"files": [{"path": "A.BIN", "sector": 50000, "size": 5},
         {"path": "SUB/B.TXT", "sector": 50010, "size": 3000}]})");
+    const std::string good_layout = R"({"files": [{"path":"A.BIN","sector":50000,"size":5},
+        {"path":"SUB/B.TXT","sector":50010,"size":3000}]})";
+    const std::vector<std::string> bad_layouts = {
+        R"({"files":[{"path":"A.BIN","sector":"oops","size":5}]})",
+        R"({"files":[{"path":"A.BIN","sector":4295017296,"size":5}]})",
+        R"({"files":[{"path":"A.BIN","sector":-1,"size":5}]})",
+        R"({"files":[{"path":"A.BIN","size":5},{"path":"SUB/B.TXT","sector":50010,"size":3000}]})",
+        R"({"files":[{"path":"A.BIN","sector":50000,"size":5},{"path":"A.BIN","sector":50001,"size":5}]})",
+        R"({"files":[{"path":"A.BIN","sector":50000,"size":5},{"path":"SUB/B.TXT","sector":50000,"size":3000}]})",
+        R"({"files":[{"path":"A.BIN","sector":50000,"size":5},{"path":"SUB/B.TXT","sector":4294967295,"size":3000}]})",
+        R"({"files":[{"path":"A.BIN","sector":50000xyz,"size":5}]})"
+    };
+    for (const auto& bad : bad_layouts) {
+        write(dir / "disc.json", bad);
+        CHECK(msr::Drive::of_folder(dir, why) == nullptr);
+        CHECK(!why.empty());
+    }
+    write(dir / "disc.json", good_layout);
     auto drive = msr::Drive::of_folder(dir, why);
     CHECK(drive != nullptr);
     if (!drive) return;
@@ -1663,6 +1681,13 @@ void test_folder_drive() {
         }
     }
     drive.reset();
+#if !defined(_WIN32)
+    // Windows' legacy host path limit may reject this fixture first.
+    const auto long_name = dir / std::string(222, 'N');
+    write(long_name, "x");
+    CHECK(msr::Drive::of_folder(dir, why) == nullptr && why.find("too long") != std::string::npos);
+    fs::remove(long_name);
+#endif
     fs::remove_all(dir);
 }
 
