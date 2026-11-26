@@ -497,9 +497,16 @@ void raindrops(Fields& out, uint64_t) {
 // sets the gulls up; they're drawn from the seconds: seagulls), FOGSETUP (the time of day, by
 // whole seconds), STOPZONES (no picture), ANIM_TEXT (whole frames of animated textures) and
 // PARTICLE (nothing in it ever runs).
-struct Scenery {
+struct SceneryTask {
     uint32_t frame;
     void (*list)(Fields&, uint64_t step);
+};
+constexpr std::array<SceneryTask, 12> kScenery{{
+    {0x8C07660Cu, landscape}, {0x8C04334Au, flags},  {0x8C04B660u, plane},  {0x8C0516CCu, train},  {0x8C03FF9Cu, chopper},
+    {0x8C03F818u, boat},      {0x8C0511E6u, traffic}, {0x8C041A90u, cones}, {0x8C03ECDCu, birds}, {0x8C04E8F4u, sparks},
+    {0x8C04EBFEu, spray},     {0x8C04C7BCu, raindrops},
+}};
+struct Scenery {  // a task's state, kScenery's in order
     uint64_t steps = 0;
     Fields before, after;
     struct Pair {
@@ -508,27 +515,24 @@ struct Scenery {
     };
     std::vector<Pair> pairs;
 };
-std::array<Scenery, 13> g_scenery{{
-    {0x8C07660Cu, landscape}, {0x8C04334Au, flags},  {0x8C04B660u, plane},  {0x8C0516CCu, train},  {0x8C03FF9Cu, chopper},
-    {0x8C03F818u, boat},      {0x8C0511E6u, traffic}, {0x8C041A90u, cones}, {0x8C03ECDCu, birds}, {0x8C04E8F4u, sparks},
-    {0x8C04EBFEu, spray},     {0x8C04C7BCu, raindrops},
-}};
-Scenery* scenery_of(rt::Context& c) {
-    const uint32_t frame = rt::ld32(c.r[14] + 8);  // the task's entry (the runner's r14): its frame function
-    for (Scenery& t : g_scenery)
-        if (t.list && t.frame == frame) return &t;
+std::array<Scenery, kScenery.size()> g_scenery;
+// The task's entry (the runner's r14) names its frame function.
+const SceneryTask* scenery_of(rt::Context& c, Scenery*& state) {
+    const uint32_t frame = rt::ld32(c.r[14] + 8);
+    for (size_t i = 0; i < kScenery.size(); ++i)
+        if (kScenery[i].frame == frame) return state = &g_scenery[i], &kScenery[i];
     return nullptr;
 }
 
 // One of the task's steps, its fields' values before and after paired.
-void scenery_step(Scenery& t, rt::Context& c, rt::Body body) {
+void scenery_step(const SceneryTask& task, Scenery& t, rt::Context& c, rt::Body body) {
     t.before.clear(), t.after.clear(), t.pairs.clear();
-    t.list(t.before, t.steps);
+    task.list(t.before, t.steps);
     std::vector<uint32_t> was(t.before.size());
     for (size_t i = 0; i < t.before.size(); ++i) was[i] = rt::ld32(t.before[i].at);
     at_game_rate(c, body);
     ++t.steps;
-    t.list(t.after, t.steps);
+    task.list(t.after, t.steps);
     for (size_t i = 0, j = 0; i < t.after.size(); ++i) {
         const Field& f = t.after[i];
         // Both lists are in the same order: an object gone or new shifts them, so look ahead.
@@ -568,8 +572,9 @@ void show_scenery(double t) {
 // A task kept at the game's rate: run once for each of the game's pictures due, at its rate.
 void at_game_pace(rt::Context& c, rt::Body body) {
     if (rt::g_frame_share >= 1.0) return body(c);
-    Scenery* t = scenery_of(c);
-    for (unsigned i = 0; i < g_due; ++i) t ? scenery_step(*t, c, body) : at_game_rate(c, body);
+    Scenery* state = nullptr;
+    const SceneryTask* task = scenery_of(c, state);
+    for (unsigned i = 0; i < g_due; ++i) task ? scenery_step(*task, *state, c, body) : at_game_rate(c, body);
 }
 
 // SEAGULL's drawing (0x8C04D834, every picture): the gulls circle as a function of the seconds
