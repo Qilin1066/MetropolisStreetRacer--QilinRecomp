@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <thread>
 
 namespace dreamcast {
 
@@ -22,7 +23,12 @@ uint64_t guest_ns() {
     // sequence loads; readers retry rather than mixing two clock states.
     for (;;) {
         const uint64_t sequence = g_sequence.load();
-        if (sequence & 1u) continue;
+        if (sequence & 1u) {
+            // The audio reader can outrank the window thread. Park briefly
+            // rather than starving a pre-empted writer while its state is odd.
+            std::this_thread::sleep_for(std::chrono::microseconds(1));
+            continue;
+        }
         const int64_t at = g_paused_at.load();
         const int64_t total = g_paused_total.load();
         const int64_t now = at >= 0 ? at : since_start();
