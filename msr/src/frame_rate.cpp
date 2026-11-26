@@ -38,6 +38,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <iterator>
@@ -69,13 +70,6 @@ uint32_t g_asked = 0;  // the blanks a picture the game last asked for (0: it ha
 unsigned g_rate = dreamcast::kFrameRateOriginal;  // the player's choice (Settings::frame_rate)
 double g_display_hz = 0;                          // the display's refresh, for kFrameRateDisplay
 double g_unlimited_rate = 60;                     // unlimited: the rate the last picture went at
-// A race is drawn at the chosen rate only once the player's car is loaded: the drive's stream
-// server moves a piece on each picture, so drawn faster the load would end sooner in the game's
-// pictures than the original's, and its count of pictures (the seconds the physics reads) differ.
-// The car's model pointer (+4C0 of the player's car, 0x8C51F79C) is 0 until then.
-constexpr uint32_t kPlayerModel = 0x8C51F79Cu + 0x4C0u;  // +4C0 of the player's car
-enum class Load { gone, empty, loaded };  // the model as last seen since the game asked: not yet seen 0, 0, set
-Load g_load = Load::gone;
 
 float refresh() { return rt::f32(rt::ld32(kRefresh)); }
 float game_rate() { return refresh() / static_cast<float>(g_asked); }
@@ -97,7 +91,7 @@ void set_rate(float pictures_per_second) {
 
 void store() {
     if (!(refresh() > 0.0f)) rt::fatal("msr: the game's display refresh (0x%08X) is %g", kRefresh, double(refresh()));
-    const double rate = g_asked >= 2 && g_load == Load::loaded ? chosen_rate() : 0;
+    const double rate = g_asked >= 2 ? chosen_rate() : 0;
     if (rate > game_rate()) {  // a race drawn faster than the game's own rate: a picture every blank
         rt::st32(kBlanksPerPicture, 1);
         dreamcast::set_blank_rate(g_rate == dreamcast::kFrameRateUnlimited ? 0.0 : rate);
@@ -112,17 +106,9 @@ void store() {
 
 void ask(uint32_t blanks) {
     g_asked = blanks;
-    g_load = Load::gone;
     store();
 }
 
-// Once a picture: has the player's car loaded since the game asked for its rate?
-void watch_load() {
-    if (g_load == Load::loaded || g_asked < 2) return;
-    const bool set = rt::ld32(kPlayerModel) != 0;
-    if (g_load == Load::gone && !set) g_load = Load::empty;
-    else if (g_load == Load::empty && set) g_load = Load::loaded, store();
-}
 
 void every_blank(rt::Context&) { ask(1); }
 void every_second_blank(rt::Context&) { ask(2); }
@@ -151,10 +137,15 @@ void count_one(uint32_t rate) {
     rt::st32(kPictureCount, count);
     rt::st32(kSeconds, rt::fdiv(count, rate));
 }
+float g_count_before = 0, g_count_after = 0;  // the count before and after the last of the game's pictures counted
 void count_pictures(rt::Context& c) {
     if (rt::g_frame_share >= 1.0) count_one(rt::ld32(kPicturesPerSecond));
     else
-        for (unsigned i = 0; i < g_due; ++i) count_one(rt::b32(game_rate()));
+        for (unsigned i = 0; i < g_due; ++i) {
+            g_count_before = rt::f32(rt::ld32(kPictureCount));
+            count_one(rt::b32(game_rate()));
+            g_count_after = rt::f32(rt::ld32(kPictureCount));
+        }
     c.r[4] = 9;
     rt::call_guest(c, 0x8C02CF0Cu);
 }
@@ -326,31 +317,27 @@ void world_step(rt::Context& c, rt::Body body) {
     if (g_stepped) show(shown());
 }
 
-void tween_put_back();
-void tween_show(double t);
-void tween_forget();
-// A race to be drawn faster, held at the game's rate until the player's car is loaded: the tasks
-// kept at its rate learn their words meanwhile, so they're shown between their steps from the
-// first picture drawn faster.
-bool learning() { return g_asked >= 2 && g_load != Load::loaded && chosen_rate() > game_rate(); }
+void put_back_shown();
+void show_scenery(double t);
+uint64_t g_step = 0;  // the game's pictures stepped while drawing faster (a new one: the scenery's states moved on)
 
 // The task runner (0x8C02CBBC): the game's timeline moved on, then its tasks; then the scenery
 // shown between its steps.
 void task_runner(rt::Context& c, rt::Body body) {
-    watch_load();
     const uint64_t now = dreamcast::guest_ns();
     if (rt::g_frame_share >= 1.0) {
         g_time = 0;
         g_due = 1;
         g_frame_ns = 0;
-        if (!learning()) tween_forget();
+        put_back_shown();
         return body(c);
     }
-    tween_put_back();
+    put_back_shown();
     const double games = g_frame_ns && now > g_frame_ns ? static_cast<double>(now - g_frame_ns) * game_rate() / 1e9 : rt::g_frame_share;
     const double before = g_time;
     g_time += std::min(games, 1.0);
     g_due = static_cast<unsigned>(whole_ceil(g_time) - whole_ceil(before));
+    g_step += g_due;
     if (g_time > 1e6) g_time -= std::floor(g_time) - 1.0;  // keep the fraction (and one whole) only
     g_frame_ns = now;
     if (g_rate == dreamcast::kFrameRateUnlimited && games > 0) {  // the next picture's rate: this one's
@@ -358,170 +345,309 @@ void task_runner(rt::Context& c, rt::Body body) {
         set_rate(static_cast<float>(g_unlimited_rate));
     }
     body(c);
-    tween_show(shown());
+    show_scenery(shown());
 }
 
-// The scenery between its steps. The tasks kept at the game's rate (the scenery, the race's
-// presentation) change a few words of RAM a step: the flags' phases, the sky's turn, the plane's
-// position, the intro camera. Which words, the port learns, from the race's start (`learning`,
-// while it's held at the game's rate for the player's car to load): all of RAM is compared before
-// and after one of a task's steps, the tasks staggered (task n at its step n, then every kRelearn
-// of its steps), and on every other step the pages of RAM it's known to change (an object's new
-// neighbour in its pool is seen at once). The words it changed are watched from then on
-// (forgotten after kForget steps unchanged). For each, its values before and after the task's last step; each picture shows the
-// value between, as the cars' poses are shown, where both are floats and the step is in line with
-// the one before (a wrap, a jump or a new object is shown as it is: integers and pointers too).
-// The values the task left are put back before the game's tasks run, so nothing the game works
-// out reads a value between; one something else changed meanwhile is left as it is.
-constexpr uint32_t kRamBase = 0x8C000000u, kRamSize = 16u << 20;
-constexpr uint32_t kFirstWatched = 0x8C010000u;  // below: the system area and the stack
-constexpr uint64_t kRelearn = 68;
-constexpr uint16_t kForget = 900;
-constexpr size_t kMaxWords = 8192;  // a task's
+// Values shown for a picture: each written with the true one kept, and put back (latest first)
+// before the game's tasks run, where nothing else has changed it meanwhile. Nothing the game works
+// out (the physics, the shared random numbers' users) reads a value shown between steps.
+struct Shown {
+    uint32_t at, truth, written;
+};
+std::vector<Shown> g_shown;
+void show_word(uint32_t at, uint32_t value) {
+    g_shown.push_back({at, rt::ld32(at), value});
+    rt::st32(at, value);
+}
+void put_back_shown() {
+    for (auto it = g_shown.rbegin(); it != g_shown.rend(); ++it)
+        if (rt::ld32(it->at) == it->written) rt::st32(it->at, it->truth);
+    g_shown.clear();
+}
 
-struct Word {
+// The scenery between its steps. The tasks kept at the game's rate step their objects 30 times a
+// second; their drawing (each task's second entry, called for every picture) works the pose out
+// from a few fields. For each task, the fields of its live objects (read from the code: docs/
+// runtime.md, "The scenery between its steps"), each with how it moves: straight, or round a
+// loop (an angle, a closed path's length); and a key that stays the same while an object goes on
+// from one step to the next (a spawn, a respawn or a reset changes it, and the object is shown as
+// it is). Each picture shows each field the timeline's fraction of the way from its value before
+// the task's last step to its value after.
+struct Field {
     uint32_t at;
-    uint32_t before, after;  // before and after the task's last step (`after` the true value)
-    uint32_t written;        // what was shown there last, if `shown`
-    float last_step;         // the step before the last (after - before then)
-    uint16_t idle;           // the task's steps since it changed
-    bool shown;
+    float loop;     // 0: straight; else the value goes round at this (wrapped by subtraction)
+    bool forward;   // only forward: a step back is a reset, shown as it is
+    uint64_t key;   // the object's: the same before and after a step it goes on through
 };
-constexpr uint32_t kPage = 4096;
-struct Tween {
-    rt::Body body = nullptr;
-    uint64_t steps = 0, stagger = 0;
-    std::vector<Word> words;      // by address
-    std::vector<uint32_t> pages;  // the RAM pages (offsets from kRamBase) its words are in, in order
-    std::vector<uint8_t> before;  // those pages before a step
-};
-std::array<Tween, 32> g_tweens;
-size_t g_tween_count = 0;
-std::vector<uint64_t> g_snapshot;  // RAM before a step being learnt from
+using Fields = std::vector<Field>;
 
-Tween& tween_of(rt::Body body) {
-    for (size_t i = 0; i < g_tween_count; ++i)
-        if (g_tweens[i].body == body) return g_tweens[i];
-    if (g_tween_count == g_tweens.size()) rt::fatal("msr: more than %zu tasks kept at the game's rate", g_tweens.size());
-    Tween& t = g_tweens[g_tween_count];
-    t.body = body;
-    t.stagger = g_tween_count++;
-    return t;
+bool in_ram(uint32_t at, uint32_t bytes) { return at >= 0x8C000000u && bytes <= 0x01000000u && at - 0x8C000000u <= 0x01000000u - bytes; }
+float fl(uint32_t at) { return rt::f32(rt::ld32(at)); }
+uint64_t key_of(double v) { return std::bit_cast<uint64_t>(v); }
+void floats(Fields& out, uint32_t at, unsigned n, uint64_t key, float loop = 0, bool forward = false) {
+    for (unsigned i = 0; i < n; ++i) out.push_back({at + 4 * i, loop, forward, key});
 }
-
-bool in_a_car(uint32_t at) {
-    for (size_t i = 0; i < g_car_count; ++i)
-        if (at >= g_cars[i].at && at < g_cars[i].at + 0x800u) return true;
-    return false;
+// A pool: a count at `count_at`, its objects from the pointer at `array_at`, `stride` apart.
+template <typename Each> void pool(uint32_t count_at, uint32_t array_at, uint32_t stride, unsigned most, Each each) {
+    const uint32_t n = rt::ld32(count_at), array = rt::ld32(array_at);
+    if (n == 0 || n > most || !in_ram(array, n * stride)) return;
+    for (uint32_t i = 0; i < n; ++i) each(array + i * stride);
 }
+// A path's length (+60 of a path object), the loop of a distance along it.
+float path_length(uint32_t path) { return in_ram(path, 64) ? fl(path + 60) : 0.0f; }
 
-// A float worth blending: zero, or finite and neither tiny (an integer's bits) nor huge.
-bool blendable(uint32_t bits) {
-    if ((bits & 0x7FFFFFFFu) == 0) return true;
-    const float v = std::fabs(rt::f32(bits));
-    return std::isfinite(v) && v > 1e-6f && v < 1e7f;
-}
-
-// The words a step changed in RAM from `from` to `to` (offsets from kRamBase), against `was` (the
-// same range before), that the task doesn't watch yet.
-void learn(Tween& t, const uint8_t* ram, const uint8_t* was, uint32_t from, uint32_t to, std::vector<Word>& added) {
-    for (uint32_t o = from; o < to; o += 8) {
-        uint64_t a, b;
-        std::memcpy(&a, was + (o - from), 8);
-        std::memcpy(&b, ram + o, 8);
-        if (a == b) continue;
-        for (uint32_t half = 0; half < 2; ++half) {
-            const uint32_t at = kRamBase + o + half * 4;
-            const uint32_t w0 = static_cast<uint32_t>(a >> (32 * half)), w1 = static_cast<uint32_t>(b >> (32 * half));
-            if (w0 == w1 || in_a_car(at)) continue;
-            const auto it = std::lower_bound(t.words.begin(), t.words.end(), at, [](const Word& w, uint32_t x) { return w.at < x; });
-            if (it != t.words.end() && it->at == at) continue;
-            added.push_back({at, w0, w1, w1, 0.0f, 0, false});
+// LANDSCAPE (0x8C07660C): the sky's turn, degrees, +0x8C53B510 a step, from 360 back by 360.
+void landscape(Fields& out, uint64_t) { out.push_back({0x8C53B50Cu, 360.0f, false, 0}); }
+// FLAGS (0x8C04334A): header 0x8C528864 (+0 count, +4 the flags, 48 bytes each). A cloth flag
+// (+0 type 0) moves its model's vertices: +16 nodes, +20 the nodes (20 bytes: +0 pinned, +4 a
+// vertex's x, y, z). The header's gust angles only feed the cloth.
+void flags(Fields& out, uint64_t) {
+    pool(0x8C528864u, 0x8C528868u, 48, 64, [&](uint32_t flag) {
+        if (rt::ld32(flag) != 0) return;
+        const uint32_t n = rt::ld32(flag + 16), nodes = rt::ld32(flag + 20);
+        if (n > 4096 || !in_ram(nodes, n * 20)) return;
+        for (uint32_t i = 0; i < n; ++i) {
+            const uint32_t node = nodes + i * 20, vertex = rt::ld32(node + 4);
+            if (rt::ld32(node) == 0 && in_ram(vertex, 12)) floats(out, vertex, 3, flag);
         }
+    });
+}
+// PLANE (0x8C04B660): count 0x8C52ACD4, planes at *0x8C52ACD8 (12 bytes: +0 the distance along its
+// path, +8 the path, a loop). The trail and the model come from the distance.
+void plane(Fields& out, uint64_t) {
+    pool(0x8C52ACD4u, 0x8C52ACD8u, 12, 64, [&](uint32_t e) { out.push_back({e, path_length(rt::ld32(e + 8)), false, rt::ld32(e + 8)}); });
+}
+// TRAIN (0x8C0516CC): count 0x8C536854, trains at *0x8C536858 (36 bytes: +0 the distance along its
+// path, +32 the path: a loop if its +56 has bit 2, else it shuttles between ends, which is smooth).
+void train(Fields& out, uint64_t) {
+    pool(0x8C536854u, 0x8C536858u, 36, 64, [&](uint32_t e) {
+        const uint32_t path = rt::ld32(e + 32);
+        const bool loops = in_ram(path, 64) && (rt::ld32(path + 56) & 4u);
+        out.push_back({e, loops ? path_length(path) : 0.0f, false, path});
+    });
+}
+// CHOPPER (0x8C03FF9C) and BOAT (0x8C03F818): count, objects 24 bytes (+0 the distance along the
+// path at +20, a loop; +4 the speed and +8 its change, which tilt the model).
+void on_paths(Fields& out, uint32_t count_at, uint32_t array_at) {
+    pool(count_at, array_at, 24, 64, [&](uint32_t e) {
+        const uint32_t path = rt::ld32(e + 20);
+        out.push_back({e, path_length(path), false, path});
+        floats(out, e + 4, 2, path);
+    });
+}
+void chopper(Fields& out, uint64_t) { on_paths(out, 0x8C5286CCu, 0x8C5286D0u); }
+void boat(Fields& out, uint64_t) { on_paths(out, 0x8C5286A8u, 0x8C5286ACu); }
+// TRAFFIC (0x8C0511E6): count 0x8C536830, vehicles at *0x8C536834 (16 bytes: +0 the distance along
+// the path; near the path's end the vehicle starts again as another (+12, its kind): a reset).
+void traffic(Fields& out, uint64_t) {
+    pool(0x8C536830u, 0x8C536834u, 16, 256, [&](uint32_t e) { out.push_back({e, 0.0f, true, rt::ld32(e + 12)}); });
+}
+// CONES (0x8C041A90): header 0x8C5287F8 (+4 count, +8 the cones, 232 bytes each): the matrix the
+// model is drawn with, rotation rows +0..+44 and position +48..+56. They slide and bounce
+// smoothly; nothing outside reads them back.
+void cones(Fields& out, uint64_t) { pool(0x8C5287FCu, 0x8C528800u, 232, 1024, [&](uint32_t e) { floats(out, e, 15, 0); }); }
+// BIRDS (0x8C03ECDC): count 0x8C528670, flocks at *0x8C528674 (36 bytes: +28 birds, +32 the birds,
+// 64 bytes each: +0 position, +12 the forward direction the model is turned to). The wing's
+// frame (+60, 0-9) picks a table entry: it stays a step's.
+void birds(Fields& out, uint64_t) {
+    const uint32_t flocks = rt::ld32(0x8C528674u);
+    pool(0x8C528670u, 0x8C528674u, 36, 64, [&](uint32_t flock) {
+        const uint32_t n = rt::ld32(flock + 28), list = rt::ld32(flock + 32);
+        if (n > 256 || !in_ram(list, n * 64)) return;
+        for (uint32_t i = 0; i < n; ++i) floats(out, list + i * 64, 6, flocks);
+    });
+}
+// SPARKS (0x8C04E8F4): 20 at 0x8C530DD4, 240 bytes each, live while +24 (frames left) is above 0;
+// +28 points (at most 8) from +48, 24 bytes each: a position and the one before. Frames left plus
+// age (+32) stays the same through a step; a new spark's differs.
+void sparks(Fields& out, uint64_t) {
+    for (uint32_t i = 0; i < 20; ++i) {
+        const uint32_t e = 0x8C530DD4u + i * 240;
+        const int32_t life = static_cast<int32_t>(rt::ld32(e + 24)), points = static_cast<int32_t>(rt::ld32(e + 28));
+        if (life <= 0 || points < 1 || points > 8) continue;
+        const uint64_t key = static_cast<uint64_t>(e) << 32 | static_cast<uint32_t>(life + static_cast<int32_t>(rt::ld32(e + 32)));
+        for (int32_t k = 0; k < points; ++k) floats(out, e + 48 + 24 * k, 6, key);
     }
 }
-void take(Tween& t, std::vector<Word>& added) {
-    if (added.empty()) return;
-    if (t.words.size() + added.size() > kMaxWords) added.resize(kMaxWords - std::min(kMaxWords, t.words.size()));
-    t.words.insert(t.words.end(), added.begin(), added.end());
-    std::sort(t.words.begin(), t.words.end(), [](const Word& a, const Word& b) { return a.at < b.at; });
+// SPRAY (0x8C04EBFE): the live nodes, a list from 0x8C5367D8 (+4 the next) in the 240 at
+// 0x8C532094 (76 bytes each): +8 position, +48 size. Life (+60) goes down by one a step: life plus
+// the step stays the same for a node that goes on; a node freed and taken again differs.
+void spray(Fields& out, uint64_t step) {
+    uint32_t node = rt::ld32(0x8C5367D8u);
+    for (unsigned n = 0; node != 0 && n < 240; ++n, node = rt::ld32(node + 4)) {
+        if (node < 0x8C532094u || node >= 0x8C532094u + 240 * 76 || (node - 0x8C532094u) % 76) return;
+        const uint64_t key = key_of(double(fl(node + 60)) + double(step)) ^ node;
+        floats(out, node + 8, 3, key);
+        floats(out, node + 48, 1, key);
+    }
 }
-void count_pages(Tween& t) {
-    t.pages.clear();
-    for (const Word& w : t.words) {
-        const uint32_t page = (w.at - kRamBase) / kPage * kPage;
-        if (t.pages.empty() || t.pages.back() != page) t.pages.push_back(page);
+// RAINDROPS (0x8C04C7BC), when it rains (0x8C1A3F34 at least 2): 300 drops at 0x8C52AFAC, 40 bytes
+// each: +0 position, +12 the streak's tail, +36 state (0 falling; a drop that lands or starts
+// again changes it).
+void raindrops(Fields& out, uint64_t) {
+    if (static_cast<int32_t>(rt::ld32(0x8C1A3F34u)) < 2) return;
+    for (uint32_t i = 0; i < 300; ++i) {
+        const uint32_t e = 0x8C52AFACu + i * 40;
+        if (rt::ld32(e + 36) == 0) floats(out, e, 6, 0);
     }
 }
 
-// One of the task's steps, at the game's rate, its words' values moved on and any new ones learnt.
-void tween_step(Tween& t, rt::Context& c, rt::Body body) {
-    uint8_t* ram = rt::ram_range(kRamBase, kRamSize);
-    const bool whole = ram && (t.steps == t.stagger || (t.steps > t.stagger && (t.steps - t.stagger) % kRelearn == 0));
-    if (whole) {
-        g_snapshot.resize(kRamSize / 8);
-        std::memcpy(g_snapshot.data(), ram, kRamSize);
-    } else if (ram) {
-        t.before.resize(t.pages.size() * kPage);
-        for (size_t i = 0; i < t.pages.size(); ++i) std::memcpy(&t.before[i * kPage], ram + t.pages[i], kPage);
-    }
+// The tasks with fields, by their frame function. The rest kept at the game's rate show nothing
+// between steps: PRESENTATION (its camera works from the seconds: intro_camera), SEAGULL (only
+// sets the gulls up; they're drawn from the seconds: seagulls), FOGSETUP (the time of day, by
+// whole seconds), STOPZONES (no picture), ANIM_TEXT (whole frames of animated textures) and
+// PARTICLE (nothing in it ever runs).
+struct Scenery {
+    uint32_t frame;
+    void (*list)(Fields&, uint64_t step);
+    uint64_t steps = 0;
+    Fields before, after;
+    struct Pair {
+        uint32_t at, from, to;  // `from`, `to` its value before and after the step (bits)
+        float loop;
+    };
+    std::vector<Pair> pairs;
+};
+std::array<Scenery, 13> g_scenery{{
+    {0x8C07660Cu, landscape}, {0x8C04334Au, flags},  {0x8C04B660u, plane},  {0x8C0516CCu, train},  {0x8C03FF9Cu, chopper},
+    {0x8C03F818u, boat},      {0x8C0511E6u, traffic}, {0x8C041A90u, cones}, {0x8C03ECDCu, birds}, {0x8C04E8F4u, sparks},
+    {0x8C04EBFEu, spray},     {0x8C04C7BCu, raindrops},
+}};
+Scenery* scenery_of(rt::Context& c) {
+    const uint32_t frame = rt::ld32(c.r[14] + 8);  // the task's entry (the runner's r14): its frame function
+    for (Scenery& t : g_scenery)
+        if (t.list && t.frame == frame) return &t;
+    return nullptr;
+}
+
+// One of the task's steps, its fields' values before and after paired.
+void scenery_step(Scenery& t, rt::Context& c, rt::Body body) {
+    t.before.clear(), t.after.clear(), t.pairs.clear();
+    t.list(t.before, t.steps);
+    std::vector<uint32_t> was(t.before.size());
+    for (size_t i = 0; i < t.before.size(); ++i) was[i] = rt::ld32(t.before[i].at);
     at_game_rate(c, body);
     ++t.steps;
-    for (Word& w : t.words) {
-        const uint32_t now = rt::ld32(w.at);
-        w.last_step = rt::f32(w.after) - rt::f32(w.before);
-        w.before = w.after, w.after = now;
-        w.idle = now == w.before ? static_cast<uint16_t>(std::min<unsigned>(w.idle + 1u, 0xFFFFu)) : uint16_t{0};
+    t.list(t.after, t.steps);
+    for (size_t i = 0, j = 0; i < t.after.size(); ++i) {
+        const Field& f = t.after[i];
+        // Both lists are in the same order: an object gone or new shifts them, so look ahead.
+        size_t k = j;
+        while (k < t.before.size() && t.before[k].at != f.at) ++k;
+        if (k == t.before.size()) continue;
+        j = k + 1;
+        const uint32_t from = was[k], to = rt::ld32(f.at);
+        if (from == to || t.before[k].key != f.key) continue;
+        if (f.forward && rt::f32(to) < rt::f32(from)) continue;
+        t.pairs.push_back({f.at, from, to, f.loop});
     }
-    std::erase_if(t.words, [](const Word& w) { return w.idle > kForget && !w.shown; });
-    if (!ram) return;
-    std::vector<Word> added;
-    if (whole) learn(t, ram, reinterpret_cast<const uint8_t*>(g_snapshot.data()) + (kFirstWatched - kRamBase), kFirstWatched - kRamBase, kRamSize, added);
-    else
-        for (size_t i = 0; i < t.pages.size(); ++i) learn(t, ram, &t.before[i * kPage], t.pages[i], t.pages[i] + kPage, added);
-    take(t, added);
-    count_pages(t);
 }
 
-// Before the game's tasks: the true values back.
-void tween_put_back() {
-    for (size_t i = 0; i < g_tween_count; ++i)
-        for (Word& w : g_tweens[i].words) {
-            if (!w.shown) continue;
-            w.shown = false;
-            const uint32_t now = rt::ld32(w.at);
-            if (now == w.written) rt::st32(w.at, w.after);
-            else w.before = w.after = now;  // changed by something else: that's its value
-        }
-}
-
-// After them: each word `t` of the way through its last step.
-void tween_show(double t) {
+// After the game's tasks: each field `t` of the way through its last step.
+void show_scenery(double t) {
     const float f = static_cast<float>(std::clamp(t, 0.0, 1.0));
-    for (size_t i = 0; i < g_tween_count; ++i)
-        for (Word& w : g_tweens[i].words) {
-            if (w.before == w.after || !blendable(w.before) || !blendable(w.after) || rt::ld32(w.at) != w.after || in_a_car(w.at)) continue;
-            const float a = rt::f32(w.before), b = rt::f32(w.after), step = b - a;
-            if (std::fabs(step) > 4.0f * std::fabs(w.last_step) + 1e-3f * std::max(1.0f, std::fabs(b))) continue;  // a jump
-            w.written = rt::b32(a + step * f);
-            w.shown = true;
-            rt::st32(w.at, w.written);
+    for (const Scenery& task : g_scenery)
+        for (const Scenery::Pair& p : task.pairs) {
+            if (rt::ld32(p.at) != p.to) continue;  // changed since: that's its value
+            const float a = rt::f32(p.from), b = rt::f32(p.to);
+            if (!std::isfinite(a) || !std::isfinite(b)) continue;
+            float step = b - a;
+            if (p.loop > 0.0f) {  // round the loop the short way, the result back inside it
+                if (step > 0.5f * p.loop) step -= p.loop;
+                if (step < -0.5f * p.loop) step += p.loop;
+            }
+            float v = a + step * f;
+            if (p.loop > 0.0f) {
+                if (v >= p.loop) v -= p.loop;
+                if (v < 0.0f) v += p.loop;
+            }
+            show_word(p.at, rt::b32(v));
         }
-}
-
-void tween_forget() {
-    tween_put_back();
-    for (size_t i = 0; i < g_tween_count; ++i) {
-        Tween& t = g_tweens[i];
-        t.words.clear(), t.pages.clear(), t.steps = 0;
-    }
 }
 
 // A task kept at the game's rate: run once for each of the game's pictures due, at its rate.
 void at_game_pace(rt::Context& c, rt::Body body) {
-    if (rt::g_frame_share >= 1.0 && !learning()) return body(c);
-    Tween& t = tween_of(body);
-    for (unsigned i = 0; i < g_due; ++i) tween_step(t, c, body);
+    if (rt::g_frame_share >= 1.0) return body(c);
+    Scenery* t = scenery_of(c);
+    for (unsigned i = 0; i < g_due; ++i) t ? scenery_step(*t, c, body) : at_game_rate(c, body);
+}
+
+// SEAGULL's drawing (0x8C04D834, every picture): the gulls circle as a function of the seconds
+// (0x8C545718), which move on a step at a time. Drawn faster, it reads the seconds the picture
+// shows: the count the timeline's fraction of the way through its last step.
+void seagulls(rt::Context& c, rt::Body body) {
+    if (rt::g_frame_share >= 1.0) return body(c);
+    const uint32_t seconds = rt::ld32(kSeconds);
+    const float count = g_count_before + (g_count_after - g_count_before) * static_cast<float>(std::clamp(shown(), 0.0, 1.0));
+    rt::st32(kSeconds, rt::b32(count / game_rate()));
+    body(c);
+    rt::st32(kSeconds, seconds);
+}
+
+// The intro's camera (0x8C074532, the intro camera's callback, every picture): its eye and target
+// (+64..+84 of the camera at 0x8C53B3A0) from a shot's paths at the shot's fraction (0x8C114318),
+// which moves on a step at a time: set by the intro's drawing, after the camera's in the draw
+// order, so a new value comes a picture after the step. Shown from the last value to the new one
+// over one of the game's pictures from when the new one came; a new shot (its fraction starting
+// again) is a cut, shown as it is.
+constexpr uint32_t kIntroCamera = 0x8C53B3A0u + 64, kShotFraction = 0x8C114318u;
+struct IntroCamera {
+    bool have = false, have_before = false;
+    float shot = 0, shot_before = 0;
+    double came = 0;  // the timeline (g_time) when the newest value came
+    uint32_t now[6] = {}, before[6] = {};
+} g_intro;
+void intro_camera(rt::Context& c, rt::Body body) {
+    body(c);
+    if (rt::g_frame_share >= 1.0) return void(g_intro.have = false);
+    const float shot = fl(kShotFraction);
+    uint32_t now[6];
+    for (unsigned i = 0; i < 6; ++i) now[i] = rt::ld32(kIntroCamera + 4 * i);
+    if (!g_intro.have || shot != g_intro.shot) {
+        g_intro.have_before = g_intro.have && shot > g_intro.shot;
+        std::copy(std::begin(g_intro.now), std::end(g_intro.now), g_intro.before);
+        g_intro.shot_before = g_intro.shot;
+        std::copy(std::begin(now), std::end(now), g_intro.now);
+        g_intro.shot = shot, g_intro.have = true;
+        g_intro.came = g_time;
+    }
+    if (!g_intro.have_before) return;
+    const float f = static_cast<float>(std::clamp(g_time - g_intro.came, 0.0, 1.0));
+    for (unsigned i = 0; i < 6; ++i) {
+        const float a = rt::f32(g_intro.before[i]), b = rt::f32(now[i]);
+        show_word(kIntroCamera + 4 * i, rt::b32(a + (b - a) * f));
+    }
+}
+
+// RAINDROPS' drawing (0x8C04C5A8, every picture, when it rains): it copies its camera matrix (one
+// a viewport, at 0x8C52AE80) to the previous one (0x8C52AD80) and the live camera's (64 bytes at
+// *0x8C1AC3E8) to it; the streaks stretch by the difference and the next step's drops start
+// ahead by it: the camera's move in one of the game's pictures. Drawn faster, the previous one is
+// set so the difference is still the last step's move, and the step sees both as the step's.
+struct RainCamera {
+    uint64_t step = UINT64_MAX;
+    float last[16] = {}, now[16] = {};
+};
+std::array<RainCamera, 4> g_rain;
+void rain_draw(rt::Context& c, rt::Body body) {
+    const uint32_t view = rt::ld8(0x8C10AD99u), live_at = rt::ld32(0x8C1AC3E8u);
+    if (rt::g_frame_share >= 1.0 || view >= g_rain.size() || !in_ram(live_at, 64) || static_cast<int32_t>(rt::ld32(0x8C1A3F34u)) < 2) return body(c);
+    const uint32_t current = 0x8C52AE80u + view * 64, previous = 0x8C52AD80u + view * 64;
+    RainCamera& r = g_rain[view];
+    float live[16];
+    for (unsigned i = 0; i < 16; ++i) live[i] = fl(live_at + 4 * i);
+    if (r.step != g_step) {
+        if (r.step == UINT64_MAX) std::copy(std::begin(live), std::end(live), r.now);
+        std::copy(std::begin(r.now), std::end(r.now), r.last);
+        std::copy(std::begin(live), std::end(live), r.now);
+        r.step = g_step;
+    }
+    for (unsigned i = 0; i < 16; ++i) rt::st32(current + 4 * i, rt::b32(live[i] - (r.now[i] - r.last[i])));
+    body(c);
+    for (unsigned i = 0; i < 16; ++i) {  // the step's, for the game's tasks
+        g_shown.push_back({previous + 4 * i, rt::b32(r.last[i]), rt::ld32(previous + 4 * i)});
+        g_shown.push_back({current + 4 * i, rt::b32(r.now[i]), rt::ld32(current + 4 * i)});
+    }
 }
 
 // The task after the world step (0x8C03DCBC): every car's wheel and corner positions from its pose,
@@ -568,7 +694,7 @@ void race_setup(rt::Context& c, rt::Body body) {
     at_game_rate(c, body);
 }
 
-constexpr std::array<rt::Wrapper, 24> kWrappers{{
+constexpr std::array<rt::Wrapper, 27> kWrappers{{
     {0x8C02CBBCu, "MSR: the task runner, the game's timeline", task_runner},
     {0x8C074204u, "MSR: the race's presentation (PRESENTATION), at the game's rate", at_game_pace},
     {0x8C03E6F8u, "MSR: the race's animated text (ANIM_TEXT), at the game's rate", at_game_pace},
@@ -588,6 +714,9 @@ constexpr std::array<rt::Wrapper, 24> kWrappers{{
     {0x8C0511E6u, "MSR: traffic (TRAFFIC), at the game's rate", at_game_pace},
     {0x8C0516CCu, "MSR: the train (TRAIN), at the game's rate", at_game_pace},
     {0x8C07660Cu, "MSR: the landscape (its sky's turn) (LANDSCAPE), at the game's rate", at_game_pace},
+    {0x8C04D834u, "MSR: the seagulls' drawing, at the seconds shown", seagulls},
+    {0x8C074532u, "MSR: the intro camera, between its steps", intro_camera},
+    {0x8C04C5A8u, "MSR: the raindrops' drawing, the camera's move a step", rain_draw},
     {0x8C03B3E2u, "MSR: the race's setup, at the game's own frame rate", race_setup},
     {0x8C03BAD4u, "MSR: the race's world step, at the game's own frame rate", world_step},
     {0x8C03C14Eu, "MSR: a car's step in the race", car_step},
