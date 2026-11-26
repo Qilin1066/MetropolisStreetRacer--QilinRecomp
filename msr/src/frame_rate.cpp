@@ -329,6 +329,10 @@ void world_step(rt::Context& c, rt::Body body) {
 void tween_put_back();
 void tween_show(double t);
 void tween_forget();
+// A race to be drawn faster, held at the game's rate until the player's car is loaded: the tasks
+// kept at its rate learn their words meanwhile, so they're shown between their steps from the
+// first picture drawn faster.
+bool learning() { return g_asked >= 2 && g_load != Load::loaded && chosen_rate() > game_rate(); }
 
 // The task runner (0x8C02CBBC): the game's timeline moved on, then its tasks; then the scenery
 // shown between its steps.
@@ -339,7 +343,7 @@ void task_runner(rt::Context& c, rt::Body body) {
         g_time = 0;
         g_due = 1;
         g_frame_ns = 0;
-        tween_forget();
+        if (!learning()) tween_forget();
         return body(c);
     }
     tween_put_back();
@@ -359,10 +363,12 @@ void task_runner(rt::Context& c, rt::Body body) {
 
 // The scenery between its steps. The tasks kept at the game's rate (the scenery, the race's
 // presentation) change a few words of RAM a step: the flags' phases, the sky's turn, the plane's
-// position, the intro camera. Which words, the port learns: now and then (a task's RAM every
-// kRelearn of its steps, the tasks staggered) all of RAM is compared before and after one of its
-// steps, and the words it changed are watched from then on (forgotten after kForget steps
-// unchanged). For each, its values before and after the task's last step; each picture shows the
+// position, the intro camera. Which words, the port learns, from the race's start (`learning`,
+// while it's held at the game's rate for the player's car to load): all of RAM is compared before
+// and after one of a task's steps, the tasks staggered (task n at its step n, then every kRelearn
+// of its steps), and on every other step the pages of RAM it's known to change (an object's new
+// neighbour in its pool is seen at once). The words it changed are watched from then on
+// (forgotten after kForget steps unchanged). For each, its values before and after the task's last step; each picture shows the
 // value between, as the cars' poses are shown, where both are floats and the step is in line with
 // the one before (a wrap, a jump or a new object is shown as it is: integers and pointers too).
 // The values the task left are put back before the game's tasks run, so nothing the game works
@@ -381,10 +387,13 @@ struct Word {
     uint16_t idle;           // the task's steps since it changed
     bool shown;
 };
+constexpr uint32_t kPage = 4096;
 struct Tween {
     rt::Body body = nullptr;
     uint64_t steps = 0, stagger = 0;
-    std::vector<Word> words;  // by address
+    std::vector<Word> words;      // by address
+    std::vector<uint32_t> pages;  // the RAM pages (offsets from kRamBase) its words are in, in order
+    std::vector<uint8_t> before;  // those pages before a step
 };
 std::array<Tween, 32> g_tweens;
 size_t g_tween_count = 0;
@@ -396,7 +405,7 @@ Tween& tween_of(rt::Body body) {
     if (g_tween_count == g_tweens.size()) rt::fatal("msr: more than %zu tasks kept at the game's rate", g_tweens.size());
     Tween& t = g_tweens[g_tween_count];
     t.body = body;
-    t.stagger = g_tween_count++ * 4;
+    t.stagger = g_tween_count++;
     return t;
 }
 
@@ -413,35 +422,48 @@ bool blendable(uint32_t bits) {
     return std::isfinite(v) && v > 1e-6f && v < 1e7f;
 }
 
-// The words a step changed (RAM now against g_snapshot) that the task doesn't watch yet.
-void learn(Tween& t, const uint8_t* ram) {
-    const auto* now = reinterpret_cast<const uint64_t*>(ram);
-    const size_t first = (kFirstWatched - kRamBase) / 8, count = kRamSize / 8;
-    std::vector<Word> added;
-    for (size_t i = first; i < count; ++i) {
-        if (now[i] == g_snapshot[i]) continue;
+// The words a step changed in RAM from `from` to `to` (offsets from kRamBase), against `was` (the
+// same range before), that the task doesn't watch yet.
+void learn(Tween& t, const uint8_t* ram, const uint8_t* was, uint32_t from, uint32_t to, std::vector<Word>& added) {
+    for (uint32_t o = from; o < to; o += 8) {
+        uint64_t a, b;
+        std::memcpy(&a, was + (o - from), 8);
+        std::memcpy(&b, ram + o, 8);
+        if (a == b) continue;
         for (uint32_t half = 0; half < 2; ++half) {
-            const uint32_t at = kRamBase + static_cast<uint32_t>(i * 8) + half * 4;
-            const uint32_t was = static_cast<uint32_t>(g_snapshot[i] >> (32 * half)), is = static_cast<uint32_t>(now[i] >> (32 * half));
-            if (was == is || in_a_car(at)) continue;
-            const auto it = std::lower_bound(t.words.begin(), t.words.end(), at, [](const Word& w, uint32_t a) { return w.at < a; });
+            const uint32_t at = kRamBase + o + half * 4;
+            const uint32_t w0 = static_cast<uint32_t>(a >> (32 * half)), w1 = static_cast<uint32_t>(b >> (32 * half));
+            if (w0 == w1 || in_a_car(at)) continue;
+            const auto it = std::lower_bound(t.words.begin(), t.words.end(), at, [](const Word& w, uint32_t x) { return w.at < x; });
             if (it != t.words.end() && it->at == at) continue;
-            added.push_back({at, was, is, is, 0.0f, 0, false});
+            added.push_back({at, w0, w1, w1, 0.0f, 0, false});
         }
     }
+}
+void take(Tween& t, std::vector<Word>& added) {
     if (added.empty()) return;
     if (t.words.size() + added.size() > kMaxWords) added.resize(kMaxWords - std::min(kMaxWords, t.words.size()));
     t.words.insert(t.words.end(), added.begin(), added.end());
     std::sort(t.words.begin(), t.words.end(), [](const Word& a, const Word& b) { return a.at < b.at; });
 }
+void count_pages(Tween& t) {
+    t.pages.clear();
+    for (const Word& w : t.words) {
+        const uint32_t page = (w.at - kRamBase) / kPage * kPage;
+        if (t.pages.empty() || t.pages.back() != page) t.pages.push_back(page);
+    }
+}
 
-// One of the task's steps, at the game's rate, its words' values moved on.
+// One of the task's steps, at the game's rate, its words' values moved on and any new ones learnt.
 void tween_step(Tween& t, rt::Context& c, rt::Body body) {
     uint8_t* ram = rt::ram_range(kRamBase, kRamSize);
-    const bool relearn = ram && (t.steps + t.stagger) % kRelearn == 0;
-    if (relearn) {
+    const bool whole = ram && (t.steps == t.stagger || (t.steps > t.stagger && (t.steps - t.stagger) % kRelearn == 0));
+    if (whole) {
         g_snapshot.resize(kRamSize / 8);
         std::memcpy(g_snapshot.data(), ram, kRamSize);
+    } else if (ram) {
+        t.before.resize(t.pages.size() * kPage);
+        for (size_t i = 0; i < t.pages.size(); ++i) std::memcpy(&t.before[i * kPage], ram + t.pages[i], kPage);
     }
     at_game_rate(c, body);
     ++t.steps;
@@ -452,7 +474,13 @@ void tween_step(Tween& t, rt::Context& c, rt::Body body) {
         w.idle = now == w.before ? static_cast<uint16_t>(std::min<unsigned>(w.idle + 1u, 0xFFFFu)) : uint16_t{0};
     }
     std::erase_if(t.words, [](const Word& w) { return w.idle > kForget && !w.shown; });
-    if (relearn) learn(t, ram);
+    if (!ram) return;
+    std::vector<Word> added;
+    if (whole) learn(t, ram, reinterpret_cast<const uint8_t*>(g_snapshot.data()) + (kFirstWatched - kRamBase), kFirstWatched - kRamBase, kRamSize, added);
+    else
+        for (size_t i = 0; i < t.pages.size(); ++i) learn(t, ram, &t.before[i * kPage], t.pages[i], t.pages[i] + kPage, added);
+    take(t, added);
+    count_pages(t);
 }
 
 // Before the game's tasks: the true values back.
@@ -472,7 +500,7 @@ void tween_show(double t) {
     const float f = static_cast<float>(std::clamp(t, 0.0, 1.0));
     for (size_t i = 0; i < g_tween_count; ++i)
         for (Word& w : g_tweens[i].words) {
-            if (w.before == w.after || !blendable(w.before) || !blendable(w.after) || rt::ld32(w.at) != w.after) continue;
+            if (w.before == w.after || !blendable(w.before) || !blendable(w.after) || rt::ld32(w.at) != w.after || in_a_car(w.at)) continue;
             const float a = rt::f32(w.before), b = rt::f32(w.after), step = b - a;
             if (std::fabs(step) > 4.0f * std::fabs(w.last_step) + 1e-3f * std::max(1.0f, std::fabs(b))) continue;  // a jump
             w.written = rt::b32(a + step * f);
@@ -483,12 +511,15 @@ void tween_show(double t) {
 
 void tween_forget() {
     tween_put_back();
-    for (size_t i = 0; i < g_tween_count; ++i) g_tweens[i].words.clear(), g_tweens[i].steps = 0;
+    for (size_t i = 0; i < g_tween_count; ++i) {
+        Tween& t = g_tweens[i];
+        t.words.clear(), t.pages.clear(), t.steps = 0;
+    }
 }
 
 // A task kept at the game's rate: run once for each of the game's pictures due, at its rate.
 void at_game_pace(rt::Context& c, rt::Body body) {
-    if (rt::g_frame_share >= 1.0) return body(c);
+    if (rt::g_frame_share >= 1.0 && !learning()) return body(c);
     Tween& t = tween_of(body);
     for (unsigned i = 0; i < g_due; ++i) tween_step(t, c, body);
 }
