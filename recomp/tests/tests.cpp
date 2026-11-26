@@ -26,6 +26,13 @@
 #include "romfont.hpp"
 #include "adx.hpp"
 #include "launcher.hpp"
+#include "frame_rate.hpp"
+#ifdef QILIN_TEST_FRAME_RATE
+#include "game.hpp"
+#include "clock.hpp"
+#endif
+#include "transfer.hpp"
+#include "system.hpp"
 #include "gdrom.hpp"
 #include "guest.hpp"
 #include "fiber.hpp"
@@ -35,6 +42,10 @@
 #include "sha256.hpp"
 
 using namespace qilin;
+
+#ifdef QILIN_TEST_FRAME_RATE
+namespace dreamcast { void set_blank_rate(double) {} }  // no interrupt hardware in the restart fixture
+#endif
 
 namespace {
 
@@ -1444,6 +1455,62 @@ void scheduler(rt::Context& c, int rounds) {
 }  // namespace threads
 
 // The launcher's replacement: what the game is restarted with, and its argument block.
+
+void test_transfer_ranges() {
+    using namespace msr::transfer;
+    CHECK(read_bytes(150, 1) == 2048u);
+    CHECK(!read_bytes(149, 1) && !read_bytes(150, 0));
+    CHECK(read_bytes(150, 0x1FFFFF) == 0xFFFFF800u);
+    CHECK(!read_bytes(150, 0x200000));  // byte count used to wrap to zero
+    CHECK(read_bytes(UINT32_MAX, 151) == 151u * 2048u);
+    CHECK(!read_bytes(UINT32_MAX, 152));  // sector address wrap
+    CHECK(address_range(0xFFFFF800u, 2048));
+    CHECK(!address_range(0xFFFFF800u, 2049));
+    CHECK(!address_range(0x8C000000u, UINT32_MAX));
+}
+
+#ifdef QILIN_TEST_FRAME_RATE
+void restart_car_body(rt::Context& c) { rt::st32(c.r[4], rt::b32(100.0f)); }
+void restart_world_body(rt::Context& c) {
+    c.r[4] = 0x8C200000u;
+    rt::wrapped(c, 0x8C03C14Eu, restart_car_body);
+}
+void restart_tasks_body(rt::Context& c) { rt::wrapped(c, 0x8C03BAD4u, restart_world_body); }
+void restart_empty_body(rt::Context&) {}
+void test_frame_rate_restart() {
+    rt::GuestMemory memory;
+    CHECK(memory.ok());
+    if (!memory.ok()) return;
+    uint8_t* const saved = rt::g_mem;
+    rt::g_mem = memory.base();
+    msr::install_frame_rate();
+    msr::restart_frame_rate();
+    dreamcast::game::set_frame_rate(144, 0);
+    rt::st32(0x8C1BB960u, rt::b32(60.0f));
+    rt::Context c;
+    rt::native_at(0x8C02D0E6u)->fn(c);
+    rt::st32(0x8C114888u, 123);
+    dreamcast::pause_guest_time(true);
+    rt::wrapped(c, 0x8C02CBBCu, restart_tasks_body);
+    rt::wrapped(c, 0x8C02CBBCu, restart_empty_body);
+    // Simulate a newly loaded image with distinct values in the old car's
+    // memory and in the random seed. No old cached write may reach it.
+    for (unsigned i = 0; i < 16; ++i) rt::st32(0x8C200000u + 4 * i, rt::b32(1.0f));
+    rt::st32(0x8C114888u, 999);
+    msr::restart_frame_rate();
+    CHECK(rt::g_frame_share == 1.0);
+    rt::wrapped(c, 0x8C02CBBCu, restart_empty_body);
+    rt::wrapped(c, 0x8C03BAD4u, restart_empty_body);
+    CHECK(rt::ld32(0x8C114888u) == 999);
+    for (unsigned i = 0; i < 16; ++i) CHECK(rt::ld32(0x8C200000u + 4 * i) == rt::b32(1.0f));
+    rt::native_at(0x8C02D0E6u)->fn(c);
+    CHECK(rt::ld32(0x8C1BB95Cu) == rt::b32(144.0f));  // player choice survives the restart
+    dreamcast::pause_guest_time(false);
+    msr::restart_frame_rate();
+    rt::g_mem = saved;
+}
+#endif
+
 void test_launcher() {
     std::string program;
     auto args = msr::launcher_arguments("1st_read.bin -DEMO=3 -ZONE=2 -SPEED=0", program);
@@ -1750,6 +1817,10 @@ int main() {
     test_nonlocal_return();
     test_guest_threads();
     test_folder_drive();
+    test_transfer_ranges();
+#ifdef QILIN_TEST_FRAME_RATE
+    test_frame_rate_restart();
+#endif
     test_launcher();
     test_adx();
     test_arm_decoder();

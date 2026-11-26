@@ -13,5 +13,7 @@ namespace msr {
 // the race's world step, a car's step and a car's update (0x8C03BAD4, 0x8C03C14E, 0x8C0AB7B8,
 // wrapped).
 void install_frame_rate();
+// Discard interpolation and timeline state before loading a fresh game image.
+void restart_frame_rate();
 
 }  // namespace msr

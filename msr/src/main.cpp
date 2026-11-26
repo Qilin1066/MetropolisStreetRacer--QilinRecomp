@@ -240,6 +240,7 @@ int main(int argc, char** argv) {
             // The game handed back to the launcher, which starts it again with these arguments.
             rt::end_guest_threads();
             msr::restart_bios();
+            msr::restart_frame_rate();
             load_program(disc.program, disc.ip_bin);
             if (!msr::write_argument_block({rt::g_mem + msr::kArgumentBlock, msr::kArgumentBlockSize}, start.args))
                 rt::fatal("msr: the arguments for the game's restart don't fit its argument block");

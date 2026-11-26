@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(MetropolisStreetRacerQilinRecomp VERSION 0.9.3 LANGUAGES C CXX)  # C: SDL3 and volk
+project(MetropolisStreetRacerQilinRecomp VERSION 0.9.4 LANGUAGES C CXX)  # C: SDL3 and volk
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -355,8 +355,10 @@ if(QILIN_GEN_DIR)
 endif()
 
 # ---- Tests (no game files needed) ----
-add_executable(qilin_tests recomp/tests/tests.cpp recomp/runtime/dispatch.cpp recomp/runtime/system.cpp
+add_executable(qilin_tests recomp/tests/tests.cpp dreamcast/src/clock.cpp recomp/runtime/dispatch.cpp recomp/runtime/system.cpp
     recomp/runtime/bus.cpp)
 target_link_libraries(qilin_tests PRIVATE qilin_core qilin_runtime qilin_platform msr_port qilin_warnings)
+target_include_directories(qilin_tests PRIVATE dreamcast/src)
+target_compile_definitions(qilin_tests PRIVATE QILIN_TEST_FRAME_RATE)
 qilin_tool(qilin_tests)
 add_test(NAME qilin_tests COMMAND qilin_tests)

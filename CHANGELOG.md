@@ -91,6 +91,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **Accesses through two views of the same RAM** at constant addresses could be reordered by the compiler; the access helpers now fold a constant address to its P1 view when compiled (GCC and Clang).
 - The memory test on arm64: the compiler reordered accesses at two views of the same byte (now fenced; the hazard is documented).
 
+## [0.9.4] - 2026-11-26
+
+### Fixed
+- A launcher restart clears the frame-rate timeline, cached car/scenery interpolation, pending visual writes and random-number bookkeeping before reloading the game. A previous race can no longer write stale poses or seeds into a fresh image. The player's frame-rate choice is retained.
+- GD-ROM reads and streams validate sector ranges, 32-bit byte counts and destination address ranges before transferring data or replacing stream state. Oversized requests no longer wrap their counters or guest addresses.
+
+### Tests
+- Added byte-count, sector and address boundary cases and a game-free restart fixture that primes real frame-rate wrappers, simulates a fresh image and checks that old car poses and random seeds are not written back.
+
 ## [0.9.3] - 2026-11-26
 
 ### Fixed

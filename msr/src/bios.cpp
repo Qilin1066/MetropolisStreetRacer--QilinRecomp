@@ -7,6 +7,7 @@
 #include <cstring>
 
 #include "drive.hpp"
+#include "transfer.hpp"
 #include "romfont.hpp"
 #include "flash.hpp"
 #include "guest.hpp"
@@ -217,13 +218,15 @@ void to_guest(rt::Context& c, uint32_t to, const uint8_t* data, uint32_t n) {
 }
 
 uint32_t read_sectors(rt::Context& c, uint32_t frame, uint32_t count, uint32_t to) {
-    if (frame < kFrameOffset || count == 0) gd_stop(c, "a read from before the disc's start, or of nothing", frame);
+    const auto bytes = transfer::read_bytes(frame, count);
+    if (!bytes || !transfer::address_range(to, *bytes))
+        gd_stop(c, "a read with an invalid or overflowing range", frame);
     uint8_t data[2048];
     for (uint32_t k = 0; k < count; ++k) {
         if (!g_drive->read(frame - kFrameOffset + k, data)) rt::fatal("GD-ROM: %s", g_drive->error().c_str());
         to_guest(c, to + k * 2048, data, 2048);
     }
-    return count * 2048;
+    return *bytes;
 }
 
 // The table of contents of one area: 99 words for tracks 1-99 (control << 28 | 1 << 24 | the
@@ -265,12 +268,13 @@ void gd_send_command(rt::Context& c) {
         break;
     case kDmaStream: {
         const uint32_t frame = rt::ld32(c.r[5]), sectors = rt::ld32(c.r[5] + 4);
-        if (frame < kFrameOffset || sectors == 0) gd_stop(c, "a stream from before the disc's start, or of nothing", frame);
+        const auto bytes = transfer::read_bytes(frame, sectors);
+        if (!bytes) gd_stop(c, "a stream with an invalid or overflowing range", frame);
         // A stream the game leaves unfinished (the file system streams ahead, then seeks
         // elsewhere) ends when the next one starts: the drive takes one streaming read at a time,
         // and a new command ends the one in progress. A later call naming the old one stops.
         g_stream.id = r.id, g_stream.sector = frame - kFrameOffset, g_stream.in_buffer = 0, g_stream.sent = 0;
-        g_stream.left = uint64_t(sectors) * 2048;
+        g_stream.left = *bytes;
         g_stream.to_report = true;
         break;
     }
@@ -319,6 +323,8 @@ void gd_dma_transfer(rt::Context& c) {
     uint32_t to = (rt::ld32(c.r[5]) & 0x1FFFFFFFu) | 0x80000000u;  // DMA addresses are physical
     uint32_t bytes = rt::ld32(c.r[5] + 4);
     if ((bytes & 3u) || (to & 3u)) gd_stop(c, "a stream transfer of an odd size or to an odd address", bytes);
+    if (!transfer::address_range(to, bytes))
+        gd_stop(c, "a stream transfer that wraps the guest address space", to);
     if (bytes > g_stream.left) {
         // The game's loader asks for the next piece from its DMA-end callback without looking at
         // what is left (0x8C02E114 -> 0x8C120D50), so after the stream's last piece it asks once

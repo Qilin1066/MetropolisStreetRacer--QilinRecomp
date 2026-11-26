@@ -886,6 +886,34 @@ constexpr std::array<rt::Wrapper, 30> kWrappers{{
 
 }  // namespace
 
+void restart_frame_rate() {
+    // The guest image is about to be reloaded. Discard cached writes; putting
+    // them back here or in the next frame would corrupt the new image.
+    g_asked = 0;
+    g_choice_changed = false;
+    g_unlimited_rate = 60;
+    g_stores = 0;
+    g_time = 0;
+    g_due = 0;
+    g_frame_ns = 0;
+    g_count_before = g_count_after = 0;
+    g_car_count = 0;
+    g_in_world_step = g_stepped = g_corners_due = false;
+    g_units = 1;
+    g_seed = 0;
+    g_seed_drawn = false;
+    g_step = 0;
+    g_in_tasks = false;
+    g_shown.clear();
+    g_cars = {};
+    g_scenery = {};
+    g_intros = {};
+    g_rain = {};
+    g_fades.clear();
+    rt::g_frame_share = 1.0;
+    // Keep the player's chosen rate and display refresh across the restart.
+}
+
 void install_frame_rate() {
     rt::provide(kNatives);
     rt::provide_wrappers(kWrappers);
