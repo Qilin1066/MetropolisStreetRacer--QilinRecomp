@@ -1,3 +1,4 @@
+#include <array>
 // Self-contained tests: SHA-256, the SH-4 decoder, IP.BIN and boot-file
 // parsing, function discovery on synthetic programs, and the GD-ROM reader on a synthetic disc image written to a
 // temporary folder. No game files required (runs in CI).
@@ -1472,10 +1473,20 @@ void test_adx() {
     CHECK(pcm.rate == 44100 && pcm.left_right.size() == 64);
     CHECK(pcm.left_right[0] == 100 && pcm.left_right[1] == 100);  // mono, doubled
     CHECK(pcm.left_right[2] > 100);                               // the prediction adds to the next
+    const auto saved = pcm.left_right;
     adx[4] = 4;                                                    // the exponential-scale encoding
     CHECK(!msr::decode_adx(adx, pcm, why));
     adx[4] = 3, adx[15] = 64;                                      // more samples than the data holds
     CHECK(!msr::decode_adx(adx, pcm, why));
+    CHECK(pcm.rate == 44100 && pcm.left_right == saved);
+    adx[12] = adx[13] = adx[14] = adx[15] = 255;
+    CHECK(!msr::decode_adx(adx, pcm, why));
+    CHECK(pcm.left_right == saved);
+    adx[12] = adx[13] = adx[14] = 0; adx[15] = 32;
+    adx[2] = adx[3] = 0;
+    CHECK(!msr::decode_adx(adx, pcm, why));
+    adx[3] = 0x10;
+    CHECK(msr::decode_adx(adx, pcm, why) && why.empty());
 }
 
 // A folder served as a disc: the file system a GD-ROM driver reads.
@@ -1634,7 +1645,24 @@ void test_folder_drive() {
     CHECK(names.contains("B.TXT;1") && names["B.TXT;1"].second == 3000 && names["B.TXT;1"].first == 50010);
     CHECK(drive->read(names["B.TXT;1"].first + 1, s) && s[951] == 'b' && s[952] == 0);
     CHECK(!drive->read(44999, s));
-    drive.reset();  // it keeps the file it read last open (which Windows won't remove)
+    drive.reset();
+    for (unsigned i = 0; i < 200; ++i) fs::create_directories(dir / ("directory_" + std::to_string(i)));
+    drive = msr::Drive::of_folder(dir, why);
+    CHECK(drive != nullptr);
+    if (drive) {
+        CHECK(drive->read(45016, s));
+        const uint32_t bytes = le(s + 132), little = le(s + 140);
+        const uint32_t big = uint32_t(s[148]) << 24 | uint32_t(s[149]) << 16 | uint32_t(s[150]) << 8 | s[151];
+        const uint32_t sectors = (bytes + 2047) / 2048;
+        CHECK(sectors > 1 && big == little + sectors && le(s + 158) == big + sectors);
+        std::array<uint8_t, 2064> guarded;
+        for (uint32_t k = 0; k < sectors * 2; ++k) {
+            guarded.fill(0xA5);
+            CHECK(drive->read(little + k, guarded.data()));
+            CHECK(std::all_of(guarded.begin() + 2048, guarded.end(), [](uint8_t v) { return v == 0xA5; }));
+        }
+    }
+    drive.reset();
     fs::remove_all(dir);
 }
 

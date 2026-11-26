@@ -91,6 +91,15 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **Accesses through two views of the same RAM** at constant addresses could be reordered by the compiler; the access helpers now fold a constant address to its P1 view when compiled (GCC and Clang).
 - The memory test on arm64: the compiler reordered accesses at two views of the same byte (now fenced; the hazard is documented).
 
+## [0.9.1] - 2026-11-26
+
+### Fixed
+- ADX decoding checks the compressed payload before allocating PCM. Invalid streams preserve previous output; payloads overlapping the header are rejected and successful decoding clears stale errors.
+- Folder-backed discs support multi-sector ISO path tables, preventing large directory trees from overflowing a 2 KB sector buffer.
+
+### Tests
+- Added malformed ADX and recovery cases, and a 200-directory fixture with buffer guards around path-table reads.
+
 ## [0.9.0] - 2026-11-22
 Every function lifts (5,252 of 5,252), and every trial of the differential test ends in a comparison, at the end or where the lifted code stopped: 5,241 of 5,252 functions have a conclusive trial (4,431 to the end, 810 to a stop), with no failures. 11 remain: the SH-4 exception and interrupt machinery the runtime replaces, loops walking random data off the end of RAM, and start-up, which doesn't reach its stop in QEMU in time.
 

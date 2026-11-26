@@ -88,7 +88,8 @@ public:
         for (size_t k = 0; k < order.size(); ++k) entries_[order[k]].number = static_cast<unsigned>(k + 1);
         dirs_ = order;
         build_path_tables();
-        uint32_t next = kHighDensity + 16 + 2 + 2;
+        path_sectors_ = static_cast<uint32_t>((path_l_.size() + kSector - 1) / kSector);
+        uint32_t next = kHighDensity + 18 + 2 * path_sectors_;
         for (size_t d : dirs_) {
             Entry& e = entries_[d];
             size_t used = 0, sectors = 1;
@@ -132,8 +133,13 @@ public:
         if (k < 16) return std::memcpy(out, ip_.data() + size_t{k} * kSector, kSector), true;
         if (k == 16) return volume_descriptor(out), true;
         if (k == 17) return out[0] = 255, std::memcpy(out + 1, "CD001", 5), out[6] = 1, true;
-        if (k == 18) return std::memcpy(out, path_l_.data(), path_l_.size()), true;
-        if (k == 19) return std::memcpy(out, path_m_.data(), path_m_.size()), true;
+        if (k >= 18 && k < 18 + 2 * path_sectors_) {
+            const bool big = k >= 18 + path_sectors_;
+            const auto& table = big ? path_m_ : path_l_;
+            const size_t offset = size_t(k - 18 - (big ? path_sectors_ : 0)) * kSector;
+            std::memcpy(out, table.data() + offset, std::min<size_t>(kSector, table.size() - offset));
+            return true;
+        }
         for (size_t d : dirs_) {
             const Entry& e = entries_[d];
             if (sector >= e.sector && sector < e.sector + e.size / kSector) return directory(e, sector - e.sector, out), true;
@@ -296,7 +302,7 @@ private:
         both16(out + 128, kSector);
         both32(out + 132, static_cast<uint32_t>(path_l_.size()));
         le32(out + 140, kHighDensity + 18);
-        be32(out + 148, kHighDensity + 19);
+        be32(out + 148, kHighDensity + 18 + path_sectors_);
         record(out + 156, entries_[0], std::string(1, '\0'));
         std::memset(out + 190, ' ', 623);
         out[881] = 1;
@@ -307,7 +313,7 @@ private:
     std::vector<size_t> dirs_;
     std::vector<uint8_t> path_l_, path_m_;
     std::map<uint32_t, size_t> files_;  // first sector -> entry
-    uint32_t end_ = 0;
+    uint32_t end_ = 0, path_sectors_ = 1;
     std::ifstream open_;                  // the file read last (read)
     const Entry* open_entry_ = nullptr;   // its entry
     uint64_t open_at_ = 0;                // where it is positioned

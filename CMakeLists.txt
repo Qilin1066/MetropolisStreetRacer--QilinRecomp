@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(MetropolisStreetRacerQilinRecomp VERSION 0.9.0 LANGUAGES C CXX)  # C: SDL3 and volk
+project(MetropolisStreetRacerQilinRecomp VERSION 0.9.1 LANGUAGES C CXX)  # C: SDL3 and volk
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
