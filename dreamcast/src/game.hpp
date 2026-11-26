@@ -41,10 +41,11 @@ void widen_to(float target);
 // A movie is playing. The movies are 4:3 pictures in the game's 640x480
 // whatever its screen mode, so they're shown at 4:3, never stretched.
 bool movie_playing();
-// The game can be drawn at 60 pictures a second throughout where it draws fewer in places (the
-// settings menu then offers frame_rate). set_frame_rate: the player's choice, 0 (the game's own)
-// or 60; called at every vertical blank on the guest thread, so a change takes effect at once.
+// The game can be drawn at other frame rates (the settings menu then offers frame_rate).
+// set_frame_rate: the player's choice (Settings::frame_rate: kFrameRate* or pictures a second)
+// and the display's refresh (Hz, 0 unknown; only looked up for kFrameRateDisplay); called at every
+// vertical blank on the guest thread, so a change takes effect at once.
 bool frame_rate_choice();
-void set_frame_rate(unsigned rate);
+void set_frame_rate(unsigned rate, double display_hz);
 
 }  // namespace dreamcast::game

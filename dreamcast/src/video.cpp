@@ -366,7 +366,7 @@ void vblank() {
     set_texture_packs();
     if (g_menu && g_menu->take_reload_textures()) g_renderer->reload_texture_packs();
     sound::set_volume(g_settings.volume, g_settings.mute_unfocused && g_display->sdl_window() && !g_display->focused());
-    game::set_frame_rate(g_settings.frame_rate);
+    game::set_frame_rate(g_settings.frame_rate, g_settings.frame_rate == kFrameRateDisplay ? g_display->refresh_rate() : 0.0);
     const float strength = g_settings.rumble ? float(g_settings.rumble_strength) / 100.0f : 0.0f;
     for (unsigned port = 0; port < 4; ++port) g_display->rumble(port, strength * maple::vibration(port));
     if (!g_drawn) return;

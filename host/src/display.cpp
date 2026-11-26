@@ -1020,6 +1020,13 @@ float Display::screen_aspect() const {
     SDL_GetWindowSizeInPixels(impl_->window, &w, &h);
     return w > 0 && h > 0 ? float(w) / float(h) : 0.0f;
 }
+double Display::refresh_rate() const {
+    if (!impl_->window) return 0.0;
+    const SDL_DisplayMode* m = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(impl_->window));
+    if (!m) return 0.0;
+    return m->refresh_rate_numerator && m->refresh_rate_denominator
+               ? double(m->refresh_rate_numerator) / double(m->refresh_rate_denominator) : double(m->refresh_rate);
+}
 bool Display::focused() const { return impl_->window && (SDL_GetWindowFlags(impl_->window) & SDL_WINDOW_INPUT_FOCUS); }
 Display::PadState Display::pad_state() const { return pad_state(0); }
 Display::PadState Display::pad_state(unsigned player) const {

@@ -385,21 +385,25 @@ inline uint32_t fcnvds(uint64_t n) { return out(static_cast<float>(f64(in(n))));
 
 // A per-picture step (KnownBuild::frame_steps): a whole number the game works out from its frame
 // rate with ftrc and adds to a clock once a picture (the race clock's milliseconds, trunc(1000 /
-// pictures a second)). Where the port draws g_frame_split pictures for each one the game asked
-// for (60 a second for its 30), the step of one of the game's pictures, trunc(x * split), is
-// shared out over those pictures in whole numbers, so the clock keeps the game's own sums: 16 then
-// 17 for its 33, where trunc(1000 / 60) would give 16 and 16 and the clock would run 4% slow.
-// `site` is the step's index in the list (qilin lift numbers them); one guest thread runs at a time.
+// pictures a second)). Where each of the port's pictures is g_frame_share of one the game asked
+// for (0.5 at 60 a second for its 30; 30 / 144 at 144), the step of one of the game's pictures,
+// trunc(x / share), is shared out over the port's in whole numbers, so the clock keeps the game's
+// own sums: 16 then 17 for its 33 at 60, where trunc(1000 / 60) would give 16 and 16 and the clock
+// would run 4% slow. `site` is the step's index in the list (qilin lift numbers them); one guest
+// thread runs at a time.
 inline constexpr unsigned kFrameSteps = 16;
-inline uint32_t g_frame_split = 1;
+inline double g_frame_share = 1.0;
 inline uint32_t frame_step(unsigned site, uint32_t n) {
-    const uint32_t split = g_frame_split;
-    if (split <= 1) return ftrc_s(n);
-    static uint32_t phase[kFrameSteps] = {};
-    const int64_t whole = static_cast<int32_t>(ftrc(static_cast<double>(f32(in(n)) * static_cast<float>(split))));
-    const uint32_t p = phase[site] % split;
-    phase[site] = (p + 1) % split;
-    return static_cast<uint32_t>(whole * (p + 1) / split - whole * p / split);
+    const double share = g_frame_share;
+    if (share == 1.0) return ftrc_s(n);
+    static double total[kFrameSteps] = {};  // the game's steps shared out so far, the whole numbers given
+    const double whole = static_cast<int32_t>(ftrc(static_cast<double>(f32(in(n)) * static_cast<float>(1.0 / share))));
+    const auto toward_zero = [](double v) { return v >= 0 ? std::floor(v + 1e-6) : std::ceil(v - 1e-6); };
+    const double before = toward_zero(total[site]);
+    total[site] += whole * share;
+    const double after = toward_zero(total[site]);
+    if (std::fabs(total[site]) > 1e6) total[site] -= after;  // keep the fraction; the whole numbers are given
+    return static_cast<uint32_t>(static_cast<int64_t>(after - before));
 }
 
 // Double registers: DRn is FRn (the high half) and FRn+1.

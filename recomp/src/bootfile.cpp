@@ -14,8 +14,9 @@ namespace {
 // library that hands over to it (msr/src/launcher.cpp; docs/disc-and-boot-analysis.md). Shinobi's
 // settings queries, the language (0x8C1304BC) and the sound mode (0x8C13043E, set 0x8C130408):
 // answered from msr.ini (msr/src/console.cpp). The game's two frame-rate setters, a picture every
-// vertical blank (0x8C02D0D0) and every second one (0x8C02D0E6): msr/src/frame_rate.cpp.
-constexpr uint32_t kMsrReplaced[] = {0x8C02D0D0u, 0x8C02D0E6u, 0x8C02F68Au, 0x8C130408u, 0x8C13043Eu, 0x8C1304BCu};
+// vertical blank (0x8C02D0D0) and every second one (0x8C02D0E6), and the task that counts its
+// pictures and seconds (0x8C098278): msr/src/frame_rate.cpp.
+constexpr uint32_t kMsrReplaced[] = {0x8C02D0D0u, 0x8C02D0E6u, 0x8C02F68Au, 0x8C098278u, 0x8C130408u, 0x8C13043Eu, 0x8C1304BCu};
 // Wait loops: 0x8C12B980, in 0x8C12B8DE, waits for a bit of 0x8C5BE3FC to clear, calling entry 7 of
 // the libraries' table at 0x8C5C35D4 (an rts) each time round; only an interrupt's handler clears
 // it. The menus spend their time there (docs/runtime.md, "Waiting").
@@ -23,13 +24,17 @@ constexpr uint32_t kMsrIdle[] = {0x8C12B980u};
 // The race clock's step, in 0x8C07E0A8: its milliseconds a picture (up, 0x8C07E0D2) and a
 // countdown's (down, 0x8C07E108), each trunc(1000 / (pictures a second / 0x8C4B1DB2's halfword)).
 constexpr uint32_t kMsrFrameSteps[] = {0x8C07E0D2u, 0x8C07E108u};
-// The cars' physics, kept at the game's own frame rate when the port draws more pictures
-// (msr/src/frame_rate.cpp): the race's world step (0x8C03BAD4, a task: every car's step, their
-// collisions, velocities from how far they moved), every second picture with the pictures between
-// interpolated; a car's step in it (0x8C03C14E, r4 the car), whose cars are the ones interpolated;
-// a car's update (0x8C0AB7B8), which the race's setup also calls on its own; and that setup
-// (0x8C03B3E2, a task: the cars put on the grid and settled), at the game's rate throughout.
-constexpr uint32_t kMsrWrapped[] = {0x8C03B3E2u, 0x8C03BAD4u, 0x8C03C14Eu, 0x8C0AB7B8u};
+// Kept at the game's own frame rate when the port draws more pictures (msr/src/frame_rate.cpp;
+// docs/runtime.md, "Frame rate"): the game's task runner (0x8C02CBBC, once a picture), which moves
+// a timeline of the game's pictures on; the race's world step (0x8C03BAD4, a task: every car's
+// step, their collisions, velocities from how far they moved), once for each of the game's
+// pictures due, the pictures between interpolated; a car's step in it (0x8C03C14E, r4 the car),
+// whose cars are the ones interpolated; the task after it that works out the cars' wheel and
+// corner positions from their poses (0x8C03DCBC), once after each world step, on the poses it
+// left; the race's presentation (0x8C074204: its title, the camera's sweep, the countdown), which
+// counts pictures; the race's setup (0x8C03B3E2, a task: the cars put on the grid and settled) and
+// a car's update (0x8C0AB7B8), which that setup calls on its own, at the game's rate throughout.
+constexpr uint32_t kMsrWrapped[] = {0x8C02CBBCu, 0x8C03B3E2u, 0x8C03BAD4u, 0x8C03C14Eu, 0x8C03DCBCu, 0x8C074204u, 0x8C0AB7B8u};
 
 // The North American disc, MK-51012 V1.010, dated 2000-11-30. Hashes
 // recorded from the Redump image in v0.3.0; docs/disc-and-boot-analysis.md

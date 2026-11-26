@@ -496,9 +496,27 @@ void Menu::display_page() {
     ImGui::Checkbox("Low latency (with vsync: at most one frame waiting)", &s_.low_latency);
     ImGui::EndDisabled();
     if (frame_rates_) {
-        const char* const kRates[] = {"Original", "60"};
-        int rate = s_.frame_rate == 60 ? 1 : 0;
-        if (ImGui::Combo("Frame rate", &rate, kRates, 2)) s_.frame_rate = rate == 1 ? 60u : 0u;
+        // The usual rates, the display's and unlimited, and any other number the file has.
+        const double hz = display_.refresh_rate();
+        std::vector<unsigned> rates = {kFrameRateOriginal, 60, 120, 144, 165, 240, kFrameRateDisplay, kFrameRateUnlimited};
+        if (std::find(rates.begin(), rates.end(), s_.frame_rate) == rates.end()) rates.insert(rates.end() - 2, s_.frame_rate);
+        const auto label = [&](unsigned r) {
+            char text[48];
+            if (r == kFrameRateOriginal) return std::string("Original");
+            if (r == kFrameRateUnlimited) return std::string("Unlimited (with vsync: the display's)");
+            if (r == kFrameRateDisplay) {
+                if (hz > 0) std::snprintf(text, sizeof text, "The display's (%.0f)", hz);
+                else std::snprintf(text, sizeof text, "The display's");
+                return std::string(text);
+            }
+            std::snprintf(text, sizeof text, "%u", r);
+            return std::string(text);
+        };
+        if (ImGui::BeginCombo("Frame rate", label(s_.frame_rate).c_str())) {
+            for (const unsigned r : rates)
+                if (ImGui::Selectable(label(r).c_str(), s_.frame_rate == r)) s_.frame_rate = r;
+            ImGui::EndCombo();
+        }
     }
     ImGui::Checkbox("Frame times (F3)", &s_.performance_overlay);
     ImGui::SeparatorText("Refresh rate");

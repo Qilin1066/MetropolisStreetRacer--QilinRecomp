@@ -1,5 +1,6 @@
 #include "interrupts.hpp"
 
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <thread>
@@ -21,9 +22,12 @@ namespace {
 
 // VGA timing: 525 lines a frame, 60 frames a second; the vertical blank
 // begins after line 480 (normal event 3) and ends at the frame's start
-// (normal event 4).
-constexpr uint64_t kFrameNs = 1'000'000'000ull / 60;
-uint64_t g_frames = 0;  // frames whose blank has been raised
+// (normal event 4). A game's port may ask for another rate (set_blank_rate):
+// the blanks then come at whole multiples of its period, or at every service
+// (a millisecond) as the game takes them.
+std::atomic<double> g_blank_ns{1e9 / 60.0};  // 0: at every service
+uint64_t g_blanks = 0;                       // blanks raised at the current period
+double g_period = 1e9 / 60.0;                // the period g_blanks counts in
 
 // The level-6 interrupt: the graphics chip's and the system bus's events
 // enabled in IML6 (normal 0x005F6930, external 0x005F6934, errors
@@ -34,10 +38,16 @@ uint32_t level6_pending() {
 }
 
 void raise_blanks() {
-    const uint64_t due = guest_ns() / kFrameNs;
-    if (due > g_frames) {
+    const uint64_t now = guest_ns();
+    const double period = g_blank_ns.load(std::memory_order_relaxed);
+    if (period != g_period) {  // a new rate: counted from now
+        g_period = period;
+        g_blanks = period > 0 ? static_cast<uint64_t>(static_cast<double>(now) / period) : now / 1'000'000u;
+    }
+    const uint64_t due = period > 0 ? static_cast<uint64_t>(static_cast<double>(now) / period) : now / 1'000'000u;
+    if (due > g_blanks) {
         // Frames the guest didn't take are gone, as on the console: one blank.
-        g_frames = due;
+        g_blanks = due;
         raise_event(3);
         raise_event(4);
         maple::vblank();
@@ -92,6 +102,8 @@ void service(rt::Context& c) {
 }
 
 }  // namespace
+
+void set_blank_rate(double hz) { g_blank_ns.store(hz > 0 ? 1e9 / hz : 0.0, std::memory_order_relaxed); }
 
 void interrupt_pending() {
     rt::g_irq_pending.store(true, std::memory_order_seq_cst);

@@ -153,11 +153,20 @@ Settings default_settings() {
     return s;
 }
 
+std::string frame_rate_text(unsigned frame_rate) {
+    switch (frame_rate) {
+    case kFrameRateOriginal: return "original";
+    case kFrameRateDisplay: return "display";
+    case kFrameRateUnlimited: return "unlimited";
+    default: return std::to_string(frame_rate);
+    }
+}
+
 bool apply_preset(Settings& s, const std::string& name) {
     if (name == "original" || name == "low-end") {  // the console's picture: 1x, its filtering, its frame rate (a Pi 4 does exactly this)
-        s.scale = 1, s.anisotropy = 1, s.msaa = 1, s.vsync = true, s.frame_rate = 0;
-    } else if (name == "desktop") {  // a desktop GPU: the screen's height (auto), 16x anisotropic, 4x MSAA, 60 a second
-        s.scale = 0, s.anisotropy = 16, s.msaa = 4, s.vsync = true, s.frame_rate = 60;
+        s.scale = 1, s.anisotropy = 1, s.msaa = 1, s.vsync = true, s.frame_rate = kFrameRateOriginal;
+    } else if (name == "desktop") {  // a desktop GPU: the screen's height (auto), 16x anisotropic, 4x MSAA, the display's rate
+        s.scale = 0, s.anisotropy = 16, s.msaa = 4, s.vsync = true, s.frame_rate = kFrameRateDisplay;
     } else {
         return false;
     }
@@ -269,9 +278,14 @@ bool parse_settings(const std::string& text, Settings& out, std::string& error) 
             } else if (name == "low_latency") {
                 if (!boolean(s.low_latency)) return false;
             } else if (name == "frame_rate") {
-                if (v == "original" || v == "30") s.frame_rate = 0;
-                else if (v == "60") s.frame_rate = 60;
-                else return fail("frame_rate is original or 60");
+                unsigned hz = 0;
+                bool digits = !v.empty() && v.size() <= 4;
+                for (char ch : v) digits = digits && std::isdigit(static_cast<unsigned char>(ch)), hz = hz * 10 + unsigned(ch - '0');
+                if (v == "original" || (digits && hz == 30)) s.frame_rate = kFrameRateOriginal;
+                else if (v == "display") s.frame_rate = kFrameRateDisplay;
+                else if (v == "unlimited") s.frame_rate = kFrameRateUnlimited;
+                else if (digits && hz > 30 && hz <= kFrameRateMax) s.frame_rate = hz;
+                else return fail("frame_rate is original, display, unlimited or a number of pictures a second from 30 to 1000");
             } else if (name == "gpu") {
                 s.gpu = value;
             } else if (name == "performance_overlay") {
@@ -390,9 +404,10 @@ std::string settings_text(const Settings& s) {
         "# picture waits for the display (false: one more, smoother where the GPU's time varies).\n"
         "vsync = " + b(s.vsync) + "\n"
         "low_latency = " + b(s.low_latency) + "\n"
-        "# Pictures a second: original, the game's own (where it draws fewer in places, as a racing game's\n"
-        "# races at 30), or 60 throughout, at the same speed (games that offer it).\n"
-        "frame_rate = " + (s.frame_rate == 60 ? std::string("60") : std::string("original")) + "\n"
+        "# Pictures a second, where the game offers the choice: original, the game's own (a racing game's\n"
+        "# races at 30); a number (60, 120, 144 ... to 1000); display, the display's refresh; or unlimited, as\n"
+        "# fast as it can draw (with vsync, the display's refresh). The game plays the same at any of them.\n"
+        "frame_rate = " + frame_rate_text(s.frame_rate) + "\n"
         "# The graphics device, by name (empty: the best one).\n"
         "gpu = " + s.gpu + "\n"
         "# Frame rate, 1% and 0.1% lows and recent frame times in a corner (F3 switches it).\n"

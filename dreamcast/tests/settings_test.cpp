@@ -116,12 +116,17 @@ int main() {
         check(!tc::parse_settings("[display]\npreset = huge\n", s, e) && e.find("presets are") != std::string::npos, "an unknown preset");
         check(tc::parse_settings("[display]\nframe_rate = 60\n", s, e) && s.frame_rate == 60, "frame_rate 60");
         check(tc::parse_settings("[display]\nframe_rate = 30\n", s, e) && s.frame_rate == 0, "frame_rate 30 is the game's own");
-        check(tc::parse_settings("[display]\npreset = desktop\n", s, e) && s.frame_rate == 60, "desktop draws 60 a second");
+        check(tc::parse_settings("[display]\npreset = desktop\n", s, e) && s.frame_rate == tc::kFrameRateDisplay, "desktop draws at the display's rate");
+        check(tc::parse_settings("[display]\nframe_rate = 144\n", s, e) && s.frame_rate == 144, "frame_rate 144");
+        check(tc::parse_settings("[display]\nframe_rate = unlimited\n", s, e) && s.frame_rate == tc::kFrameRateUnlimited, "frame_rate unlimited");
+        check(tc::parse_settings("[display]\nframe_rate = display\n", s, e) && s.frame_rate == tc::kFrameRateDisplay, "frame_rate display");
         check(tc::parse_settings("[display]\npreset = desktop\nframe_rate = original\n", s, e) && s.frame_rate == 0,
               "frame_rate overrides the preset's");
         check(tc::parse_settings("[display]\npreset = low-end\n", s, e) && s.frame_rate == 0, "low-end keeps the game's rate");
-        check(!tc::parse_settings("[display]\nframe_rate = 144\n", s, e) && e.find("frame_rate is original or 60") != std::string::npos,
-              "an unknown frame rate");
+        check(!tc::parse_settings("[display]\nframe_rate = 2000\n", s, e) && e.find("frame_rate is original, display") != std::string::npos,
+              "a frame rate too high");
+        check(!tc::parse_settings("[display]\nframe_rate = 25\n", s, e), "a frame rate below the game's");
+        check(tc::frame_rate_text(tc::kFrameRateUnlimited) == "unlimited" && tc::frame_rate_text(165) == "165", "frame rates as written");
     }
     check(error_of("[controls]\nstart = key:F1\n").find("kept for the program") != std::string::npos, "F1 can't be bound");
     check(error_of("[controls]\nstart = key:escape\n").find("kept for the program") != std::string::npos, "nor Escape");

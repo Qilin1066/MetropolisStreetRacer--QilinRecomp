@@ -31,6 +31,7 @@
 #include "memory.hpp"
 #include "onchip.hpp"
 #include "interrupts.hpp"
+#include "clock.hpp"
 #include "console.hpp"
 #include "frame_rate.hpp"
 #include "launcher.hpp"
@@ -146,15 +147,18 @@ Disc read_disc(const std::filesystem::path& path) {
 // of its last access outside the CPU's registers) and how many pictures it has shown, so a
 // run that shows nothing still says whether the game is running and where.
 void progress() {
-    static uint64_t blanks = 0;
-    if (++blanks % 300 != 0) return;
+    // Every five seconds of guest time (the blanks' rate can change: frame_rate.cpp).
+    static uint64_t reported = 0;
+    const uint64_t seconds = dreamcast::guest_ns() / 1'000'000'000u;
+    if (seconds < reported + 5) return;
+    reported = seconds - seconds % 5;
 #ifdef QILIN_BRINGUP
     const uint32_t pc = rt::g_pc;
     std::fprintf(stderr, "msr: %llu s: at %08X (in fn_%08X), %llu pictures shown\n",
-                 static_cast<unsigned long long>(blanks / 60), pc, rt::function_containing(pc),
+                 static_cast<unsigned long long>(reported), pc, rt::function_containing(pc),
                  static_cast<unsigned long long>(dreamcast::video::pictures_shown()));
 #else
-    std::fprintf(stderr, "msr: %llu s: %llu pictures shown\n", static_cast<unsigned long long>(blanks / 60),
+    std::fprintf(stderr, "msr: %llu s: %llu pictures shown\n", static_cast<unsigned long long>(reported),
                  static_cast<unsigned long long>(dreamcast::video::pictures_shown()));
 #endif
     std::fflush(stderr);

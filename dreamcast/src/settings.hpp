@@ -46,6 +46,13 @@ const char* pad_button_name(uint32_t bit);  // null if it isn't one
 // Keys kept for the program: Escape and F1 (the menu), F3 (frame times), F11 (full screen).
 bool key_reserved(const std::string& name);
 
+// frame_rate's choices besides a number of pictures a second: the game's own rate, the display's
+// refresh, and as fast as it can draw (vsync, if on, then paces it to the display).
+inline constexpr unsigned kFrameRateOriginal = 0, kFrameRateDisplay = 1, kFrameRateUnlimited = 2;
+inline constexpr unsigned kFrameRateMax = 1000;
+// As the file writes it: "original", "display", "unlimited" or the number.
+std::string frame_rate_text(unsigned frame_rate);
+
 struct Settings {
     // [display]
     std::string preset = "original";  // original, low-end, desktop
@@ -66,7 +73,7 @@ struct Settings {
     unsigned sharpness = 80;          // FSR's sharpening, 0-100
     bool vsync = true;                // at the display's refresh (no tearing); off: the lowest latency
     bool low_latency = true;          // with vsync: at most one finished picture waiting for the display
-    unsigned frame_rate = 0;          // pictures a second: 0, the game's own; 60 (where the game offers it)
+    unsigned frame_rate = 0;          // where the game offers it: kFrameRate* below, or pictures a second (31-1000)
     std::string gpu;                  // the graphics device's name (empty: the best one)
     bool performance_overlay = false; // frame rate, 1% and 0.1% lows and frame times in a corner (F3 switches it)
     bool match_refresh = true;        // fullscreen: a refresh that's a multiple of 60 Hz when the desktop's isn't

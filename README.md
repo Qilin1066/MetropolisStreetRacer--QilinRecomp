@@ -6,7 +6,7 @@ A static recompilation of **Metropolis Street Racer** (Bizarre Creations / Sega,
 
 ## Status
 
-The game boots through its title cards to the title screen and the attract demo, and from there through a new game, player details and a memory-card save to the first race (San Francisco, Fisherman's Wharf), which runs at a steady 30 frames a second, as on the console, or at 60 (`frame_rate = 60` in the settings menu's Display page) with the cars' physics still the original's, and drives. No whole lap has been played yet.
+The game boots through its title cards to the title screen and the attract demo, and from there through a new game, player details and a memory-card save to the first race (San Francisco, Fisherman's Wharf), which runs at a steady 30 frames a second, as on the console, or at a higher rate (60, 144, the display's or unlimited: `frame_rate` in the settings menu's Display page) with the cars' physics still the original's, and drives. No whole lap has been played yet.
 
 | Part | State |
 |---|---|

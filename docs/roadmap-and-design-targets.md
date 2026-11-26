@@ -81,7 +81,7 @@ The same menu as the other recomps, found on 2026-11-22. Its model is Punch-Out'
   - refresh rate: full screen at a multiple of 60 Hz, or variable refresh;
   - "look at the picture": the menu hidden while held.
 - **Game:**
-  - the enhancements: internal resolution, AF, MSAA, SMAA, AMD FSR 1 with its sharpness, texture packs and texture dumps, the frame rate (60 throughout, the physics at the game's own rate: `runtime.md`, "Frame rate"); widescreen to 21:9 and higher frame rates as their roadmap steps arrive;
+  - the enhancements: internal resolution, AF, MSAA, SMAA, AMD FSR 1 with its sharpness, texture packs and texture dumps, the frame rate (any from 31 to 1000, the display's or unlimited, the physics at the game's own rate: `runtime.md`, "Frame rate"); widescreen to 21:9 as its roadmap step arrives;
   - the graphics device;
   - the console's own settings (language, sound mode), read the next time the game starts;
   - sound: volume, muting when another window has the keyboard, and the playback device;

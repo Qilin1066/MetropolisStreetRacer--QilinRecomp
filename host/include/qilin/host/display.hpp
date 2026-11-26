@@ -78,6 +78,9 @@ public:
     // The screen's shape, width over height: the window's drawing area (the
     // desktop's, fullscreen), or the headless target's. 0 while minimised.
     float screen_aspect() const;
+    // The refresh rate of the display the window is on, in Hz (its current
+    // mode, fullscreen or not); 0 headless or when the system doesn't say.
+    double refresh_rate() const;
     // If the mouse moved over the window since the last poll: where, over the
     // picture last presented, -1 to 1 each way (y up; beyond 1 off the picture).
     bool mouse_moved(float& x, float& y) const;
