@@ -69,6 +69,10 @@ constexpr double kMinRate = 30.0, kMaxRate = dreamcast::kFrameRateMax;
 uint32_t g_asked = 0;  // the blanks a picture the game last asked for (0: it hasn't yet)
 unsigned g_rate = dreamcast::kFrameRateOriginal;  // the player's choice (Settings::frame_rate)
 double g_display_hz = 0;                          // the display's refresh, for kFrameRateDisplay
+// The choice changed (set_frame_rate, from the vertical blank, which comes at any of the lifted
+// code's polls: inside a game step, at_game_rate's float and share in force): stored at the next
+// task runner, between the game's pictures.
+bool g_choice_changed = false;
 double g_unlimited_rate = 60;                     // unlimited: the rate the last picture went at
 
 float refresh() { return rt::f32(rt::ld32(kRefresh)); }
@@ -89,7 +93,9 @@ void set_rate(float pictures_per_second) {
     rt::g_frame_share = game_rate() / pictures_per_second;
 }
 
+uint64_t g_stores = 0;  // store()s so far: at_game_rate keeps one made inside its body
 void store() {
+    ++g_stores;
     if (!(refresh() > 0.0f)) rt::fatal("msr: the game's display refresh (0x%08X) is %g", kRefresh, double(refresh()));
     const double rate = g_asked >= 2 ? chosen_rate() : 0;
     if (rate > game_rate()) {  // a race drawn faster than the game's own rate: a picture every blank
@@ -118,7 +124,7 @@ void every_second_blank(rt::Context&) { ask(2); }
 // the guest time since the last, at most one of the game's pictures (a slower picture slows the
 // game, as the original's did, rather than catching up). The game's pictures that fall due in a
 // picture (whole ones passed) are how many times the tasks kept at the game's rate run in it.
-double g_time = 0;        // in the game's pictures
+double g_time = 0;        // in the game's pictures (exact enough as a double for far longer than any session)
 unsigned g_due = 0;       // the game's pictures due in this picture
 uint64_t g_frame_ns = 0;  // when the last picture began (guest time)
 
@@ -139,8 +145,10 @@ void count_one(uint32_t rate) {
 }
 float g_count_before = 0, g_count_after = 0;  // the count before and after the last of the game's pictures counted
 void count_pictures(rt::Context& c) {
-    if (rt::g_frame_share >= 1.0) count_one(rt::ld32(kPicturesPerSecond));
-    else
+    if (rt::g_frame_share >= 1.0) {
+        count_one(rt::ld32(kPicturesPerSecond));
+        g_count_before = g_count_after = rt::f32(rt::ld32(kPictureCount));
+    } else
         for (unsigned i = 0; i < g_due; ++i) {
             g_count_before = rt::f32(rt::ld32(kPictureCount));
             count_one(rt::b32(game_rate()));
@@ -161,9 +169,11 @@ constexpr std::array<rt::Provided, 3> kNatives{{
 void at_game_rate(rt::Context& c, rt::Body body) {
     const uint32_t fps = rt::ld32(kPicturesPerSecond);
     const double share = rt::g_frame_share;
+    const uint64_t stores = g_stores;
     rt::st32(kPicturesPerSecond, rt::b32(game_rate()));
     rt::g_frame_share = 1.0;
     body(c);
+    if (g_stores != stores) return;  // the game asked for a rate meanwhile: that's in force
     rt::st32(kPicturesPerSecond, fps);
     rt::g_frame_share = share;
 }
@@ -320,6 +330,7 @@ void world_step(rt::Context& c, rt::Body body) {
 
 void put_back_shown();
 void show_scenery(double t);
+void forget_between_steps();
 // The game's random numbers (0x8C02FC08: seed at 0x8C114888) are shared by the tasks that use them
 // (the boats', traffic's, birds', flags' and sparks' steps among them) and the drawing (the intro
 // picks its shots). The original drew once a step; a picture drawn between steps leaves the seed
@@ -338,12 +349,18 @@ bool g_in_tasks = false;  // the task runner's tasks are running (not the drawin
 // shown between its steps.
 void task_runner(rt::Context& c, rt::Body body) {
     keep_random_numbers();
+    if (g_choice_changed) {
+        g_choice_changed = false;
+        g_frame_ns = 0;
+        if (g_asked) store();
+    }
     const uint64_t now = dreamcast::guest_ns();
     if (rt::g_frame_share >= 1.0) {
         g_time = 0;
         g_due = 1;
         g_frame_ns = 0;
         put_back_shown();
+        forget_between_steps();
         g_seed_drawn = false;
         return body(c);
     }
@@ -353,10 +370,11 @@ void task_runner(rt::Context& c, rt::Body body) {
     g_time += std::min(games, 1.0);
     g_due = static_cast<unsigned>(whole_ceil(g_time) - whole_ceil(before));
     g_step += g_due;
-    if (g_time > 1e6) g_time -= std::floor(g_time) - 1.0;  // keep the fraction (and one whole) only
     g_frame_ns = now;
-    if (g_rate == dreamcast::kFrameRateUnlimited && games > 0) {  // the next picture's rate: this one's
-        g_unlimited_rate = std::clamp(game_rate() / games, game_rate() * 1.0, kMaxRate);
+    if (g_rate == dreamcast::kFrameRateUnlimited && games > 0) {
+        // The next picture's rate: this one's. Never down to the game's own, which would take its
+        // own rate's path (a share of 1) and measure no more.
+        g_unlimited_rate = std::clamp(game_rate() / games, game_rate() * 1.001, kMaxRate);
         set_rate(static_cast<float>(g_unlimited_rate));
     }
     g_in_tasks = true;
@@ -537,6 +555,7 @@ struct Scenery {  // a task's state, kScenery's in order
 std::array<Scenery, kScenery.size()> g_scenery;
 // The task's entry (the runner's r14) names its frame function.
 const SceneryTask* scenery_of(rt::Context& c, Scenery*& state) {
+    if (!in_ram(c.r[14] + 8, 4)) return nullptr;
     const uint32_t frame = rt::ld32(c.r[14] + 8);
     for (size_t i = 0; i < kScenery.size(); ++i)
         if (kScenery[i].frame == frame) return state = &g_scenery[i], &kScenery[i];
@@ -552,13 +571,14 @@ void scenery_step(const SceneryTask& task, Scenery& t, rt::Context& c, rt::Body 
     at_game_rate(c, body);
     ++t.steps;
     task.list(t.after, t.steps);
-    for (size_t i = 0, j = 0; i < t.after.size(); ++i) {
-        const Field& f = t.after[i];
-        // Both lists are in the same order: an object gone or new shifts them, so look ahead.
-        size_t k = j;
-        while (k < t.before.size() && t.before[k].at != f.at) ++k;
-        if (k == t.before.size()) continue;
-        j = k + 1;
+    // The fields before the step, by address (objects come and go between the two lists).
+    std::vector<uint32_t> order(t.before.size());
+    for (uint32_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return t.before[a].at < t.before[b].at; });
+    for (const Field& f : t.after) {
+        const auto it = std::lower_bound(order.begin(), order.end(), f.at, [&](uint32_t i, uint32_t at) { return t.before[i].at < at; });
+        if (it == order.end() || t.before[*it].at != f.at) continue;
+        const size_t k = *it;
         const uint32_t from = was[k], to = rt::ld32(f.at);
         if (from == to || t.before[k].key != f.key) continue;
         if (f.forward && rt::f32(to) < rt::f32(from)) continue;
@@ -624,30 +644,38 @@ void seagulls(rt::Context& c, rt::Body body) {
 // over one of the game's pictures from when the new one came; a new shot (its fraction starting
 // again) is a cut, shown as it is.
 constexpr uint32_t kIntroCamera = 0x8C53B3A0u + 64, kShotFraction = 0x8C114318u;
+constexpr uint32_t kViewport = 0x8C10AD99u;  // the byte: the viewport being drawn
 struct IntroCamera {
     bool have = false, have_before = false;
     float shot = 0, shot_before = 0;
-    double came = 0;  // the timeline (g_time) when the newest value came
+    double came = 0;     // the timeline (g_time) when the newest value came
+    uint64_t seen = 0;   // guest time of the last call
     uint32_t now[6] = {}, before[6] = {};
-} g_intro;
+};
+std::array<IntroCamera, 4> g_intros;  // a viewport each
 void intro_camera(rt::Context& c, rt::Body body) {
     body(c);
-    if (rt::g_frame_share >= 1.0) return void(g_intro.have = false);
+    const uint32_t view = rt::ld8(kViewport);
+    if (rt::g_frame_share >= 1.0 || view >= g_intros.size()) return;
+    IntroCamera& cam = g_intros[view];
+    const uint64_t now_ns = dreamcast::guest_ns();
+    if (now_ns - cam.seen > 250'000'000u) cam.have = false;  // not called for a while: a new intro
+    cam.seen = now_ns;
     const float shot = fl(kShotFraction);
     uint32_t now[6];
     for (unsigned i = 0; i < 6; ++i) now[i] = rt::ld32(kIntroCamera + 4 * i);
-    if (!g_intro.have || shot != g_intro.shot) {
-        g_intro.have_before = g_intro.have && shot > g_intro.shot;
-        std::copy(std::begin(g_intro.now), std::end(g_intro.now), g_intro.before);
-        g_intro.shot_before = g_intro.shot;
-        std::copy(std::begin(now), std::end(now), g_intro.now);
-        g_intro.shot = shot, g_intro.have = true;
-        g_intro.came = g_time;
+    if (!cam.have || shot != cam.shot) {
+        cam.have_before = cam.have && shot > cam.shot;
+        std::copy(std::begin(cam.now), std::end(cam.now), cam.before);
+        cam.shot_before = cam.shot;
+        std::copy(std::begin(now), std::end(now), cam.now);
+        cam.shot = shot, cam.have = true;
+        cam.came = g_time;
     }
-    if (!g_intro.have_before) return;
-    const float f = static_cast<float>(std::clamp(g_time - g_intro.came, 0.0, 1.0));
+    if (!cam.have_before) return;
+    const float f = static_cast<float>(std::clamp(g_time - cam.came, 0.0, 1.0));
     for (unsigned i = 0; i < 6; ++i) {
-        const float a = rt::f32(g_intro.before[i]), b = rt::f32(now[i]);
+        const float a = rt::f32(cam.before[i]), b = rt::f32(now[i]);
         show_word(kIntroCamera + 4 * i, rt::b32(a + (b - a) * f));
     }
 }
@@ -683,14 +711,17 @@ constexpr uint32_t kSwayOn = 0x8C1AC394u, kSwayAngle = 0x8C10A03Cu;
 void camera_draw(rt::Context& c, rt::Body body) {
     const double share = rt::g_frame_share;
     if (share >= 1.0) return body(c);
-    const float scale = fl(kCameraScale), sway = fl(kSwayAngle);
-    const bool swaying = rt::ld32(kSwayOn) != 0 && rt::ld32(0x8C53B380u) == 0;
-    body(c);
+    const float sway = fl(kSwayAngle);
+    const bool swaying = rt::ld32(kSwayOn) != 0 && rt::ld32(kPaused) == 0;
+    // The drawing sets the scale to 0.8 of it plus 0.2 of the target, and uses it: given x such
+    // that the result is the target plus 0.8^share of the way left.
     const uint32_t choice = rt::ld32(kScaleChoice);
     if (choice < 64) {
-        const float target = fl(kScaleTargets + 4 * choice);
-        rt::st32(kCameraScale, rt::b32(target + (scale - target) * static_cast<float>(std::pow(0.8, share))));
+        const float scale = fl(kCameraScale), target = fl(kScaleTargets + 4 * choice);
+        const float wanted = target + (scale - target) * static_cast<float>(std::pow(0.8, share));
+        rt::st32(kCameraScale, rt::b32((wanted - 0.2f * target) / 0.8f));
     }
+    body(c);
     if (swaying) {
         float turn = fl(kSwayAngle) - sway;
         if (turn < -180.0f) turn += 360.0f;
@@ -702,21 +733,21 @@ void camera_draw(rt::Context& c, rt::Body body) {
 
 // The cars' lights fade (0x8C036310, r4 a float, r5 up or down): by the step at 0x8C54C9C0 (0.2),
 // held between 0 and 1. The cars' drawing (0x8C036120, through 0x8C036350 and 0x8C0369E8) calls
-// it every picture, as the original did once a step. Drawn faster, it moves on once for each of
-// the game's pictures due, as the original's, and each picture shows the value the timeline's
-// fraction of the way from before that to after; the true one is put back for the game's tasks.
+// it every picture, for each viewport, as the original did once a step. Drawn faster, it moves on
+// once for each of the game's pictures due and each viewport, as the original's, and each picture
+// shows the value the timeline's fraction of the way from before that to after; the true one is
+// put back for the game's tasks.
 struct Fade {
-    uint32_t at, from, to;
+    uint32_t at, view, from, to;  // the light, and the viewport drawing it (each did its own fade)
     uint64_t step;
 };
 std::vector<Fade> g_fades;
 void light_fade(rt::Context& c, rt::Body body) {
-    if (rt::g_frame_share >= 1.0) g_fades.clear();
     if (rt::g_frame_share >= 1.0 || g_in_tasks) return body(c);
-    const uint32_t at = c.r[4];
-    auto it = std::find_if(g_fades.begin(), g_fades.end(), [&](const Fade& f) { return f.at == at; });
+    const uint32_t at = c.r[4], view = rt::ld8(kViewport);
+    auto it = std::find_if(g_fades.begin(), g_fades.end(), [&](const Fade& f) { return f.at == at && f.view == view; });
     if (it == g_fades.end()) {
-        g_fades.push_back({at, rt::ld32(at), rt::ld32(at), UINT64_MAX});
+        g_fades.push_back({at, view, rt::ld32(at), rt::ld32(at), UINT64_MAX});
         it = g_fades.end() - 1;
     }
     if (rt::ld32(at) != it->to) it->from = it->to = rt::ld32(at);  // set by something else meanwhile
@@ -747,7 +778,7 @@ struct RainCamera {
 };
 std::array<RainCamera, 4> g_rain;
 void rain_draw(rt::Context& c, rt::Body body) {
-    const uint32_t view = rt::ld8(0x8C10AD99u), live_at = rt::ld32(0x8C1AC3E8u);
+    const uint32_t view = rt::ld8(kViewport), live_at = rt::ld32(0x8C1AC3E8u);
     if (rt::g_frame_share >= 1.0 || view >= g_rain.size() || !in_ram(live_at, 64) || static_cast<int32_t>(rt::ld32(0x8C1A3F34u)) < 2) return body(c);
     const uint32_t current = 0x8C52AE80u + view * 64, previous = 0x8C52AD80u + view * 64;
     RainCamera& r = g_rain[view];
@@ -765,6 +796,15 @@ void rain_draw(rt::Context& c, rt::Body body) {
         g_shown.push_back({previous + 4 * i, rt::b32(r.last[i]), rt::ld32(previous + 4 * i)});
         g_shown.push_back({current + 4 * i, rt::b32(r.now[i]), rt::ld32(current + 4 * i)});
     }
+}
+
+// At the game's own rate (the menus, between races, the choice set back): nothing of the last
+// race's steps is shown again.
+void forget_between_steps() {
+    for (Scenery& t : g_scenery) t.pairs.clear(), t.steps = 0;
+    g_fades.clear();
+    for (RainCamera& r : g_rain) r.step = UINT64_MAX;
+    for (IntroCamera& i : g_intros) i.have = false;
 }
 
 // The task after the world step (0x8C03DCBC): every car's wheel and corner positions from its pose,
@@ -861,8 +901,7 @@ void set_frame_rate(unsigned rate, double display_hz) {
     if (rate == msr::g_rate && (rate != kFrameRateDisplay || display_hz == msr::g_display_hz)) return;
     msr::g_rate = rate;
     msr::g_display_hz = display_hz;
-    msr::g_frame_ns = 0;
-    if (msr::g_asked) msr::store();
+    msr::g_choice_changed = true;
 }
 
 }  // namespace dreamcast::game
