@@ -32,9 +32,17 @@ constexpr uint32_t kMsrFrameSteps[] = {0x8C07E0D2u, 0x8C07E108u};
 // whose cars are the ones interpolated; the task after it that works out the cars' wheel and
 // corner positions from their poses (0x8C03DCBC), once after each world step, on the poses it
 // left; the race's presentation (0x8C074204: its title, the camera's sweep, the countdown), which
-// counts pictures; the race's setup (0x8C03B3E2, a task: the cars put on the grid and settled) and
-// a car's update (0x8C0AB7B8), which that setup calls on its own, at the game's rate throughout.
-constexpr uint32_t kMsrWrapped[] = {0x8C02CBBCu, 0x8C03B3E2u, 0x8C03BAD4u, 0x8C03C14Eu, 0x8C03DCBCu, 0x8C074204u, 0x8C0AB7B8u};
+// counts pictures; the scenery's tasks, each stepped once a picture (below); the race's setup
+// (0x8C03B3E2, a task: the cars put on the grid and settled) and a car's update (0x8C0AB7B8),
+// which that setup calls on its own, at the game's rate throughout. The scenery: ANIM_TEXT,
+// BIRDS, BOAT, CHOPPER, CONES, FLAGS, FOGSETUP, PARTICLE, PLANE, RAINDROPS, SEAGULL, SPARKS,
+// SPRAY, STOPZONES, TRAFFIC, TRAIN and LANDSCAPE, the race's tasks (by the names in its task
+// table) that read none of the game's timing.
+constexpr uint32_t kMsrWrapped[] = {
+    0x8C02CBBCu, 0x8C03B3E2u, 0x8C03BAD4u, 0x8C03C14Eu, 0x8C03DCBCu, 0x8C03E6F8u, 0x8C03ECDCu,
+    0x8C03F818u, 0x8C03FF9Cu, 0x8C041A90u, 0x8C04334Au, 0x8C04597Eu, 0x8C04AAF2u, 0x8C04B660u,
+    0x8C04C7BCu, 0x8C04DA68u, 0x8C04E8F4u, 0x8C04EBFEu, 0x8C050D18u, 0x8C0511E6u, 0x8C0516CCu,
+    0x8C074204u, 0x8C07660Cu, 0x8C0AB7B8u};
 
 // The North American disc, MK-51012 V1.010, dated 2000-11-30. Hashes
 // recorded from the Redump image in v0.3.0; docs/disc-and-boot-analysis.md

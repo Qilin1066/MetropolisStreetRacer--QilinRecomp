@@ -396,9 +396,26 @@ void race_setup(rt::Context& c, rt::Body body) {
     at_game_rate(c, body);
 }
 
-constexpr std::array<rt::Wrapper, 7> kWrappers{{
+constexpr std::array<rt::Wrapper, 24> kWrappers{{
     {0x8C02CBBCu, "MSR: the task runner, the game's timeline", task_runner},
     {0x8C074204u, "MSR: the race's presentation (PRESENTATION), at the game's rate", at_game_pace},
+    {0x8C03E6F8u, "MSR: the race's animated text (ANIM_TEXT), at the game's rate", at_game_pace},
+    {0x8C03ECDCu, "MSR: birds (BIRDS), at the game's rate", at_game_pace},
+    {0x8C03F818u, "MSR: boats (BOAT), at the game's rate", at_game_pace},
+    {0x8C03FF9Cu, "MSR: the helicopter (CHOPPER), at the game's rate", at_game_pace},
+    {0x8C041A90u, "MSR: cones (CONES), at the game's rate", at_game_pace},
+    {0x8C04334Au, "MSR: flags (FLAGS), at the game's rate", at_game_pace},
+    {0x8C04597Eu, "MSR: fog (FOGSETUP), at the game's rate", at_game_pace},
+    {0x8C04AAF2u, "MSR: particles (PARTICLE), at the game's rate", at_game_pace},
+    {0x8C04B660u, "MSR: the plane (PLANE), at the game's rate", at_game_pace},
+    {0x8C04C7BCu, "MSR: raindrops (RAINDROPS), at the game's rate", at_game_pace},
+    {0x8C04DA68u, "MSR: seagulls (SEAGULL), at the game's rate", at_game_pace},
+    {0x8C04E8F4u, "MSR: sparks (SPARKS), at the game's rate", at_game_pace},
+    {0x8C04EBFEu, "MSR: spray (SPRAY), at the game's rate", at_game_pace},
+    {0x8C050D18u, "MSR: stop zones (STOPZONES), at the game's rate", at_game_pace},
+    {0x8C0511E6u, "MSR: traffic (TRAFFIC), at the game's rate", at_game_pace},
+    {0x8C0516CCu, "MSR: the train (TRAIN), at the game's rate", at_game_pace},
+    {0x8C07660Cu, "MSR: the landscape (its sky's turn) (LANDSCAPE), at the game's rate", at_game_pace},
     {0x8C03B3E2u, "MSR: the race's setup, at the game's own frame rate", race_setup},
     {0x8C03BAD4u, "MSR: the race's world step, at the game's own frame rate", world_step},
     {0x8C03C14Eu, "MSR: a car's step in the race", car_step},
