@@ -61,7 +61,7 @@ uint32_t g_level = 0;        // INTREQ: the level of the interrupt being taken
 bool g_in_service = false;   // between taking an interrupt and INTCLEAR
 std::atomic<bool> g_running{false};
 
-uint64_t samples_now() { return dreamcast::guest_ns() * kRate / 1'000'000'000u; }
+uint64_t samples_now() { return dreamcast::samples_at(dreamcast::guest_ns(), kRate); }
 
 // The timers brought up to `now`: each wrap sets its pending bit.
 void tick(uint64_t now) {

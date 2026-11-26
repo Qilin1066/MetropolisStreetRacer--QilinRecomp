@@ -277,7 +277,7 @@ void set_tick(void (*tick)()) { g_tick = tick; }
 
 void sync() {
     if (!g_regs) return;
-    const uint64_t target = guest_ns() * kRate / 1'000'000'000ull;
+    const uint64_t target = samples_at(guest_ns(), kRate);
     if (target > g_rendered) render(target - g_rendered), g_rendered = target;
 }
 

@@ -63,7 +63,8 @@ void play_intro(std::vector<uint8_t> sfd) {
     if (width == 0 || height == 0 || width > 1024 || height > 1024) rt::fatal("msr: the intro movie's picture is %ux%u", width, height);
     std::vector<uint8_t> rgba(size_t(width) * height * 4);
 
-    qilin::host::AudioOut out;
+    qilin::host::AudioOut out(dreamcast::video::audio_device());
+    dreamcast::video::apply_audio_settings(out);
     const size_t frames = sound.left_right.size() / 2;
     size_t pushed = 0;
     uint16_t held = 0;
@@ -72,8 +73,11 @@ void play_intro(std::vector<uint8_t> sfd) {
     const clock::time_point start = clock::now();
     while (plm_frame_t* frame = plm_decode_video(plm)) {
         const auto due = start + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(frame->time));
-        // The sound, up to a tenth of a second ahead of the picture.
-        const auto until = std::min(frames, static_cast<size_t>((frame->time + 0.1) * sound.rate));
+        // Keep the stream near its own target, not a fixed 100 ms batch
+        // (which exceeds the default 80 ms cap and discards the intro's start).
+        dreamcast::video::poll();
+        dreamcast::video::apply_audio_settings(out);
+        const auto until = std::min(frames, static_cast<size_t>((frame->time + out.target_ms() / 1000.0) * sound.rate));
         if (until > pushed) {
             out.push(sound.left_right.data() + pushed * 2, until - pushed, sound.rate);
             pushed = until;

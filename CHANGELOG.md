@@ -91,6 +91,17 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 - **Accesses through two views of the same RAM** at constant addresses could be reordered by the compiler; the access helpers now fold a constant address to its P1 view when compiled (GCC and Clang).
 - The memory test on arm64: the compiler reordered accesses at two views of the same byte (now fenced; the hazard is documented).
 
+## [0.9.3] - 2026-11-26
+
+### Fixed
+- Pause and resume publish a coherent guest-clock state. Concurrent audio/timer readers can no longer combine an old pause timestamp with a new pause total and jump backwards or underflow. Concurrent pause/resume writers are serialised, while clock reads remain lock-free.
+- Both audio clocks convert nanoseconds to samples without overflowing the intermediate product after roughly five days of uptime.
+- The intro movie honours the selected audio device, saved volume and mute-when-unfocused setting. Its first batch now matches the playback queue's target instead of overflowing the default cap and losing initial samples.
+
+### Tests
+- Added concurrent pause/resume readers and writers, idempotent pause/resume checks and long-uptime audio sample conversion cases. The previous clock fails the concurrent test; the corrected clock passes.
+- Movie and sound-CPU integration sources are now compiled in CI even without game-derived lifted code.
+
 ## [0.9.2] - 2026-11-26
 
 ### Fixed

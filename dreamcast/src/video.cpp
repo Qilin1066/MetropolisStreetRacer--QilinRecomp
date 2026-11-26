@@ -22,6 +22,7 @@
 #include "menu.hpp"
 #include "pvr.hpp"
 #include "qilin/host/display.hpp"
+#include "qilin/host/audio.hpp"
 #include "qilin/host/paths.hpp"
 #include "renderer.hpp"
 #include "save_history.hpp"
@@ -539,6 +540,13 @@ maple::Controls controls(unsigned port) {
             if (p2.rt) c.rt = 255;
         }
     return c;
+}
+
+std::string audio_device() { return g_settings.sound_device; }
+
+void apply_audio_settings(qilin::host::AudioOut& output) {
+    output.set_volume(g_settings.volume, g_settings.mute_unfocused && g_display &&
+                      g_display->sdl_window() && !g_display->focused());
 }
 
 void poll() {

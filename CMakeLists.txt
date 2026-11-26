@@ -7,7 +7,7 @@ if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
     set(CMAKE_OSX_DEPLOYMENT_TARGET 10.15 CACHE STRING "oldest macOS the runtime runs on")
 endif()
 # The single source of the version number (see CHANGELOG.md for the scheme).
-project(MetropolisStreetRacerQilinRecomp VERSION 0.9.2 LANGUAGES C CXX)  # C: SDL3 and volk
+project(MetropolisStreetRacerQilinRecomp VERSION 0.9.3 LANGUAGES C CXX)  # C: SDL3 and volk
 
 # ---- Language: C++23 everywhere (recompiler, runtime, generated code) ----
 set(CMAKE_CXX_STANDARD 23)
@@ -113,6 +113,12 @@ if(WIN32)
 endif()
 
 enable_testing()
+find_package(Threads REQUIRED)
+add_executable(dreamcast_clock_test dreamcast/tests/clock_test.cpp dreamcast/src/clock.cpp)
+target_include_directories(dreamcast_clock_test PRIVATE dreamcast/src)
+target_link_libraries(dreamcast_clock_test PRIVATE qilin_warnings Threads::Threads)
+add_test(NAME dreamcast_clock_test COMMAND dreamcast_clock_test)
+set_tests_properties(dreamcast_clock_test PROPERTIES TIMEOUT 20)
 
 # ---- The host platform: window, input and audio (SDL3), Vulkan ----
 # The sister projects' host layer (host/, from Toy Commander--QilinRecomp,
@@ -279,6 +285,13 @@ if(QILIN_HOST)
     target_link_libraries(msr_port PUBLIC dreamcast_hw)  # flash memory (the boot ROM's FLASHROM calls)
 else()
     target_include_directories(msr_port PRIVATE dreamcast/src)
+endif()
+
+# Compile the movie and sound-CPU integration in CI without requiring game-derived lifts.
+# These objects are not linked into the game; its executable compiles them normally.
+if(QILIN_HOST)
+    add_library(msr_media_compile OBJECT msr/src/movie.cpp msr/src/sound_cpu.cpp)
+    target_link_libraries(msr_media_compile PRIVATE msr_port qilin_pl_mpeg dreamcast_hw qilin_warnings)
 endif()
 
 # ---- Lifted code (optional): the output of `qilin lift`, which is derived
