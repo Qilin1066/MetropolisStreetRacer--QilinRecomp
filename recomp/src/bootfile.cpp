@@ -39,13 +39,15 @@ constexpr uint32_t kMsrFrameSteps[] = {0x8C07E0D2u, 0x8C07E108u};
 // SPRAY, STOPZONES, TRAFFIC, TRAIN and LANDSCAPE, the race's tasks (by the names in its task
 // table) that read none of the game's timing. Drawn between their steps: the seagulls' drawing
 // (0x8C04D834), from the seconds; the intro camera's callback (0x8C074532); the raindrops' drawing
-// (0x8C04C5A8), whose camera latch moves a step at a time.
+// (0x8C04C5A8), whose camera latch moves a step at a time; the birds' drawing (0x8C03EC14), their
+// wings between frames; the camera's drawing (0x8C01CC20), whose easing is a picture's; the cars'
+// lights' fade (0x8C036310), which the cars' drawing calls every picture.
 constexpr uint32_t kMsrWrapped[] = {
     0x8C02CBBCu, 0x8C03B3E2u, 0x8C03BAD4u, 0x8C03C14Eu, 0x8C03DCBCu, 0x8C03E6F8u, 0x8C03ECDCu,
     0x8C03F818u, 0x8C03FF9Cu, 0x8C041A90u, 0x8C04334Au, 0x8C04597Eu, 0x8C04AAF2u, 0x8C04B660u,
     0x8C04C7BCu, 0x8C04DA68u, 0x8C04E8F4u, 0x8C04EBFEu, 0x8C050D18u, 0x8C0511E6u, 0x8C0516CCu,
     0x8C074204u, 0x8C07660Cu, 0x8C0AB7B8u,
-    0x8C04D834u, 0x8C074532u, 0x8C04C5A8u};
+    0x8C04D834u, 0x8C074532u, 0x8C04C5A8u, 0x8C03EC14u, 0x8C01CC20u, 0x8C036310u};
 
 // The North American disc, MK-51012 V1.010, dated 2000-11-30. Hashes
 // recorded from the Redump image in v0.3.0; docs/disc-and-boot-analysis.md

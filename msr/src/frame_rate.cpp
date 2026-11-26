@@ -217,7 +217,7 @@ void log_step() {
     static uint64_t step = 0;
     uint64_t hash = 1469598103934665603ull;
     for (uint32_t off = 0; off < 0x800; off += 4)
-        if (off != 0x4FC && off != 0x504)  // a running total the renderer keeps there, not the physics
+        if (off != 0x4F0 && off != 0x4FC && off != 0x504)  // the drawing's: its lighting colour, running totals
             hash = (hash ^ rt::ld32(kPlayer + off)) * 1099511628211ull;
     std::fprintf(out, "%llu %g %016llx %.9g %.9g\n", static_cast<unsigned long long>(step++), double(rt::f32(rt::ld32(kPlayer + 0x324))),
                  static_cast<unsigned long long>(hash), double(rt::f32(rt::ld32(kPictureCount))), double(rt::f32(rt::ld32(kSeconds))));
@@ -317,19 +317,34 @@ void world_step(rt::Context& c, rt::Body body) {
     if (g_stepped) show(shown());
 }
 
+
 void put_back_shown();
 void show_scenery(double t);
+// The game's random numbers (0x8C02FC08: seed at 0x8C114888) are shared by the tasks that use them
+// (the boats', traffic's, birds', flags' and sparks' steps among them) and the drawing (the intro
+// picks its shots). The original drew once a step; a picture drawn between steps leaves the seed
+// as it found it, so the tasks draw the same numbers as at 30.
+constexpr uint32_t kRandomSeed = 0x8C114888u;
+uint32_t g_seed = 0;
+bool g_seed_drawn = false;  // the last picture was drawn between steps, from g_seed
+void keep_random_numbers() {
+    if (g_seed_drawn && rt::ld32(kRandomSeed) != g_seed) rt::st32(kRandomSeed, g_seed);
+    g_seed_drawn = false;
+}
 uint64_t g_step = 0;  // the game's pictures stepped while drawing faster (a new one: the scenery's states moved on)
+bool g_in_tasks = false;  // the task runner's tasks are running (not the drawing)
 
 // The task runner (0x8C02CBBC): the game's timeline moved on, then its tasks; then the scenery
 // shown between its steps.
 void task_runner(rt::Context& c, rt::Body body) {
+    keep_random_numbers();
     const uint64_t now = dreamcast::guest_ns();
     if (rt::g_frame_share >= 1.0) {
         g_time = 0;
         g_due = 1;
         g_frame_ns = 0;
         put_back_shown();
+        g_seed_drawn = false;
         return body(c);
     }
     put_back_shown();
@@ -344,8 +359,12 @@ void task_runner(rt::Context& c, rt::Body body) {
         g_unlimited_rate = std::clamp(game_rate() / games, game_rate() * 1.0, kMaxRate);
         set_rate(static_cast<float>(g_unlimited_rate));
     }
+    g_in_tasks = true;
     body(c);
+    g_in_tasks = false;
     show_scenery(shown());
+    g_seed_drawn = g_due == 0;  // drawn now: a picture the original didn't draw
+    g_seed = rt::ld32(kRandomSeed);
 }
 
 // Values shown for a picture: each written with the true one kept, and put back (latest first)
@@ -547,6 +566,15 @@ void scenery_step(const SceneryTask& task, Scenery& t, rt::Context& c, rt::Body 
     }
 }
 
+// A value that can be a field: zero, or a finite float neither tiny nor huge. A field listed wrong
+// (an integer or an address where a float was read from the code) is shown as it is: an address's
+// bits are a float of about 1e-31, an integer's below 1e-38.
+bool blendable(uint32_t bits) {
+    if ((bits & 0x7FFFFFFFu) == 0) return true;
+    const float v = std::fabs(rt::f32(bits));
+    return std::isfinite(v) && v > 1e-20f && v < 1e9f;
+}
+
 // After the game's tasks: each field `t` of the way through its last step.
 void show_scenery(double t) {
     const float f = static_cast<float>(std::clamp(t, 0.0, 1.0));
@@ -554,7 +582,7 @@ void show_scenery(double t) {
         for (const Scenery::Pair& p : task.pairs) {
             if (rt::ld32(p.at) != p.to) continue;  // changed since: that's its value
             const float a = rt::f32(p.from), b = rt::f32(p.to);
-            if (!std::isfinite(a) || !std::isfinite(b)) continue;
+            if (!blendable(p.from) || !blendable(p.to)) continue;
             float step = b - a;
             if (p.loop > 0.0f) {  // round the loop the short way, the result back inside it
                 if (step > 0.5f * p.loop) step -= p.loop;
@@ -622,6 +650,90 @@ void intro_camera(rt::Context& c, rt::Body body) {
         const float a = rt::f32(g_intro.before[i]), b = rt::f32(now[i]);
         show_word(kIntroCamera + 4 * i, rt::b32(a + (b - a) * f));
     }
+}
+
+// BIRDS' drawing (0x8C03EC14, every picture): each bird's wings from its frame (+60, 0-9, one on
+// a step) as the table at 0x8C528680, ten floats 0.15 sin(2 pi i / 10). Drawn between steps, the
+// table is the wing a frame's fraction back: entry k the wing at k - 1 + the timeline's fraction,
+// each bird's frame being k after the step. Put back after. Not while the birds stood still (the
+// game paused).
+constexpr uint32_t kWingTable = 0x8C528680u;
+void birds_draw(rt::Context& c, rt::Body body) {
+    static_assert(kScenery[8].frame == 0x8C03ECDCu, "kScenery[8] is BIRDS");
+    const Scenery& state = g_scenery[8];  // kScenery[8]: BIRDS
+    const double t = shown();
+    if (rt::g_frame_share >= 1.0 || state.pairs.empty() || t >= 1.0) return body(c);
+    uint32_t table[10];
+    for (unsigned k = 0; k < 10; ++k) {
+        table[k] = rt::ld32(kWingTable + 4 * k);
+        const double phase = (static_cast<double>(k) - 1.0 + t) * (2.0 * 3.14159265358979 / 10.0);
+        rt::st32(kWingTable + 4 * k, rt::b32(static_cast<float>(0.15 * std::sin(phase))));
+    }
+    body(c);
+    for (unsigned k = 0; k < 10; ++k) rt::st32(kWingTable + 4 * k, table[k]);
+}
+
+// The camera's drawing (0x8C01CC20, every picture) eases a scale (0x8C10A014) towards its target
+// (the float at 0x8C1146FC + 4 * the word at 0x8C1146F4), 0.8 of the way left a picture; and, while
+// the word at 0x8C1AC394 is set (not in a race), turns an angle (0x8C10A03C) by 0x8C10A048's
+// degrees a picture. Drawn faster, a picture is a share of the game's: 0.8 to that power, and the
+// share of the turn.
+constexpr uint32_t kCameraScale = 0x8C10A014u, kScaleTargets = 0x8C1146FCu, kScaleChoice = 0x8C1146F4u;
+constexpr uint32_t kSwayOn = 0x8C1AC394u, kSwayAngle = 0x8C10A03Cu;
+void camera_draw(rt::Context& c, rt::Body body) {
+    const double share = rt::g_frame_share;
+    if (share >= 1.0) return body(c);
+    const float scale = fl(kCameraScale), sway = fl(kSwayAngle);
+    const bool swaying = rt::ld32(kSwayOn) != 0 && rt::ld32(0x8C53B380u) == 0;
+    body(c);
+    const uint32_t choice = rt::ld32(kScaleChoice);
+    if (choice < 64) {
+        const float target = fl(kScaleTargets + 4 * choice);
+        rt::st32(kCameraScale, rt::b32(target + (scale - target) * static_cast<float>(std::pow(0.8, share))));
+    }
+    if (swaying) {
+        float turn = fl(kSwayAngle) - sway;
+        if (turn < -180.0f) turn += 360.0f;
+        float v = sway + turn * static_cast<float>(share);
+        if (v > 360.0f) v -= 360.0f;
+        rt::st32(kSwayAngle, rt::b32(v));
+    }
+}
+
+// The cars' lights fade (0x8C036310, r4 a float, r5 up or down): by the step at 0x8C54C9C0 (0.2),
+// held between 0 and 1. The cars' drawing (0x8C036120, through 0x8C036350 and 0x8C0369E8) calls
+// it every picture, as the original did once a step. Drawn faster, it moves on once for each of
+// the game's pictures due, as the original's, and each picture shows the value the timeline's
+// fraction of the way from before that to after; the true one is put back for the game's tasks.
+struct Fade {
+    uint32_t at, from, to;
+    uint64_t step;
+};
+std::vector<Fade> g_fades;
+void light_fade(rt::Context& c, rt::Body body) {
+    if (rt::g_frame_share >= 1.0) g_fades.clear();
+    if (rt::g_frame_share >= 1.0 || g_in_tasks) return body(c);
+    const uint32_t at = c.r[4];
+    auto it = std::find_if(g_fades.begin(), g_fades.end(), [&](const Fade& f) { return f.at == at; });
+    if (it == g_fades.end()) {
+        g_fades.push_back({at, rt::ld32(at), rt::ld32(at), UINT64_MAX});
+        it = g_fades.end() - 1;
+    }
+    if (rt::ld32(at) != it->to) it->from = it->to = rt::ld32(at);  // set by something else meanwhile
+    if (it->step != g_step) {  // the game's pictures due since this light last faded
+        const uint64_t due = it->step == UINT64_MAX ? 1 : std::min<uint64_t>(g_step - it->step, 8);
+        it->step = g_step;
+        it->from = rt::ld32(at);
+        const uint32_t r4 = c.r[4], r5 = c.r[5];
+        for (uint64_t i = 0; i < due; ++i) {
+            c.r[4] = r4, c.r[5] = r5;
+            body(c);
+        }
+        it->to = rt::ld32(at);
+    }
+    if (it->from == it->to) return;
+    const float a = rt::f32(it->from), b = rt::f32(it->to);
+    show_word(at, rt::b32(a + (b - a) * static_cast<float>(std::clamp(shown(), 0.0, 1.0))));
 }
 
 // RAINDROPS' drawing (0x8C04C5A8, every picture, when it rains): it copies its camera matrix (one
@@ -699,7 +811,7 @@ void race_setup(rt::Context& c, rt::Body body) {
     at_game_rate(c, body);
 }
 
-constexpr std::array<rt::Wrapper, 27> kWrappers{{
+constexpr std::array<rt::Wrapper, 30> kWrappers{{
     {0x8C02CBBCu, "MSR: the task runner, the game's timeline", task_runner},
     {0x8C074204u, "MSR: the race's presentation (PRESENTATION), at the game's rate", at_game_pace},
     {0x8C03E6F8u, "MSR: the race's animated text (ANIM_TEXT), at the game's rate", at_game_pace},
@@ -722,6 +834,9 @@ constexpr std::array<rt::Wrapper, 27> kWrappers{{
     {0x8C04D834u, "MSR: the seagulls' drawing, at the seconds shown", seagulls},
     {0x8C074532u, "MSR: the intro camera, between its steps", intro_camera},
     {0x8C04C5A8u, "MSR: the raindrops' drawing, the camera's move a step", rain_draw},
+    {0x8C03EC14u, "MSR: the birds' drawing, their wings between steps", birds_draw},
+    {0x8C01CC20u, "MSR: the camera's drawing, its easing a picture's share", camera_draw},
+    {0x8C036310u, "MSR: the cars' lights' fade, once a step", light_fade},
     {0x8C03B3E2u, "MSR: the race's setup, at the game's own frame rate", race_setup},
     {0x8C03BAD4u, "MSR: the race's world step, at the game's own frame rate", world_step},
     {0x8C03C14Eu, "MSR: a car's step in the race", car_step},
