@@ -11,6 +11,8 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-28
+
 ### Added
 - **Downloads for players** (`tools/player-kit/`, as Toy Commander--QilinRecomp's): a Windows zip (cross-compiled with LLVM-MinGW, which it bundles), Linux tarballs for x86-64 and ARM64 (built with the zig they bundle, glibc 2.35 or later) and a universal macOS disk image (MoltenVK in the app, Apple's clang from the Command Line Tools), built by three new workflows on every push and attached to the release of a `vX.Y.Z` tag. Each holds the players' launcher, `Play Metropolis Street Racer` (Toy Commander's `tools/player-kit/launcher`, launcher 4, copied unchanged), the recompiler and the prebuilt rest of the game, and nothing from the game. The player chooses their disc, the launcher checks it, takes `MSR.BIN` and `SOUND/MANATEE.DRV` from the image (`qilin extract --file`), lifts both (`qilin lift`, `qilin armlift`) and compiles the result; the game then runs from the image itself. `kit/game.txt` is written by `tools/player-kit/games.sh`; `compile_memory_mb` is 1000 (the largest lifted file, `lifted_002.cpp`, peaked at 807 MB in zig's clang at `-O2`; the sound driver's at 332 MB).
 - **The player kit** (`-DQILIN_PLAYER_KIT=ON`): `libmsr_kit.a`, everything but the lifted code in one archive, with the runtime's headers, `qilin` and `build-flags.txt` (the lifted code's flags, `QILIN_BRINGUP` included, so both sides of the link agree). The game's program without the lifted code is now a library, `msr_game`, which `msr` links; `msr_link_check` links it with empty function tables in every build, and `msr_kit_link_check` the kit's archive.
