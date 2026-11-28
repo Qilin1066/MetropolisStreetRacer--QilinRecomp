@@ -165,6 +165,9 @@ if(WIN32)
         target_link_libraries(qilin_platform PRIVATE onecore)
     else()
         target_link_libraries(qilin_platform PRIVATE api-ms-win-core-memory-l1-1-6 api-ms-win-core-memory-l1-1-5)
+        # MinGW's headers declare them from Windows 10 1803 (RS4) only, which
+        # newer releases (llvm-mingw's) don't assume by default.
+        target_compile_definitions(qilin_platform PRIVATE NTDDI_VERSION=0x0A000005)
     endif()
 endif()
 
@@ -384,7 +387,7 @@ option(QILIN_BRINGUP "Note the guest instruction of each access in the game buil
 option(QILIN_PLAYER_KIT "Build the player kit (tools/player-kit): the game's program without the lifted code as one archive, for the downloads" OFF)
 
 # ---- The player kit: the downloads (tools/player-kit, as Toy Commander's) ----
-# Everything but the lifted code in one archive (libmsr_kit.a): msr_game and
+# Everything but the lifted code in one archive (libmsr_kit.a): msr_game (as msr_game_archive) and
 # all it links, SDL3 included. Beside it the runtime's headers, the recompiler,
 # and build-flags.txt: how the player's computer compiles and links the code it
 # lifts from its own disc (tools/player-kit/launcher/build.cpp reads it).
@@ -394,7 +397,7 @@ option(QILIN_PLAYER_KIT "Build the player kit (tools/player-kit): the game's pro
 # universal, merged by Apple's libtool (tools/player-kit/macos.cmake).
 # The lifted code's flags: what qilin_runtime and msr_game give it here, so
 # both sides of the link agree (QILIN_BRINGUP changes guest.hpp's accesses).
-set(QILIN_KIT_LIBRARIES msr_game msr_port dreamcast_hw dreamcast_menu qilin_host qilin_imgui qilin_volk qilin_pl_mpeg
+set(QILIN_KIT_LIBRARIES msr_game_archive msr_port dreamcast_hw dreamcast_menu qilin_host qilin_imgui qilin_volk qilin_pl_mpeg
                         qilin_disc ${QILIN_CHDR_LIBRARIES} qilin_platform qilin_file_store SDL3-static)
 set(QILIN_KIT_CXXFLAGS -ffp-contract=off -fno-fast-math -frounding-math)
 if(QILIN_BRINGUP)
@@ -479,7 +482,11 @@ endfunction()
 
 if(QILIN_HOST)
     find_package(Threads REQUIRED)
-    add_library(msr_game STATIC msr/src/main.cpp msr/src/game.cpp msr/src/sound_cpu.cpp msr/src/movie.cpp
+    # An object library: the programs that link it get its objects, so the
+    # layers it calls and that call back into it (dreamcast_hw's calls into
+    # game.cpp) link in any order. msr_game_archive is the same objects as an
+    # archive, for the player kit's.
+    add_library(msr_game OBJECT msr/src/main.cpp msr/src/game.cpp msr/src/sound_cpu.cpp msr/src/movie.cpp
         recomp/runtime/dispatch.cpp recomp/runtime/system.cpp recomp/runtime/bus.cpp)
     target_link_libraries(msr_game PUBLIC msr_port dreamcast_hw qilin_pl_mpeg qilin_disc qilin_runtime qilin_platform
                                           SDL3::SDL3-static Threads::Threads PRIVATE qilin_warnings)
@@ -491,6 +498,7 @@ if(QILIN_HOST)
     elseif(WIN32)
         target_link_options(msr_game INTERFACE -Wl,--stack,8388608)
     endif()
+    add_library(msr_game_archive STATIC $<TARGET_OBJECTS:msr_game>)
     add_executable(msr_link_check tools/player-kit/link_check.cpp)
     target_link_libraries(msr_link_check PRIVATE msr_game)
     if(QILIN_PLAYER_KIT)
