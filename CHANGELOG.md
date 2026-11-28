@@ -20,7 +20,7 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ### Changed
 - **Paths with any characters on Windows**: `qilin` and `msr` read their arguments as UTF-8 from the UTF-16 command line (`recomp/runtime/command_line.hpp`, Toy Commander's), and the disc reader names files in UTF-8.
-- **The guest's address space under MinGW** links the API sets' import libraries (`api-ms-win-core-memory-l1-1-5`, `-1-6`) where MSVC links `onecore`; `fiber.cpp`'s POSIX-only fields no longer warn under Clang for Windows.
+- **The guest's address space on Windows** finds `VirtualAlloc2`, `MapViewOfFile3` and `UnmapViewOfFile2` in `kernelbase.dll` at run time instead of linking `onecore` (MSVC's only: MinGW's toolchains name these import libraries differently, or not at all), and says plainly that Windows 10 version 1803 or later is needed where they are missing. `fiber.cpp`'s POSIX-only fields no longer warn under Clang for Windows.
 
 ### Fixed
 - **Pictures drawn half built at high frame rates.** The game builds the next scene in a second parameter buffer while the last renders; at 144 a render was sometimes started after the next scene had begun, and the port, which kept one scene, drew that one without its trees, fences, shadows and HUD (29 of 40 pictures in one run). The tile accelerator now keeps the scene finished in each buffer, and a render draws the one PARAM_BASE names.

@@ -158,15 +158,11 @@ add_library(qilin_platform STATIC recomp/runtime/memory.cpp recomp/runtime/fiber
 target_include_directories(qilin_platform PUBLIC recomp/runtime)
 target_link_libraries(qilin_platform PRIVATE qilin_warnings)
 if(WIN32)
-    # VirtualAlloc2, MapViewOfFile3, UnmapViewOfFile2 (Windows 10 1803+): MSVC's
-    # onecore; MinGW's (the player kit's llvm-mingw, zig) import libraries of
-    # the API sets they are in.
-    if(MSVC)
-        target_link_libraries(qilin_platform PRIVATE onecore)
-    else()
-        target_link_libraries(qilin_platform PRIVATE api-ms-win-core-memory-l1-1-6 api-ms-win-core-memory-l1-1-5)
-        # MinGW's headers declare them from Windows 10 1803 (RS4) only, which
-        # newer releases (llvm-mingw's) don't assume by default.
+    # VirtualAlloc2, MapViewOfFile3, UnmapViewOfFile2 (Windows 10 1803+) are
+    # found at run time (memory.cpp): no import library. MinGW's headers
+    # declare them from Windows 10 1803 (RS4) only, which newer releases
+    # (llvm-mingw's) don't assume by default.
+    if(NOT MSVC)
         target_compile_definitions(qilin_platform PRIVATE NTDDI_VERSION=0x0A000005)
     endif()
 endif()
@@ -429,11 +425,9 @@ function(qilin_player_kit)
     add_custom_target(msr_kit ALL DEPENDS "${kit_archive}")
     string(JOIN " " lifted_text ${QILIN_KIT_CXXFLAGS})
     if(WIN32)
-        # The system libraries SDL3 and the runtime need (MinGW names); the
-        # memory API sets: the guest's address space (VirtualAlloc2, MapViewOfFile3,
-        # UnmapViewOfFile2).
+        # The system libraries SDL3 and the runtime need (MinGW names).
         set(kit_system_libraries -lm -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32
-            -lsetupapi -lshell32 -ldinput8 -lwinspool -lcomdlg32 -lapi-ms-win-core-memory-l1-1-6 -lapi-ms-win-core-memory-l1-1-5)
+            -lsetupapi -lshell32 -ldinput8 -lwinspool -lcomdlg32)
         set(kit_ldflags "-static -O2 -Wl,--stack,8388608")
         set(kit_icon " $kit/lib/icon.o")
         set(kit_native "")  # the launcher's default, -march=native
