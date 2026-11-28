@@ -11,6 +11,7 @@
 #include <map>
 
 #include "gdrom.hpp"
+#include "path.hpp"
 
 namespace msr {
 
@@ -76,7 +77,7 @@ class FolderDrive final : public Drive {
 public:
     bool build(const std::filesystem::path& folder, std::string& why) {
         std::ifstream ip(folder / "IP.BIN", std::ios::binary);
-        if (!ip) return why = "no IP.BIN in " + folder.string(), false;
+        if (!ip) return why = "no IP.BIN in " + qilin::utf8_path(folder), false;
         ip_.assign(std::istreambuf_iterator<char>(ip), {});
         if (ip_.size() != 16 * kSector) return why = "IP.BIN isn't 32 KB", false;
         Entry root;
@@ -175,7 +176,7 @@ public:
         open_.read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(n));
         if (!open_) {
             open_ = std::ifstream(), open_entry_ = nullptr;
-            return error_ = "cannot read " + f.path.string(), false;
+            return error_ = "cannot read " + qilin::utf8_path(f.path), false;
         }
         open_at_ = offset + n;
         return true;
@@ -200,7 +201,7 @@ private:
         std::ifstream in(folder / "disc.json");
         if (!in) in.open(folder.parent_path() / "disc.json");
         if (!in)
-            return why = "no disc.json beside " + folder.string() +
+            return why = "no disc.json beside " + qilin::utf8_path(folder) +
                          " (qilin extract writes it; the files' sectors must be the disc's)", false;
         const std::string text((std::istreambuf_iterator<char>(in)), {});
         size_t at = text.find("\"files\"");
@@ -245,17 +246,17 @@ private:
         std::error_code ec;
         std::vector<std::filesystem::directory_entry> list;
         for (const auto& de : std::filesystem::directory_iterator(entries_[dir].path, ec)) list.push_back(de);
-        if (ec) return why = "cannot list " + entries_[dir].path.string(), false;
+        if (ec) return why = "cannot list " + qilin::utf8_path(entries_[dir].path), false;
         std::vector<Entry> kids;
         for (const auto& de : list) {
-            std::string name = de.path().filename().string();
+            std::string name = qilin::utf8_path(de.path().filename());
             std::transform(name.begin(), name.end(), name.begin(), [](char ch) { return static_cast<char>(std::toupper(static_cast<unsigned char>(ch))); });
             if (dir == 0 && (name == "IP.BIN" || name == "DISC.JSON")) continue;  // the system area; the layout
             Entry e;
             e.name = name, e.path = de.path(), e.dir = de.is_directory();
             if (!e.dir) {
                 const auto size = de.file_size(ec);
-                if (ec || size > 0xFFFFFFFFu) return why = "cannot size " + de.path().string(), false;
+                if (ec || size > 0xFFFFFFFFu) return why = "cannot size " + qilin::utf8_path(de.path()), false;
                 e.size = static_cast<uint32_t>(size);
                 e.name += ";1";
             }

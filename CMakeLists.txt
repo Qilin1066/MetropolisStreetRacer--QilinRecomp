@@ -312,6 +312,12 @@ if(QILIN_HOST)
     target_link_libraries(qilin_padtest PRIVATE qilin_host SDL3::SDL3-static qilin_warnings)
     add_test(NAME qilin_padtest COMMAND qilin_padtest)
     set_tests_properties(qilin_padtest PROPERTIES SKIP_RETURN_CODE 77)
+    # The data folder under a name outside the ANSI code page (QILIN_SAVE_DIR
+    # read as Unicode on Windows), with a save and a settings file in it.
+    add_executable(qilin_paths_test host/tests/paths_test.cpp)
+    target_include_directories(qilin_paths_test PRIVATE recomp/runtime)
+    target_link_libraries(qilin_paths_test PRIVATE qilin_host qilin_file_store qilin_warnings)
+    add_test(NAME qilin_paths_test COMMAND qilin_paths_test)
     # The texture decoder and the renderer, without the game.
     add_executable(dreamcast_render_test dreamcast/tests/render_test.cpp dreamcast/src/texture.cpp dreamcast/src/renderer.cpp)
     target_include_directories(dreamcast_render_test PRIVATE dreamcast/src recomp/runtime)

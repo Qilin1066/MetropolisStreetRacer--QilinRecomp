@@ -92,7 +92,7 @@ std::optional<std::vector<uint8_t>> read_in_folder(const std::filesystem::path& 
         std::error_code ec;
         bool found = false;
         for (const auto& e : std::filesystem::directory_iterator(at, ec)) {
-            const std::string name = e.path().filename().string();
+            const std::string name = qilin::utf8_path(e.path().filename());
             if (std::ranges::equal(name, part, [](char x, char y) { return std::toupper(static_cast<unsigned char>(x)) == y; })) {
                 at = e.path(), found = true;
                 break;

@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "guest.hpp"
+#include "path.hpp"
 #include "qilin/host/image.hpp"
 #include "shaders.inc"
 #include "texture.hpp"
@@ -283,7 +284,7 @@ private:
             PackImage image;
             std::string error;
             if (!qilin::host::load_png(job.file, image.width, image.height, image.pixels, error))
-                qilin::host::die("%s", ("cannot read the texture pack's " + job.file.string() + ": " + error).c_str());
+                qilin::host::die("%s", ("cannot read the texture pack's " + qilin::utf8_path(job.file) + ": " + error).c_str());
             const bool halves = !(image.width & (image.width - 1)) && !(image.height & (image.height - 1));
             image.levels = job.mipmapped && halves ? uint32_t(std::bit_width(std::max(image.width, image.height))) : 1u;
             mip_chain(image.pixels, image.width, image.height, image.levels);
@@ -843,7 +844,7 @@ struct Renderer::Impl {
                 std::error_code ec;
                 std::string error;
                 if (!std::filesystem::exists(file, ec) && !qilin::host::save_png(file, p.width, p.height, pixels.data(), error))
-                    qilin::host::die("%s", ("cannot dump a texture to " + file.string() + ": " + error).c_str());
+                    qilin::host::die("%s", ("cannot dump a texture to " + qilin::utf8_path(file) + ": " + error).c_str());
                 ++stats.dumped;
             }
             if (const auto it = pack_files.find(hash); it != pack_files.end()) {
@@ -888,17 +889,18 @@ struct Renderer::Impl {
         std::error_code ec;
         if (!dump.empty()) {
             std::filesystem::create_directories(dump, ec);
-            if (ec) qilin::host::die("%s", ("cannot make the texture dump folder " + dump.string() + ": " + ec.message()).c_str());
+            if (ec) qilin::host::die("%s", ("cannot make the texture dump folder " + qilin::utf8_path(dump) + ": " + ec.message()).c_str());
         }
         if (!load.empty() && std::filesystem::is_directory(load, ec)) {
             for (auto it = std::filesystem::recursive_directory_iterator(load, ec); !ec && it != std::filesystem::recursive_directory_iterator();
                  it.increment(ec)) {
                 uint64_t hash = 0;
-                if (!it->is_regular_file(ec) || !pack_hash(it->path().filename().string(), hash)) continue;
+                if (!it->is_regular_file(ec) || !pack_hash(qilin::utf8_path(it->path().filename()), hash)) continue;
                 const auto [at, added] = pack_files.emplace(hash, it->path());
-                if (!added) qilin::host::die("%s", ("two texture pack files for one texture: " + at->second.string() + " and " + it->path().string()).c_str());
+                if (!added)
+                    qilin::host::die("%s", ("two texture pack files for one texture: " + qilin::utf8_path(at->second) + " and " + qilin::utf8_path(it->path())).c_str());
             }
-            if (ec) qilin::host::die("%s", ("cannot read the texture pack folder " + load.string() + ": " + ec.message()).c_str());
+            if (ec) qilin::host::die("%s", ("cannot read the texture pack folder " + qilin::utf8_path(load) + ": " + ec.message()).c_str());
         }
         for (auto& [k, t] : textures) t.generation = ~uint64_t{0};  // decoded (and looked up) again when next used
         stats.pack_files = uint32_t(pack_files.size());

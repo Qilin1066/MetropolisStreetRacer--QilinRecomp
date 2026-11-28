@@ -11,6 +11,9 @@ Each release is a git tag (`vX.Y.Z`) with a matching GitHub release. The version
 
 ## [Unreleased]
 
+### Fixed
+- **Messages about the data folder, texture packs and the disc folder work when your Windows user name has characters outside the system's code page** (Japanese or Cyrillic on an English Windows): the paths in the messages are written in UTF-8 instead of with question marks for those characters (an MSVC build stopped on them instead), and a texture pack file or a file in an extracted disc folder is matched by its name the same way. A test now saves and reads a memory card and a settings file in a data folder with a Japanese name.
+
 ## [0.10.0] - 2026-11-28
 
 ### Added
