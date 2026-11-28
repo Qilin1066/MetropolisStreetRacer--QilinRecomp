@@ -26,6 +26,30 @@ constexpr uint64_t kSpace = 1ull << 32;
 // Windows maps one section at several addresses inside a reservation through
 // placeholders (Windows 10 1803 and later): reserve the whole space as one
 // placeholder, split off each view's range, and replace it with a view.
+// The placeholder calls are kernelbase.dll's, from Windows 10 1803: found at
+// run time, so no toolchain's import library has to provide them (MSVC's is
+// onecore, MinGW's differ between releases), and an older Windows gets a
+// plain message instead of a loader error.
+namespace {
+struct PlaceholderApi {
+    decltype(&::VirtualAlloc2) virtual_alloc2 = nullptr;
+    decltype(&::MapViewOfFile3) map_view_of_file3 = nullptr;
+    decltype(&::UnmapViewOfFile2) unmap_view_of_file2 = nullptr;
+};
+const PlaceholderApi& placeholder_api() {
+    static const PlaceholderApi api = [] {
+        PlaceholderApi a;
+        if (HMODULE k = GetModuleHandleW(L"kernelbase.dll")) {
+            a.virtual_alloc2 = reinterpret_cast<decltype(a.virtual_alloc2)>(reinterpret_cast<void*>(GetProcAddress(k, "VirtualAlloc2")));
+            a.map_view_of_file3 = reinterpret_cast<decltype(a.map_view_of_file3)>(reinterpret_cast<void*>(GetProcAddress(k, "MapViewOfFile3")));
+            a.unmap_view_of_file2 = reinterpret_cast<decltype(a.unmap_view_of_file2)>(reinterpret_cast<void*>(GetProcAddress(k, "UnmapViewOfFile2")));
+        }
+        return a;
+    }();
+    return api;
+}
+}  // namespace
+
 struct GuestMemory::Native {
     HANDLE section = nullptr;
     std::vector<void*> views;         // mapped views, to unmap
@@ -34,6 +58,12 @@ struct GuestMemory::Native {
 
 GuestMemory::GuestMemory() {
     native_ = new Native;
+    const PlaceholderApi& api = placeholder_api();
+    if (!api.virtual_alloc2 || !api.map_view_of_file3 || !api.unmap_view_of_file2) {
+        error_ = "this Windows has no placeholder mappings (VirtualAlloc2): it needs Windows 10 version 1803 or later";
+        release();
+        return;
+    }
     native_->section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, kRamSize, nullptr);
     if (!native_->section) {
         error_ = "CreateFileMapping failed for main RAM";
@@ -41,7 +71,7 @@ GuestMemory::GuestMemory() {
         return;
     }
     uint8_t* base = static_cast<uint8_t*>(
-        VirtualAlloc2(nullptr, nullptr, kSpace, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+        api.virtual_alloc2(nullptr, nullptr, kSpace, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
     if (!base) {
         error_ = "cannot reserve 4 GB of address space for the guest";
         release();
@@ -58,7 +88,7 @@ GuestMemory::GuestMemory() {
             release();
             return;
         }
-        void* view = MapViewOfFile3(native_->section, GetCurrentProcess(), base + at, 0, kRamSize,
+        void* view = api.map_view_of_file3(native_->section, GetCurrentProcess(), base + at, 0, kRamSize,
                                     MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0);
         if (!view) {
             native_->placeholders.push_back(base + at);
@@ -77,7 +107,7 @@ GuestMemory::GuestMemory() {
 
 void GuestMemory::release() {
     if (native_) {
-        for (void* v : native_->views) UnmapViewOfFile2(GetCurrentProcess(), v, 0);
+        for (void* v : native_->views) placeholder_api().unmap_view_of_file2(GetCurrentProcess(), v, 0);
         for (void* p : native_->placeholders) VirtualFree(p, 0, MEM_RELEASE);
         if (native_->views.empty() && native_->placeholders.empty() && base_) VirtualFree(base_, 0, MEM_RELEASE);
         if (native_->section) CloseHandle(native_->section);

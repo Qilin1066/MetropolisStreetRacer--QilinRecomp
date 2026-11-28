@@ -10,6 +10,7 @@ Everything here is fetched at build time (CMake `FetchContent`), pinned to a ver
 | [Dear ImGui](https://github.com/ocornut/imgui) | `c1aaac65e` | MIT | the settings menu |
 | [pl_mpeg](https://github.com/phoboslab/pl_mpeg) | `c871f2be0` | MIT | the intro movie's MPEG-1 video and stream separation (`msr/src/movie.cpp`) |
 | [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) | `a21ffb8f6` (FSR 1.0): `ffx-fsr/ffx_a.h`, `ffx-fsr/ffx_fsr1.h`, `license.txt` | MIT (AMD) | FSR 1 upscaling in the present pass (`host/src/fsr/`) |
+| [libchdr](https://github.com/rtissera/libchdr) | `93d8c239f` (v0.3.0), with what it bundles: LZMA SDK (public domain), miniz (Unlicense), zstd's decompressor (BSD-3-Clause) and dr_flac (public domain) | BSD-3-Clause | reading `.chd` disc images (`recomp/src/gdrom.cpp`) |
 | [SMAA](https://github.com/iryoku/smaa) | `71c806a83`: `SMAA.hlsl`, `Textures/AreaTex.h`, `Textures/SearchTex.h`, `LICENSE.txt` | MIT (Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro, Diego Gutierrez) | SMAA 1x anti-aliasing in the present pass (`host/src/smaa/`) |
 
 ## Data
@@ -23,6 +24,10 @@ FSR 1's and SMAA's files are single files, not libraries: CMake downloads each f
 Unlike the libraries, these glyphs are committed: `tools/make_romfont.py` generates `msr/src/romfont_glyphs.inc` from the pinned file (the developer downloads it; the script checks its hash), as `tools/build_shaders.py` does the shaders. The generated file is a derivative of Unifont and keeps its licence, stated at its top.
 
 `dreamcast/` and `host/` come from Toy Commander--QilinRecomp (same owner, GPL-3.0, merged up to commit `0c4789e`); the present pass's SMAA and FSR from Grabbed by the Ghoulies--QilinRecomp (same owner, GPL-3.0).
+
+## In the downloads
+
+The downloads (`tools/player-kit/`) carry, besides the above (whose licences they include in `LICENSES/`): [LLVM-MinGW](https://github.com/mstorsjo/llvm-mingw) `20261104` (Windows: the compiler, Apache-2.0 with LLVM exceptions, and MinGW-w64's runtime), [zig](https://ziglang.org) `0.17.1` (Linux: the compiler, MIT, with LLVM's libc++ and the C libraries' headers it bundles) and [MoltenVK](https://github.com/KhronosGroup/MoltenVK) `v1.4.2` (macOS: Apache-2.0, with SPIRV-Cross, SPIRV-Tools, SPIRV-Headers and cereal inside), each pinned by SHA-256 in its workflow. pl_mpeg's licence is its header's SPDX line (MIT), written out with the author's name in `tools/player-kit/pl_mpeg-LICENSE.txt`; GNU Unifont's two licence texts (GPL-2.0 with the font embedding exception, and OFL-1.1) are committed in `tools/player-kit/unifont/` from Unifont 18.0.01's own `COPYING` and `OFL-1.1.txt`. The players' launcher (`tools/player-kit/launcher/`) is Toy Commander--QilinRecomp's (same owner, GPL-3.0), copied unchanged.
 
 Tools run as references and never linked or copied: GNU binutils (decoder checks), QEMU (the differential test), Flycast (planned, for comparison).
 

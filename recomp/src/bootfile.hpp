@@ -84,6 +84,7 @@ struct KnownBuild {
     std::span<const uint32_t> wrapped = {};
 };
 const KnownBuild* known_build(std::string_view sha256_hex);
+std::span<const KnownBuild> known_builds();
 
 // Thrown only for programming errors: reading outside the image.
 struct BootFileError : std::runtime_error {

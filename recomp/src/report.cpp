@@ -2,6 +2,8 @@
 
 #include <format>
 
+#include "path.hpp"
+
 namespace qilin {
 
 namespace {
@@ -46,7 +48,7 @@ std::string to_json(const GdRom& disc, const IpBin& ip, std::span<const GdFile> 
         j += std::format("    {{\"number\": {}, \"type\": \"{}\", \"area\": \"{}\", \"start\": {}, \"sectors\": {}, "
                          "\"sector_size\": {}, \"file\": {}}}{}\n",
                          t.number, t.data ? "data" : "audio", t.high_density ? "high-density" : "single-density",
-                         t.start, t.sectors, t.sector_size, json_string(t.file.filename().string()),
+                         t.start, t.sectors, t.sector_size, json_string(utf8_path(t.file.empty() ? disc.chd.filename() : t.file.filename())),
                          i + 1 < disc.tracks.size() ? "," : "");
     }
     j += "  ],\n  \"ip_bin\": " + ip_json(ip, "  ") + ",\n";

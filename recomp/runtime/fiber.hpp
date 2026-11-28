@@ -44,8 +44,9 @@ public:
 private:
     Fiber();  // the host thread's own stack
     void* sp_ = nullptr;      // saved stack pointer (or the system fiber, on Windows)
-    void* stack_ = nullptr;   // allocated stack (none for the thread's own)
-    size_t stack_size_ = 0;
+    // Allocated stack (none for the thread's own); Windows' fibers keep their own.
+    [[maybe_unused]] void* stack_ = nullptr;
+    [[maybe_unused]] size_t stack_size_ = 0;
     Entry entry_ = nullptr;
     void* arg_ = nullptr;
     bool ok_ = false;

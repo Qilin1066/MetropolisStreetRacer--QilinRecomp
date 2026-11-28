@@ -1,12 +1,17 @@
 #include "gdrom.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <system_error>
 
+#include <libchdr/chd.h>
+
 #include "bootfile.hpp"
+#include "path.hpp"
 
 namespace qilin {
 
@@ -39,24 +44,25 @@ std::expected<uint32_t, std::string> number(const std::string& s, const std::str
 
 std::expected<std::vector<std::string>, std::string> read_lines(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) return fail("cannot open " + path.string());
+    if (!f) return fail("cannot open " + utf8_path(path));
     std::vector<std::string> lines;
     for (std::string line; std::getline(f, line);) lines.push_back(trim(std::move(line)));
-    if (f.bad()) return fail("cannot read " + path.string());
+    if (f.bad()) return fail("cannot read " + utf8_path(path));
     return lines;
 }
 
 // A track's size in sectors, from its file.
 std::expected<void, std::string> measure(GdTrack& t) {
     std::error_code ec;
+    const std::string name = utf8_path(t.file);
     const uint64_t bytes = std::filesystem::file_size(t.file, ec);
-    if (ec) return fail("cannot open " + t.file.string());
-    if (bytes < t.file_offset) return fail(t.file.string() + ": shorter than the track's offset in it");
+    if (ec) return fail("cannot open " + name);
+    if (bytes < t.file_offset) return fail(name + ": shorter than the track's offset in it");
     const uint64_t size = bytes - t.file_offset;
     if (size == 0 || size % t.sector_size)
-        return fail(t.file.string() + ": its size isn't a whole number of " + std::to_string(t.sector_size) +
+        return fail(name + ": its size isn't a whole number of " + std::to_string(t.sector_size) +
                     "-byte sectors");
-    if (size / t.sector_size > 600000) return fail(t.file.string() + ": larger than a GD-ROM");
+    if (size / t.sector_size > 600000) return fail(name + ": larger than a GD-ROM");
     t.sectors = static_cast<uint32_t>(size / t.sector_size);
     return {};
 }
@@ -65,7 +71,7 @@ std::expected<void, std::string> measure(GdTrack& t) {
 std::expected<GdRom, std::string> open_cue(const std::filesystem::path& image) {
     auto lines = read_lines(image);
     if (!lines) return std::unexpected(lines.error());
-    const std::string where = image.string();
+    const std::string where = utf8_path(image);
     GdRom disc;
     bool have_area = false, high_density = false, file_used = true;
     std::filesystem::path file;
@@ -82,7 +88,7 @@ std::expected<GdRom, std::string> open_cue(const std::filesystem::path& image) {
             if (open == std::string::npos || close == open) return fail(where + ": FILE without a quoted name");
             if (trim(line.substr(close + 1)) != "BINARY") return fail(where + ": only BINARY files are supported");
             if (!file_used) return fail(where + ": a FILE without a TRACK");
-            file = image.parent_path() / std::filesystem::path(line.substr(open + 1, close - open - 1));
+            file = image.parent_path() / native_path(line.substr(open + 1, close - open - 1));
             file_used = false;
             continue;
         }
@@ -129,7 +135,7 @@ std::expected<GdRom, std::string> open_cue(const std::filesystem::path& image) {
 std::expected<GdRom, std::string> open_gdi(const std::filesystem::path& image) {
     auto lines = read_lines(image);
     if (!lines) return std::unexpected(lines.error());
-    const std::string where = image.string();
+    const std::string where = utf8_path(image);
     std::erase_if(*lines, [](const std::string& l) { return l.empty(); });
     if (lines->empty()) return fail(where + ": empty");
     auto count = number((*lines)[0], where + ": track count");
@@ -171,12 +177,161 @@ std::expected<GdRom, std::string> open_gdi(const std::filesystem::path& image) {
         if (!t.data && *ss != kRawSector) return fail(where + ": audio track " + num + " isn't 2352 bytes a sector");
         t.sector_size = *ss;
         t.file_offset = *off;
-        t.file = image.parent_path() / std::filesystem::path(name);
+        t.file = image.parent_path() / native_path(name);
         t.high_density = t.start >= kHighDensityStart;
         if (auto ok = measure(t); !ok) return std::unexpected(ok.error());
         if (!disc.tracks.empty() && t.start < disc.tracks.back().end())
             return fail(where + ": track " + num + " starts before the track before it ends");
         disc.tracks.push_back(std::move(t));
+    }
+    return disc;
+}
+
+}  // namespace
+
+// ---- .chd (libchdr), ported from Toy Commander--QilinRecomp's reader ----
+
+// A .chd open for reading, with the hunk last read.
+struct GdChd {
+    std::FILE* stdio = nullptr;
+    chd_file* chd = nullptr;
+    uint32_t hunk_bytes = 0, unit_bytes = 0, hunks = 0, frames_per_hunk = 0;
+    std::vector<uint8_t> hunk;
+    uint32_t hunk_no = UINT32_MAX;
+
+    GdChd() = default;
+    GdChd(const GdChd&) = delete;
+    GdChd& operator=(const GdChd&) = delete;
+    ~GdChd() {
+        if (chd) chd_close(chd);
+        if (stdio) std::fclose(stdio);  // chd_open_file never closes it
+    }
+
+    std::expected<void, std::string> open(const std::filesystem::path& path) {
+        const std::string name = utf8_path(path.filename());
+#if defined(_WIN32)
+        stdio = _wfopen(path.c_str(), L"rb");
+#else
+        stdio = std::fopen(path.c_str(), "rb");
+#endif
+        if (!stdio) return fail("cannot open " + utf8_path(path));
+        if (const chd_error e = chd_open_file(stdio, CHD_OPEN_READ, nullptr, &chd); e != CHDERR_NONE)
+            return fail(name + ": not a CHD libchdr can read (" + chd_error_string(e) + ")");
+        const chd_header* h = chd_get_header(chd);
+        hunk_bytes = h->hunkbytes, unit_bytes = h->unitbytes, hunks = h->totalhunks;
+        // A CD's units are frames: a sector's 2352 bytes and 96 of subcode.
+        if (unit_bytes != kRawSector + 96 || hunk_bytes == 0 || hunk_bytes % unit_bytes)
+            return fail(name + ": not a CD or GD-ROM image (its units are " + std::to_string(unit_bytes) + " bytes, not 2448)");
+        frames_per_hunk = hunk_bytes / unit_bytes;
+        hunk.resize(hunk_bytes);
+        return {};
+    }
+
+    // Frame `frame`'s first `bytes` bytes into `out`.
+    std::expected<void, std::string> read_frame(uint64_t frame, uint8_t* out, uint32_t bytes) {
+        const uint64_t h = frame / frames_per_hunk;
+        if (h >= hunks) return fail("frame " + std::to_string(frame) + " lies beyond the CHD's end");
+        if (h != hunk_no) {
+            hunk_no = UINT32_MAX;
+            if (const chd_error e = chd_read(chd, static_cast<uint32_t>(h), hunk.data()); e != CHDERR_NONE)
+                return fail("cannot read hunk " + std::to_string(h) + " of the CHD: " + chd_error_string(e));
+            hunk_no = static_cast<uint32_t>(h);
+        }
+        std::memcpy(out, hunk.data() + (frame % frames_per_hunk) * unit_bytes, bytes);
+        return {};
+    }
+};
+
+namespace {
+
+// A raw data sector's header address (BCD minutes, seconds, frames from the
+// disc's start, 150 sectors before sector 0), if it holds a decodable one.
+std::optional<uint32_t> header_address(const uint8_t* raw) {
+    static constexpr uint8_t kSync[12] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0};
+    if (std::memcmp(raw, kSync, sizeof kSync) != 0 || (raw[15] != 1 && raw[15] != 2)) return std::nullopt;
+    const auto bcd = [](uint8_t b) -> std::optional<uint32_t> {
+        if ((b >> 4) > 9 || (b & 15) > 9) return std::nullopt;
+        return (b >> 4) * 10u + (b & 15u);
+    };
+    const auto m = bcd(raw[12]), s = bcd(raw[13]), f = bcd(raw[14]);
+    if (!m || !s || !f || *s >= 60 || *f >= 75) return std::nullopt;
+    const uint32_t msf = (*m * 60 + *s) * 75 + *f;
+    if (msf < 150) return std::nullopt;
+    return msf - 150;
+}
+
+// A GD-ROM's .chd: its track list (GDROM_TRACK_METADATA_TAG, one entry a
+// track: its type, frames, padding and pregap), each track's frames padded
+// to a multiple of 4 in the file. Each raw data track is then placed where
+// its sectors' headers say it is (the first readable header in its first
+// 1,000 sectors, after any blank pregap).
+std::expected<GdRom, std::string> open_chd(const std::filesystem::path& path) {
+    const std::string name = utf8_path(path.filename());
+    GdChd chd;
+    if (auto r = chd.open(path); !r) return std::unexpected(r.error());
+    GdRom disc;
+    disc.chd = path;
+    uint64_t frame = 0;  // in the CHD
+    uint32_t next = 0;   // on the disc
+    for (uint32_t i = 0;; ++i) {
+        char meta[512] = {};
+        uint32_t length = 0;
+        if (chd_get_metadata(chd.chd, GDROM_TRACK_METADATA_TAG, i, meta, sizeof meta - 1, &length, nullptr, nullptr) != CHDERR_NONE) {
+            if (i == 0) {
+                const bool cd = chd_get_metadata(chd.chd, CDROM_TRACK_METADATA2_TAG, 0, meta, sizeof meta - 1, &length, nullptr, nullptr) == CHDERR_NONE ||
+                                chd_get_metadata(chd.chd, CDROM_TRACK_METADATA_TAG, 0, meta, sizeof meta - 1, &length, nullptr, nullptr) == CHDERR_NONE;
+                return fail(name + (cd ? ": a CD's image, not a GD-ROM's (make it from the .gdi or .cue with chdman createcd)"
+                                       : ": no GD-ROM track list (not a disc image?)"));
+            }
+            break;
+        }
+        meta[std::min<size_t>(length, sizeof meta - 1)] = 0;
+        unsigned n = 0, frames = 0, pad = 0, pregap = 0, postgap = 0;
+        char type[32] = {}, subtype[32] = {}, pgtype[32] = {}, pgsub[32] = {};
+        if (std::sscanf(meta, "TRACK:%u TYPE:%31s SUBTYPE:%31s FRAMES:%u PAD:%u PREGAP:%u PGTYPE:%31s PGSUB:%31s POSTGAP:%u", &n, type, subtype,
+                        &frames, &pad, &pregap, pgtype, pgsub, &postgap) != 9)
+            return fail(name + ": track " + std::to_string(i + 1) + "'s description is malformed");
+        if (n != i + 1) return fail(name + ": tracks are not numbered in order");
+        GdTrack t;
+        t.number = n;
+        const std::string_view kind = type;
+        if (kind == "AUDIO") t.data = false, t.swapped = true, t.sector_size = kRawSector;  // CD audio is kept big-endian in a CHD
+        else if (kind == "MODE1") t.data = true, t.sector_size = kSectorData;
+        else if (kind == "MODE1_RAW") t.data = true, t.sector_size = kRawSector;
+        else return fail(name + ": track " + std::to_string(n) + " is " + type + ", which is not supported");
+        if (frames == 0 || frames > 600000) return fail(name + ": track " + std::to_string(n) + " has " + std::to_string(frames) + " frames");
+        t.high_density = n >= 3;
+        if (n == 3) next = kHighDensityStart;
+        // A pregap is either in the track's frames ('V' types) or not stored.
+        const bool stored = pgtype[0] == 'V';
+        if (stored && pregap >= frames) return fail(name + ": track " + std::to_string(n) + "'s pregap is longer than it");
+        t.start = next + (stored ? 0 : pregap);
+        t.sectors = frames;
+        t.chd_frame = static_cast<uint32_t>(frame);
+        frame += uint64_t{frames} + pad;
+        if (frame > uint64_t{chd.hunks} * chd.frames_per_hunk) return fail(name + ": its tracks run beyond its data");
+        next = t.end() + postgap;
+        disc.tracks.push_back(t);
+    }
+    for (GdTrack& t : disc.tracks) {
+        if (!t.data || t.sector_size != kRawSector) continue;
+        uint8_t raw[kRawSector];
+        const uint32_t scan = std::min<uint32_t>(t.sectors, 1000);
+        for (uint32_t k = 0; k < scan; ++k) {
+            if (auto r = chd.read_frame(uint64_t{t.chd_frame} + k, raw, kRawSector); !r) return std::unexpected(r.error());
+            const auto address = header_address(raw);
+            if (!address) continue;
+            if (*address < k) return fail(name + ": track " + std::to_string(t.number) + "'s sector headers are malformed");
+            t.start = *address - k;
+            break;
+        }
+    }
+    for (size_t i = 1; i < disc.tracks.size(); ++i) {
+        const GdTrack& a = disc.tracks[i - 1];
+        const GdTrack& b = disc.tracks[i];
+        if (a.high_density == b.high_density && b.start < a.end())
+            return fail(name + ": tracks " + std::to_string(a.number) + " and " + std::to_string(b.number) + " overlap");
+        if (b.end() > 600000) return fail(name + ": track " + std::to_string(b.number) + " runs past a GD-ROM's end");
     }
     return disc;
 }
@@ -249,13 +404,25 @@ std::expected<void, std::string> walk(const GdRom& disc, uint32_t sector, uint32
 
 }  // namespace
 
-std::expected<GdRom, std::string> GdRom::open(const std::filesystem::path& image) {
-    std::string ext = image.extension().string();
+namespace {
+std::string lower_extension(const std::filesystem::path& p) {
+    std::string ext = utf8_path(p.extension());
     std::ranges::transform(ext, ext.begin(), [](char c) { return c >= 'A' && c <= 'Z' ? char(c - 'A' + 'a') : c; });
-    if (ext != ".cue" && ext != ".gdi") return fail(image.string() + ": not a .cue or .gdi disc image");
-    std::expected<GdRom, std::string> disc = ext == ".cue" ? open_cue(image) : open_gdi(image);
+    return ext;
+}
+}  // namespace
+
+bool GdRom::is_image(const std::filesystem::path& path) {
+    const std::string ext = lower_extension(path);
+    return ext == ".cue" || ext == ".gdi" || ext == ".chd";
+}
+
+std::expected<GdRom, std::string> GdRom::open(const std::filesystem::path& image) {
+    const std::string ext = lower_extension(image);
+    if (!is_image(image)) return fail(utf8_path(image) + ": not a .cue, .gdi or .chd disc image");
+    std::expected<GdRom, std::string> disc = ext == ".cue" ? open_cue(image) : ext == ".gdi" ? open_gdi(image) : open_chd(image);
     if (!disc) return disc;
-    const std::string where = image.string();
+    const std::string where = utf8_path(image);
     if (disc->tracks.size() < 3) return fail(where + ": fewer than three tracks: not a GD-ROM");
     const GdTrack& first = disc->tracks[2];
     if (!first.high_density || first.start != kHighDensityStart || !first.data)
@@ -269,7 +436,25 @@ namespace {
 // Positions `r` at sector `s` of the track holding it, opening the track's file only when it is
 // another file and seeking only when the read isn't of the next sector.
 enum class Seek { ok, nowhere, wrong_kind, cannot_open };
-Seek seek(const std::vector<GdTrack>& tracks, GdReader& r, uint32_t s, bool data) {
+// A .chd's reader opens the image once and reads it by frame (read_stored).
+Seek seek(const GdRom& disc, GdReader& r, uint32_t s, bool data) {
+    const std::vector<GdTrack>& tracks = disc.tracks;
+    if (!disc.chd.empty()) {
+        if (r.track >= tracks.size() || s < tracks[r.track].start || s >= tracks[r.track].end()) {
+            size_t found = SIZE_MAX;
+            for (size_t k = 0; k < tracks.size(); ++k)
+                if (s >= tracks[k].start && s < tracks[k].end()) found = k;
+            if (found == SIZE_MAX) return Seek::nowhere;
+            if (tracks[found].data != data) return Seek::wrong_kind;
+            r.track = found;
+        }
+        if (!r.chd) {
+            auto chd = std::make_shared<GdChd>();
+            if (!chd->open(disc.chd)) return Seek::cannot_open;
+            r.chd = std::move(chd);
+        }
+        return Seek::ok;
+    }
     if (r.track >= tracks.size() || s < tracks[r.track].start || s >= tracks[r.track].end()) {
         size_t found = SIZE_MAX;
         for (size_t k = 0; k < tracks.size(); ++k)
@@ -302,6 +487,32 @@ unsigned track_number(const std::vector<GdTrack>& tracks, uint32_t s) {
         if (s >= t.start && s < t.end()) return t.number;
     return 0;
 }
+
+// What a reader reads from: the .chd, or its track's file (UTF-8, for messages).
+std::string source(const GdRom& disc, const GdReader& r) {
+    if (!disc.chd.empty()) return utf8_path(disc.chd.filename());
+    return r.track < disc.tracks.size() ? utf8_path(disc.tracks[r.track].file.filename()) : std::string("the image");
+}
+
+// Sector `s` as stored (its track's sector_size bytes) into `out`, from where seek put `r`.
+std::expected<void, std::string> read_stored(const GdRom& disc, GdReader& r, uint32_t s, uint8_t* out) {
+    const GdTrack& t = disc.tracks[r.track];
+    if (r.chd) {
+        if (auto ok = r.chd->read_frame(uint64_t{t.chd_frame} + (s - t.start), out, t.sector_size); !ok) {
+            r.close();
+            return fail("sector " + std::to_string(s) + ": " + ok.error());
+        }
+        return {};
+    }
+    r.file.read(reinterpret_cast<char*>(out), t.sector_size);
+    if (!r.file) {
+        const std::string file = source(disc, r);
+        r.close();
+        return fail("cannot read sector " + std::to_string(s) + " from " + file);
+    }
+    r.next = s + 1;
+    return {};
+}
 }  // namespace
 
 std::expected<std::vector<int16_t>, std::string> GdRom::read_audio(uint32_t sector, uint32_t count) const {
@@ -310,25 +521,22 @@ std::expected<std::vector<int16_t>, std::string> GdRom::read_audio(uint32_t sect
     uint8_t raw[kRawSector];
     for (uint32_t n = 0; n < count; ++n, ++sector) {
         const std::string name = "sector " + std::to_string(sector);
-        switch (seek(tracks, audio_, sector, false)) {
+        switch (seek(*this, audio_, sector, false)) {
         case Seek::ok: break;
         case Seek::nowhere: return fail(name + " is not on the disc");
         case Seek::wrong_kind: return fail(name + " is in data track " + std::to_string(track_number(tracks, sector)));
         case Seek::cannot_open: {
-            const std::string file = tracks[audio_.track].file.string();
+            const std::string file = chd.empty() ? utf8_path(tracks[audio_.track].file) : utf8_path(chd);
             audio_.close();
             return fail("cannot open " + file);
         }
         }
-        const GdTrack& track = tracks[audio_.track];
-        audio_.file.read(reinterpret_cast<char*>(raw), kRawSector);
-        if (!audio_.file) {
-            const std::string file = track.file.filename().string();
-            audio_.close();
-            return fail("cannot read " + name + " from " + file);
-        }
-        audio_.next = sector + 1;
-        for (uint32_t k = 0; k < kRawSector; k += 2) out.push_back(static_cast<int16_t>(raw[k] | raw[k + 1] << 8));
+        const bool swapped = tracks[audio_.track].swapped;
+        if (auto ok = read_stored(*this, audio_, sector, raw); !ok) return std::unexpected(ok.error());
+        if (swapped)
+            for (uint32_t k = 0; k < kRawSector; k += 2) out.push_back(static_cast<int16_t>(raw[k] << 8 | raw[k + 1]));
+        else
+            for (uint32_t k = 0; k < kRawSector; k += 2) out.push_back(static_cast<int16_t>(raw[k] | raw[k + 1] << 8));
     }
     return out;
 }
@@ -338,48 +546,39 @@ std::expected<void, std::string> GdRom::read(uint32_t sector, uint32_t count, st
     uint8_t raw[kRawSector];
     for (uint32_t i = 0; i < count; ++i) {
         const uint32_t s = sector + i;
-        switch (seek(tracks, data_, s, true)) {
+        switch (seek(*this, data_, s, true)) {
         case Seek::ok: break;
         case Seek::nowhere: return fail("sector " + std::to_string(s) + " isn't in any track of the image");
         case Seek::wrong_kind:
             return fail("sector " + std::to_string(s) + " is in audio track " + std::to_string(track_number(tracks, s)));
         case Seek::cannot_open: {
-            const std::string file = tracks[data_.track].file.string();
+            const std::string file = chd.empty() ? utf8_path(tracks[data_.track].file) : utf8_path(chd);
             data_.close();
             return fail("cannot open " + file);
         }
         }
         const GdTrack& track = tracks[data_.track];
-        std::ifstream& f = data_.file;
         uint8_t* dest = out.data() + size_t(i) * kSectorData;
         if (track.sector_size == kSectorData) {
-            f.read(reinterpret_cast<char*>(dest), kSectorData);
-        } else {
-            f.read(reinterpret_cast<char*>(raw), kRawSector);
-            if (f) {
-                // A raw sector says what it is and where it is: check both,
-                // which also proves the track layout worked out above.
-                static constexpr uint8_t kSync[12] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0};
-                const std::string name = "sector " + std::to_string(s) + " (track " + std::to_string(track.number) + ")";
-                std::string wrong;
-                if (std::memcmp(raw, kSync, sizeof kSync) != 0) wrong = name + " has no sync pattern";
-                else if (raw[15] != 1) wrong = name + " isn't a Mode 1 sector";
-                else if (const uint32_t address = (from_bcd(raw[12]) * 60 + from_bcd(raw[13])) * 75 + from_bcd(raw[14]); address != s + 150)
-                    wrong = name + " carries the address of sector " + std::to_string(int64_t(address) - 150) +
-                            ": the image's track layout isn't what it says";
-                if (!wrong.empty()) {
-                    data_.close();
-                    return fail(wrong);
-                }
-                std::memcpy(dest, raw + kRawHeader, kSectorData);
-            }
+            if (auto ok = read_stored(*this, data_, s, dest); !ok) return std::unexpected(ok.error());
+            continue;
         }
-        if (!f) {
-            const std::string file = track.file.string();
+        if (auto ok = read_stored(*this, data_, s, raw); !ok) return std::unexpected(ok.error());
+        // A raw sector says what it is and where it is: check both,
+        // which also proves the track layout worked out above.
+        static constexpr uint8_t kSync[12] = {0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0};
+        const std::string name = "sector " + std::to_string(s) + " (track " + std::to_string(track.number) + ")";
+        std::string wrong;
+        if (std::memcmp(raw, kSync, sizeof kSync) != 0) wrong = name + " has no sync pattern";
+        else if (raw[15] != 1) wrong = name + " isn't a Mode 1 sector";
+        else if (const uint32_t address = (from_bcd(raw[12]) * 60 + from_bcd(raw[13])) * 75 + from_bcd(raw[14]); address != s + 150)
+            wrong = name + " carries the address of sector " + std::to_string(int64_t(address) - 150) +
+                    ": the image's track layout isn't what it says";
+        if (!wrong.empty()) {
             data_.close();
-            return fail("cannot read sector " + std::to_string(s) + " from " + file);
+            return fail(wrong);
         }
-        data_.next = s + 1;
+        std::memcpy(dest, raw + kRawHeader, kSectorData);
     }
     return {};
 }

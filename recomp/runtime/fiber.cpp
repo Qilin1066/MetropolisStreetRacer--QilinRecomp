@@ -29,7 +29,7 @@ namespace qilin::rt {
 
 namespace {
 thread_local Fiber* t_current = nullptr;
-thread_local Fiber* t_from = nullptr;  // the fiber the last switch left
+[[maybe_unused]] thread_local Fiber* t_from = nullptr;  // the fiber the last switch left (not on Windows)
 
 // AddressSanitizer must be told of every switch, with the bounds of the stack
 // switched to. Those of the thread's own stack are learnt the first time it

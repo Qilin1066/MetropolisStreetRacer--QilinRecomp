@@ -13,6 +13,10 @@ project(MetropolisStreetRacerQilinRecomp VERSION 0.9.4 LANGUAGES C CXX)  # C: SD
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+# No C++ modules anywhere: without this, Ninja builds scan every C++ source
+# for them with clang-scan-deps, which zig's Clang (a Windows PC without LLVM,
+# as Toy Commander's CLAUDE.md describes) doesn't have.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
@@ -35,6 +39,7 @@ if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 endif()
 
 option(QILIN_WERROR "Treat warnings in our own code as errors" OFF)
+option(QILIN_REQUIRE_LAUNCHER_TESTS "Require the launcher's build test (CI): a native build, not a cross-compile" OFF)
 
 # ---- Warnings for our own targets ----
 add_library(qilin_warnings INTERFACE)
@@ -70,14 +75,47 @@ target_include_directories(qilin_file_store_test PRIVATE recomp/runtime)
 target_link_libraries(qilin_file_store_test PRIVATE qilin_file_store qilin_warnings)
 add_test(NAME qilin_file_store_test COMMAND qilin_file_store_test)
 
+# ---- libchdr (BSD-3-Clause): reading .chd disc images ----
+# As Toy Commander--QilinRecomp has it: v0.3.0, fetched and pinned, built
+# statically with what it bundles: LZMA (public domain), miniz (Unlicense),
+# zstd's decompressor (taken under its BSD licence) and dr_flac (public
+# domain). Its own CMake project is added by hand (SOURCE_SUBDIR points
+# nowhere) so its test programs stay out of the build.
+include(FetchContent)
+FetchContent_Declare(libchdr
+    URL https://github.com/rtissera/libchdr/archive/93d8c239ff0d4e8d7722985992649fce12d2463b.tar.gz
+    URL_HASH SHA256=f38fb1b3e907c8927271a57ad6e3c02347eaa2d5803f910880b4b3c3021b3657
+    SOURCE_SUBDIR no-cmake)
+FetchContent_MakeAvailable(libchdr)
+set(qilin_saved_shared ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
+set(WITH_SYSTEM_ZLIB OFF CACHE BOOL "" FORCE)
+set(WITH_SYSTEM_ZSTD OFF CACHE BOOL "" FORCE)
+set(WITH_LZMA_ASM OFF CACHE BOOL "" FORCE)  # plain C: no assembler needed on any target
+add_subdirectory(${libchdr_SOURCE_DIR} ${libchdr_BINARY_DIR} EXCLUDE_FROM_ALL SYSTEM)
+set(BUILD_SHARED_LIBS ${qilin_saved_shared})
+set(QILIN_CHDR_LIBRARIES chdr-static chdr-lzma miniz zstd)
+foreach(library IN LISTS QILIN_CHDR_LIBRARIES)
+    set_target_properties(${library} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    if(MSVC)
+        target_compile_options(${library} PRIVATE /W0)  # third-party code: its warnings aren't ours
+    else()
+        target_compile_options(${library} PRIVATE -w)
+    endif()
+endforeach()
+
 # ---- Disc image, IP.BIN and boot-file loaders: runtime code too (no std::format) ----
 add_library(qilin_disc STATIC recomp/src/gdrom.cpp recomp/src/bootfile.cpp recomp/src/sha256.cpp)
-target_include_directories(qilin_disc PUBLIC recomp/src)
-target_link_libraries(qilin_disc PRIVATE qilin_warnings)
+target_include_directories(qilin_disc PUBLIC recomp/src recomp/runtime)  # recomp/runtime: path.hpp, command_line.hpp
+target_link_libraries(qilin_disc PRIVATE chdr-static qilin_warnings)
+if(WIN32)
+    target_link_libraries(qilin_disc PUBLIC shell32)  # CommandLineToArgvW (command_line.hpp)
+endif()
 
 # ---- Recompiler core ----
 add_library(qilin_core STATIC
     recomp/src/report.cpp
+    recomp/src/identify.cpp
     recomp/src/decoder.cpp
     recomp/src/cfg.cpp
     recomp/src/lifter.cpp
@@ -92,6 +130,17 @@ add_executable(qilin recomp/src/main.cpp)
 target_link_libraries(qilin PRIVATE qilin_core qilin_warnings)
 qilin_tool(qilin)
 target_compile_definitions(qilin PRIVATE QILIN_VERSION="${PROJECT_VERSION}")
+
+# The downloads' launcher (tools/player-kit/launcher, the same files in every
+# project: ADOPTING.md there): its core and tests here, its program further
+# down (qilin_launcher_program, where SDL3 and Dear ImGui are known). Its
+# build test runs the real build with stand-in children, and qilin's identify.
+enable_testing()
+if(QILIN_REQUIRE_LAUNCHER_TESTS AND CMAKE_CROSSCOMPILING)
+    message(FATAL_ERROR "the launcher's build test needs a native build")
+endif()
+set(QILIN_LAUNCHER_QILIN qilin)
+include(tools/player-kit/launcher/launcher.cmake)
 
 # ---- What lifted code runs on: header-only, plus the dispatch table lookup ----
 add_library(qilin_runtime INTERFACE)
@@ -109,10 +158,15 @@ add_library(qilin_platform STATIC recomp/runtime/memory.cpp recomp/runtime/fiber
 target_include_directories(qilin_platform PUBLIC recomp/runtime)
 target_link_libraries(qilin_platform PRIVATE qilin_warnings)
 if(WIN32)
-    target_link_libraries(qilin_platform PRIVATE onecore)  # VirtualAlloc2, MapViewOfFile3 (Windows 10 1803+)
+    # VirtualAlloc2, MapViewOfFile3, UnmapViewOfFile2 (Windows 10 1803+) are
+    # found at run time (memory.cpp): no import library. MinGW's headers
+    # declare them from Windows 10 1803 (RS4) only, which newer releases
+    # (llvm-mingw's) don't assume by default.
+    if(NOT MSVC)
+        target_compile_definitions(qilin_platform PRIVATE NTDDI_VERSION=0x0A000005)
+    endif()
 endif()
 
-enable_testing()
 find_package(Threads REQUIRED)
 add_executable(dreamcast_clock_test dreamcast/tests/clock_test.cpp dreamcast/src/clock.cpp)
 target_include_directories(dreamcast_clock_test PRIVATE dreamcast/src)
@@ -143,6 +197,15 @@ if(QILIN_HOST)
     FetchContent_Declare(volk GIT_REPOSITORY https://github.com/zeux/volk GIT_TAG vulkan-sdk-1.4.363.0 GIT_SHALLOW ON
                          SOURCE_SUBDIR no-cmake)
     FetchContent_MakeAvailable(SDL3 VulkanHeaders volk)
+    # SDL's Wayland protocol headers, made from its own XML, before the
+    # system's (as Toy Commander's): SDL adds them as a system folder, and
+    # zig's compiler (the Linux download's) searches the system's
+    # /usr/include first, whose older wayland-client-protocol.h lacks what SDL
+    # uses (WL_KEYBOARD_KEY_STATE_REPEATED). SDL includes them in quotes, and
+    # -iquote folders come before every -I and -isystem one.
+    if(TARGET SDL3-static AND EXISTS "${sdl3_BINARY_DIR}/wayland-generated-protocols" AND NOT MSVC)
+        target_compile_options(SDL3-static BEFORE PRIVATE "-iquote${sdl3_BINARY_DIR}/wayland-generated-protocols")
+    endif()
     add_library(qilin_volk STATIC ${volk_SOURCE_DIR}/volk.c)
     target_include_directories(qilin_volk PUBLIC ${volk_SOURCE_DIR})
     target_link_libraries(qilin_volk PUBLIC Vulkan::Headers ${CMAKE_DL_LIBS})
@@ -274,6 +337,25 @@ if(QILIN_HOST)
     target_link_libraries(qilin_audio_callback_test PRIVATE qilin_host SDL3::SDL3-static qilin_warnings)
     add_test(NAME qilin_audio_callback_test COMMAND qilin_audio_callback_test)
     set_tests_properties(qilin_audio_callback_test PROPERTIES ENVIRONMENT "SDL_AUDIODRIVER=dummy;SDL_AUDIO_DEVICE_SAMPLE_FRAMES=128" TIMEOUT 25)
+
+    # The downloads' launcher, `Play Metropolis Street Racer` (Windows: .exe;
+    # macOS: the app's program), which reads kit/game.txt
+    # (tools/player-kit/launcher/launcher.cmake).
+    qilin_launcher_program(IMGUI_DIR ${imgui_SOURCE_DIR} LIBRARIES qilin_imgui qilin_volk SDL3::SDL3-static Threads::Threads)
+    if(WIN32)
+        # The launcher's icon for the game too, which the player's PC links
+        # (the player kit's icon.o; QILIN_WINDOWS_RESOURCES is launcher.cmake's).
+        if(QILIN_WINDOWS_RESOURCES)
+            add_library(qilin_game_icon OBJECT tools/player-kit/game_icon.rc)
+        elseif(QILIN_PLAYER_KIT)
+            message(FATAL_ERROR "the player kit needs QILIN_WINDOWS_RESOURCES=ON (the game's icon)")
+        endif()
+    endif()
+endif()
+
+# The macOS download's parts (tools/player-kit/macos.cmake): the universal kit.
+if(APPLE)
+    include(tools/player-kit/macos.cmake)
 endif()
 
 # ---- The port: the hardware and system software the game runs on (msr/src),
@@ -287,11 +369,138 @@ else()
     target_include_directories(msr_port PRIVATE dreamcast/src)
 endif()
 
-# Compile the movie and sound-CPU integration in CI without requiring game-derived lifts.
-# These objects are not linked into the game; its executable compiles them normally.
+# ---- The game's program without the lifted code (msr_game) ----
+# The program players run (msr/src/main.cpp and the game's side), the runtime
+# lifted code calls (dispatch, system, bus) and everything they link: built
+# whether or not lifted code is here, and linked with stand-ins for it
+# (msr_link_check, tools/player-kit/link_check.cpp), so CI checks the whole
+# program with every compiler. The game is msr_game plus the lifted code
+# (QILIN_GEN_DIR below), and the player kit is msr_game in one archive.
+# During the bring-up: each access notes its instruction, so a stop names it
+# (docs/runtime.md). The lifted code is compiled with the same definitions
+# (msr_game's, and the player kit's build-flags.txt).
+option(QILIN_BRINGUP "Note the guest instruction of each access in the game build" ON)
+option(QILIN_PLAYER_KIT "Build the player kit (tools/player-kit): the game's program without the lifted code as one archive, for the downloads" OFF)
+
+# ---- The player kit: the downloads (tools/player-kit, as Toy Commander's) ----
+# Everything but the lifted code in one archive (libmsr_kit.a): msr_game (as msr_game_archive) and
+# all it links, SDL3 included. Beside it the runtime's headers, the recompiler,
+# and build-flags.txt: how the player's computer compiles and links the code it
+# lifts from its own disc (tools/player-kit/launcher/build.cpp reads it).
+# Windows: cross-compiled on Linux with llvm-mingw (tools/player-kit/package.sh).
+# Linux: built with the zig the download bundles, so the library's libc++ is
+# the one the player's compiles link with (package-linux.sh). macOS:
+# universal, merged by Apple's libtool (tools/player-kit/macos.cmake).
+# The lifted code's flags: what qilin_runtime and msr_game give it here, so
+# both sides of the link agree (QILIN_BRINGUP changes guest.hpp's accesses).
+set(QILIN_KIT_LIBRARIES msr_game_archive msr_port dreamcast_hw dreamcast_menu qilin_host qilin_imgui qilin_volk qilin_pl_mpeg
+                        qilin_disc ${QILIN_CHDR_LIBRARIES} qilin_platform qilin_file_store SDL3-static)
+set(QILIN_KIT_CXXFLAGS -ffp-contract=off -fno-fast-math -frounding-math)
+if(QILIN_BRINGUP)
+    list(APPEND QILIN_KIT_CXXFLAGS -DQILIN_BRINGUP)
+endif()
+function(qilin_player_kit)
+    if(APPLE)
+        qilin_player_kit_macos()  # tools/player-kit/macos.cmake
+        return()
+    endif()
+    if(NOT TARGET SDL3-static)
+        message(FATAL_ERROR "the player kit needs SDL3 built statically (QILIN_HOST=ON)")
+    endif()
+    if(QILIN_WATCH)
+        message(FATAL_ERROR "the player kit is a release build: configure it with -DQILIN_WATCH=OFF")
+    endif()
+    set(kit_archive "${CMAKE_BINARY_DIR}/kit/libmsr_kit.a")
+    set(mri "CREATE ${kit_archive}\n")
+    foreach(library IN LISTS QILIN_KIT_LIBRARIES)
+        string(APPEND mri "ADDLIB $<TARGET_FILE:${library}>\n")
+    endforeach()
+    string(APPEND mri "SAVE\nEND\n")
+    file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/kit/kit.mri" CONTENT "${mri}")
+    add_custom_command(OUTPUT "${kit_archive}"
+        COMMAND "${CMAKE_COMMAND}" "-DAR=${CMAKE_AR}" "-DMRI=${CMAKE_BINARY_DIR}/kit/kit.mri" "-DOUT=${kit_archive}"
+                -P "${CMAKE_SOURCE_DIR}/tools/player-kit/merge.cmake"
+        DEPENDS ${QILIN_KIT_LIBRARIES} "${CMAKE_BINARY_DIR}/kit/kit.mri"
+        COMMENT "Merging the player kit" VERBATIM)
+    add_custom_target(msr_kit ALL DEPENDS "${kit_archive}")
+    string(JOIN " " lifted_text ${QILIN_KIT_CXXFLAGS})
+    if(WIN32)
+        # The system libraries SDL3 and the runtime need (MinGW names).
+        set(kit_system_libraries -lm -lkernel32 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lversion -luuid -ladvapi32
+            -lsetupapi -lshell32 -ldinput8 -lwinspool -lcomdlg32)
+        set(kit_ldflags "-static -O2 -Wl,--stack,8388608")
+        set(kit_icon " $kit/lib/icon.o")
+        set(kit_native "")  # the launcher's default, -march=native
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # SDL3 loads X11, Wayland, the sound servers and Vulkan at run time:
+        # the game links only glibc's own libraries (and zig's libc++).
+        set(kit_system_libraries -lm -ldl -lpthread -lrt)
+        set(kit_ldflags "-O2")
+        set(kit_icon "")
+        # For the player's processor: x86-64's -march, ARM's -mcpu.
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+            set(kit_native "native = -mcpu=native\n")
+        else()
+            set(kit_native "native = -march=native\n")
+        endif()
+    else()
+        message(FATAL_ERROR "no player kit for ${CMAKE_SYSTEM_NAME} yet")
+    endif()
+    string(JOIN " " kit_system_text ${kit_system_libraries})
+    # Read by the launcher (tools/player-kit/launcher/build.cpp): `name = value`
+    # lines, $kit the kit's folder.
+    file(WRITE "${CMAKE_BINARY_DIR}/kit/build-flags.txt"
+        "# Written by CMake for the player kit (QILIN_PLAYER_KIT).\n"
+        "cxxflags = -O2 -DNDEBUG -std=c++23 -w ${lifted_text} -I$kit/include\n"
+        "${kit_native}"
+        "ldflags = ${kit_ldflags}\n"
+        "libs = $kit/lib/libmsr_kit.a${kit_icon} ${kit_system_text}\n")
+    # The kit's archive linked with stand-ins for the lifted code: it's complete.
+    add_executable(msr_kit_link_check tools/player-kit/link_check.cpp)
+    target_include_directories(msr_kit_link_check PRIVATE recomp/runtime)
+    target_compile_options(msr_kit_link_check PRIVATE ${QILIN_KIT_CXXFLAGS})
+    target_link_libraries(msr_kit_link_check PRIVATE "${kit_archive}" ${kit_system_libraries})
+    separate_arguments(kit_ldflags_list UNIX_COMMAND "${kit_ldflags}")  # as the launcher splits them
+    target_link_options(msr_kit_link_check PRIVATE ${kit_ldflags_list})
+    add_dependencies(msr_kit_link_check msr_kit)
+    install(TARGETS qilin RUNTIME DESTINATION kit COMPONENT msr)
+    install(FILES "${kit_archive}" DESTINATION kit/lib COMPONENT msr)
+    if(WIN32)
+        # The game's icon (the launcher's), linked into it on the player's PC.
+        add_dependencies(msr_kit qilin_game_icon)
+        install(FILES $<TARGET_OBJECTS:qilin_game_icon> DESTINATION kit/lib RENAME icon.o COMPONENT msr)
+    endif()
+    install(FILES "${CMAKE_BINARY_DIR}/kit/build-flags.txt" DESTINATION kit COMPONENT msr)
+    file(GLOB kit_headers recomp/runtime/*.hpp)
+    install(FILES ${kit_headers} DESTINATION kit/include COMPONENT msr)
+endfunction()
+
 if(QILIN_HOST)
-    add_library(msr_media_compile OBJECT msr/src/movie.cpp msr/src/sound_cpu.cpp)
-    target_link_libraries(msr_media_compile PRIVATE msr_port qilin_pl_mpeg dreamcast_hw qilin_warnings)
+    find_package(Threads REQUIRED)
+    # An object library: the programs that link it get its objects, so the
+    # layers it calls and that call back into it (dreamcast_hw's calls into
+    # game.cpp) link in any order. msr_game_archive is the same objects as an
+    # archive, for the player kit's.
+    add_library(msr_game OBJECT msr/src/main.cpp msr/src/game.cpp msr/src/sound_cpu.cpp msr/src/movie.cpp
+        recomp/runtime/dispatch.cpp recomp/runtime/system.cpp recomp/runtime/bus.cpp)
+    target_link_libraries(msr_game PUBLIC msr_port dreamcast_hw qilin_pl_mpeg qilin_disc qilin_runtime qilin_platform
+                                          SDL3::SDL3-static Threads::Threads PRIVATE qilin_warnings)
+    if(QILIN_BRINGUP)
+        target_compile_definitions(msr_game PUBLIC QILIN_BRINGUP)
+    endif()
+    if(MSVC)
+        target_link_options(msr_game INTERFACE /STACK:8388608)  # guest recursion runs on the host stack
+    elseif(WIN32)
+        target_link_options(msr_game INTERFACE -Wl,--stack,8388608)
+    endif()
+    add_library(msr_game_archive STATIC $<TARGET_OBJECTS:msr_game>)
+    add_executable(msr_link_check tools/player-kit/link_check.cpp)
+    target_link_libraries(msr_link_check PRIVATE msr_game)
+    if(QILIN_PLAYER_KIT)
+        qilin_player_kit()
+    endif()
+elseif(QILIN_PLAYER_KIT)
+    message(FATAL_ERROR "the player kit needs the host layer (QILIN_HOST)")
 endif()
 
 # ---- Lifted code (optional): the output of `qilin lift`, which is derived
@@ -316,22 +525,6 @@ if(QILIN_GEN_DIR)
         target_link_options(qilin_difftest PRIVATE /STACK:16777216)
     endif()
 
-    # The game: the lifted code built for speed (RAM as the fast path, the rest
-    # through the bus), and the program players run (msr/src).
-    add_library(qilin_gen STATIC ${QILIN_GEN_SOURCES} recomp/runtime/dispatch.cpp recomp/runtime/system.cpp
-        recomp/runtime/bus.cpp)
-    target_include_directories(qilin_gen PUBLIC "${QILIN_GEN_DIR}")
-    target_link_libraries(qilin_gen PUBLIC qilin_runtime qilin_platform PRIVATE qilin_warnings)
-    if(MSVC)
-        # C4702 (unreachable code): lifted code calls guest functions that never return (they
-        # stop, or loop for ever), and the code after such a call is still emitted.
-        target_compile_options(qilin_gen PRIVATE /wd4702)
-    endif()
-    # During the bring-up: each access notes its instruction, so a stop names it (docs/runtime.md).
-    option(QILIN_BRINGUP "Note the guest instruction of each access in the game build" ON)
-    if(QILIN_BRINGUP)
-        target_compile_definitions(qilin_gen PUBLIC QILIN_BRINGUP)
-    endif()
     # Development: QILIN_WATCH=<from>-<to> logs the instructions storing into that range (guest.hpp).
     option(QILIN_WATCH "Let QILIN_WATCH log stores into a range of guest memory (slower; development only)" OFF)
     if(QILIN_WATCH)
@@ -347,10 +540,15 @@ if(QILIN_GEN_DIR)
     if(NOT EXISTS "${QILIN_GEN_DIR}/arm_table.cpp")
         message(FATAL_ERROR "${QILIN_GEN_DIR} has no lifted sound driver: run qilin armlift <disc>/SOUND/MANATEE.DRV --out ${QILIN_GEN_DIR}")
     endif()
-    add_executable(msr msr/src/main.cpp msr/src/game.cpp msr/src/sound_cpu.cpp msr/src/movie.cpp)
-    target_link_libraries(msr PRIVATE msr_port dreamcast_hw qilin_pl_mpeg qilin_gen qilin_disc SDL3::SDL3-static qilin_warnings)
+    # The game: the lifted code built for speed (RAM as the fast path, the rest
+    # through the bus), linked with the program players run (msr_game).
+    add_executable(msr ${QILIN_GEN_SOURCES})
+    target_include_directories(msr PRIVATE "${QILIN_GEN_DIR}")
+    target_link_libraries(msr PRIVATE msr_game qilin_warnings)
     if(MSVC)
-        target_link_options(msr PRIVATE /STACK:8388608)  # guest recursion runs on the host stack
+        # C4702 (unreachable code): lifted code calls guest functions that never return (they
+        # stop, or loop for ever), and the code after such a call is still emitted.
+        target_compile_options(msr PRIVATE /wd4702)
     endif()
 endif()
 
