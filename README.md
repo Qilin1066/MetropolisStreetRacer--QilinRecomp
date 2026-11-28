@@ -2,7 +2,7 @@
 
 A static recompilation of **Metropolis Street Racer** (Bizarre Creations / Sega, Dreamcast, 2000) into portable C++23 with a Vulkan 1.3 renderer, for 64-bit Windows, Linux and macOS on x86-64 or ARM64. Any GPU with a Vulkan 1.3 driver is in scope, down to the Raspberry Pi 4 (Mesa 24.3+). Macs run it through MoltenVK (macOS 10.15 or later).
 
-> **No game data is included, and none ever will be.** You need your own copy of the game: the North American disc (`MK-51012`, `V1.010`). The tools read the disc image, or its extracted files, from a path you give them.
+> **No game data is included, and none ever will be.** You need your own copy of the game: the North American disc (`MK-51012`, `V1.010`), as a Redump-style `.cue` with its `.bin` tracks, a `.gdi` or a `.chd`. The tools read the disc image, or its extracted files, from a path you give them.
 
 ## Status
 
@@ -10,7 +10,7 @@ The game boots through its title cards to the title screen and the attract demo,
 
 | Part | State |
 |---|---|
-| Disc reader (Redump CUE + BIN, GDI; ISO 9660), IP.BIN and boot-file loader | ✅ every raw sector's address checked; the launcher and the game recognised by SHA-256 |
+| Disc reader (Redump CUE + BIN, GDI, CHD; ISO 9660), IP.BIN and boot-file loader | ✅ every raw sector's address checked; the launcher and the game recognised by SHA-256 |
 | SH-4 decoder (all 209 forms of the SH7091) | ✅ 0 unexplained differences with GNU binutils over all 65,536 words and every word of the game |
 | Function discovery and control flow | ✅ 5,309 functions, 25 jump tables, 99.9% of bytes accounted for (870 unknown) |
 | Floating-point mode analysis | ✅ 1,497 of 1,507 functions proven; the other 10 read the mode at run time |
@@ -23,7 +23,18 @@ The game boots through its title cards to the title screen and the attract demo,
 
 ## Playing
 
-There is no download: the game is built from your own disc, with the toolchain in [Building](#building). Unpack the image so the `.cue` (or `.gdi`) and its tracks are in one folder, then:
+Each release has a download for Windows, Linux (x86-64, and ARM64 for a Raspberry Pi 4 or 5 on the 64-bit Raspberry Pi OS) and macOS (Apple silicon and Intel) on the [Releases](https://github.com/Qilin1066/MetropolisStreetRacer--QilinRecomp/releases) page: `MetropolisStreetRacer--QilinRecomp-X.Y.Z-windows-x64.zip`, `-linux-x86_64.tar.gz`, `-linux-arm64.tar.gz` and `-macos.dmg`. None of them holds anything from the game.
+
+1. Unzip it (on a Mac, open the disk image and drag the app onto Applications), then double-click **Play Metropolis Street Racer**.
+2. Choose your disc: its `.cue` (with the `.bin` tracks beside it), its `.gdi` or its `.chd`, or drag it onto the window. The window says at once whether it is the right disc (`qilin identify`).
+3. The first start builds the game from it, once: the recompiler takes the game's program (`MSR.BIN`) and its sound driver (`SOUND/MANATEE.DRV`) from the image, lifts both to C++, and the bundled compiler (LLVM-MinGW on Windows, zig on Linux; Apple's own on a Mac, which the app offers to install) builds it with the prebuilt rest of the port. A few minutes on a desktop PC; much longer on a Raspberry Pi.
+4. Click **Play**. The game reads the rest of the disc from the image itself: nothing else is copied.
+
+The download's `README.txt` has the details: what each system needs (Vulkan 1.3 above all), where the logs, saves and settings go, updates, and the first-start warnings Windows and macOS show for unsigned programs. The downloads are built by `.github/workflows/player-kit*.yml` (`tools/player-kit/`, the launcher shared with Toy Commander--QilinRecomp).
+
+### Building it yourself
+
+Unpack the image so the `.cue` (or `.gdi`) and its tracks are in one folder, or use the `.chd`, then:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -124,6 +135,7 @@ Prove the decoders agree with GNU objdump: mnemonic and every operand, and a wor
 | `dreamcast/` | The Dreamcast hardware: PowerVR2 and the Vulkan renderer, sound chip, Maple bus, timers, interrupts, flash, settings and menu, with tests |
 | `host/` | The SDL3 window, Vulkan, audio and pads, SMAA and FSR 1, with tests |
 | `msr/src/` | The `msr` program and this game's port: SH-4 control registers, boot ROM calls, disc drive, clock, sound CPU, launcher replacement, intro movie, ROM font |
+| `tools/player-kit/` | The downloads: the players' launcher (`launcher/`, Toy Commander--QilinRecomp's, copied unchanged), the packaging scripts, their checks and the README templates |
 | `tools/check/` | The SH-4 and ARM decoder checks against GNU objdump |
 | `tools/difftest/` | The differential test: lifted code against the original under QEMU |
 | `tools/` | Shader, SMAA, FSR and ROM-font generators (`build_shaders.py`, `smaa_spirv.sh`, `fsr_spirv.sh`, `make_romfont.py`) |

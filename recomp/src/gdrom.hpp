@@ -13,10 +13,16 @@
 //    sheet without them is refused. Each BIN holds its track's pregap, so the
 //    files of an area follow one another on the disc without gaps.
 //  - GDI: a text file with one line per track, giving its start sector.
+//  - CHD: MAME's compressed format (chdman createcd from a .gdi or .cue),
+//    read with libchdr. Its GD-ROM track list gives each track's frames; a
+//    raw data track is placed by its sectors' own addresses, as Toy
+//    Commander--QilinRecomp's reader does (pregaps are kept or dropped
+//    differently by different tools).
 //
 // Data tracks may be raw (2352 bytes a sector, Mode 1: checked on every
 // read) or cooked (2048 bytes a sector).
 //
+// Paths are UTF-8 in messages and in the sheets (recomp/runtime/path.hpp).
 // Runtime code: no std::format (see CMakeLists.txt).
 #pragma once
 
@@ -24,6 +30,7 @@
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -42,10 +49,14 @@ struct GdTrack {
     uint32_t sectors = 0;
     uint32_t sector_size = 0;   // bytes a sector in the file: 2352 or 2048
     uint64_t file_offset = 0;   // where the track starts in the file
-    std::filesystem::path file;
+    std::filesystem::path file; // empty in a .chd
+    uint32_t chd_frame = 0;     // .chd: the frame holding sector `start`
+    bool swapped = false;       // .chd: audio samples stored big-endian
 
     uint32_t end() const { return start + sectors; }
 };
+
+struct GdChd;  // a .chd open for reading (gdrom.cpp)
 
 struct GdFile {
     std::string path;     // "1ST_READ.BIN", "SOUND/TOKYO.AFS": '/' separated, version suffix removed
@@ -58,6 +69,7 @@ struct GdFile {
 // starts with none open.
 struct GdReader {
     std::ifstream file;
+    std::shared_ptr<GdChd> chd;  // a .chd's: opened at the first read, kept with its last hunk
     size_t track = SIZE_MAX;  // the open file's track (an index into GdRom::tracks); SIZE_MAX: none
     uint32_t next = 0;        // the sector the file is positioned at
     GdReader() = default;
@@ -68,16 +80,20 @@ struct GdReader {
     }
     void close() {
         file = std::ifstream();
+        chd.reset();
         track = SIZE_MAX;
     }
 };
 
 class GdRom {
 public:
-    // Opens a .cue or .gdi (by its extension). Errors come back as a message.
+    // Opens a .cue, .gdi or .chd (by its extension). Errors come back as a message.
     static std::expected<GdRom, std::string> open(const std::filesystem::path& image);
+    // Whether `path` names a kind of image open reads (.cue, .gdi, .chd), by its extension.
+    static bool is_image(const std::filesystem::path& path);
 
     std::vector<GdTrack> tracks;  // in disc order
+    std::filesystem::path chd;    // the .chd the tracks are in, for a disc read from one (else empty)
 
     // The user data of `count` sectors starting at `sector`: 2048 bytes each
     // into `out`. Fails if a sector isn't in a data track, or isn't a Mode 1

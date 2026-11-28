@@ -1,7 +1,14 @@
 // qilin: Metropolis Street Racer static recompiler (work in progress).
 //
-//   qilin disc    <image.cue|.gdi> [--json out.json]   tracks, IP.BIN's fields and the file list (JSON)
-//   qilin extract <image.cue|.gdi> --out <dir>          IP.BIN and every file of the disc, into <dir>
+//   qilin disc    <image.cue|.gdi|.chd> [--json out.json]
+//                                                       tracks, IP.BIN's fields and the file list (JSON)
+//   qilin extract <image.cue|.gdi|.chd> --out <dir> [--file PATH]...
+//                                                       IP.BIN and every file of the disc, into <dir>; with
+//                                                       --file, only the files named (the player kit's steps)
+//   qilin identify <image.cue|.gdi|.chd> --json [--build <title>]
+//                                                       what the disc is, for the players' launcher: one JSON
+//                                                       object on stdout (identify.hpp); exit 0 the supported
+//                                                       build, 3 another (or an unknown version), 2 unreadable
 //   qilin info    <1ST_READ.BIN> [--ip IP.BIN] [--json out.json]
 //                                                       SHA-256, supported build, load address (JSON)
 //   qilin insns   <1ST_READ.BIN> [-o out.txt]           every word of the boot file, decoded
@@ -46,6 +53,9 @@
 #include <vector>
 
 #include "bootfile.hpp"
+#include "command_line.hpp"
+#include "identify.hpp"
+#include "path.hpp"
 #include "cfg.hpp"
 #include "arm/decoder.hpp"
 #include "arm/lifter.hpp"
@@ -71,8 +81,9 @@ int usage() {
     std::print(stderr,
                "qilin " QILIN_VERSION "\n"
                "usage:\n"
-               "  qilin disc    <image.cue|.gdi> [--json out.json]\n"
-               "  qilin extract <image.cue|.gdi> --out <dir>\n"
+               "  qilin disc    <image.cue|.gdi|.chd> [--json out.json]\n"
+               "  qilin extract <image.cue|.gdi|.chd> --out <dir> [--file PATH]...\n"
+               "  qilin identify <image.cue|.gdi|.chd> --json [--build <title>]\n"
                "  qilin info    <1ST_READ.BIN> [--ip IP.BIN] [--json out.json]\n"
                "  qilin insns   <1ST_READ.BIN> [-o out.txt]\n"
                "  qilin disasm  <words.bin> [--base addr] [-o out.txt]\n"
@@ -93,6 +104,7 @@ int usage() {
 struct Args {
     std::string command, input;
     std::optional<std::string> out, json, out_dir, ip;
+    std::vector<std::string> files;  // extract --file: the disc's paths, '/' between folders
     uint32_t base = 0;
     bool list = false;
 };
@@ -123,6 +135,7 @@ Args parse_args(std::span<char*> argv) {
         else if (arg == "--base") a.base = parse_u32(value());
         else if (arg == "--out") a.out_dir = value();
         else if (arg == "--ip") a.ip = value();
+        else if (arg == "--file") a.files.push_back(value());
         else if (arg == "--list") a.list = true;
         else if (arg.starts_with("-")) throw Failure{std::format("unknown option {}", arg)};
         else if (a.input.empty()) a.input = arg;
@@ -140,7 +153,7 @@ T must(std::expected<T, std::string> result, const std::string& context = {}) {
 }
 
 std::vector<uint8_t> read_file(const std::string& path) {
-    std::ifstream f(path, std::ios::binary);
+    std::ifstream f(native_path(path), std::ios::binary);
     if (!f) throw Failure{std::format("cannot open {}", path)};
     std::vector<uint8_t> bytes{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
     if (f.bad()) throw Failure{std::format("cannot read {}", path)};
@@ -148,7 +161,7 @@ std::vector<uint8_t> read_file(const std::string& path) {
 }
 
 void write_text(const std::string& path, const std::string& text) {
-    std::ofstream f(path, std::ios::binary);
+    std::ofstream f(native_path(path), std::ios::binary);
     if (!(f << text) || !f.flush()) throw Failure{std::format("cannot write {}", path)};
 }
 
@@ -157,7 +170,11 @@ class Output {
 public:
     explicit Output(const std::optional<std::string>& path) {
         if (!path) return;
+#ifdef _WIN32
+        file_ = _wfopen(native_path(*path).c_str(), L"w");
+#else
         file_ = std::fopen(path->c_str(), "w");
+#endif
         if (!file_) throw Failure{std::format("cannot write {}", *path)};
     }
     ~Output() {
@@ -191,7 +208,7 @@ struct OpenDisc {
 
 OpenDisc open_disc(const std::string& path) {
     OpenDisc d;
-    d.disc = must(GdRom::open(path));
+    d.disc = must(GdRom::open(native_path(path)));
     d.ip_bin = must(d.disc.system_area(), path);
     d.ip = must(IpBin::parse(d.ip_bin), path);
     d.files = must(d.disc.files(), path);
@@ -209,32 +226,41 @@ int cmd_disc(const Args& a) {
 int cmd_extract(const Args& a) {
     if (!a.out_dir) throw Failure{"extract needs --out <dir>"};
     const OpenDisc d = open_disc(a.input);
-    const std::filesystem::path dir(*a.out_dir);
+    const std::filesystem::path dir = native_path(*a.out_dir);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    if (ec) throw Failure{std::format("cannot create {}", dir.string())};
+    if (ec) throw Failure{std::format("cannot create {}", utf8_path(dir))};
 
     const auto write = [](const std::filesystem::path& p, auto&& fill) {
         std::ofstream f(p, std::ios::binary);
-        if (!f) throw Failure{std::format("cannot write {}", p.string())};
+        if (!f) throw Failure{std::format("cannot write {}", utf8_path(p))};
         fill(f);
-        if (!f.flush()) throw Failure{std::format("cannot write {}", p.string())};
+        if (!f.flush()) throw Failure{std::format("cannot write {}", utf8_path(p))};
     };
-    write(dir / "IP.BIN", [&](std::ofstream& f) {
-        f.write(reinterpret_cast<const char*>(d.ip_bin.data()), static_cast<std::streamsize>(d.ip_bin.size()));
-    });
+    // --file: only the files named (each must be on the disc), and not IP.BIN.
+    std::vector<GdFile> chosen;
+    for (const std::string& want : a.files) {
+        const auto it = std::ranges::find(d.files, want, &GdFile::path);
+        if (it == d.files.end()) throw Failure{std::format("{} isn't on this disc", want)};
+        chosen.push_back(*it);
+    }
+    const std::vector<GdFile>& files = a.files.empty() ? d.files : chosen;
+    if (a.files.empty())
+        write(dir / "IP.BIN", [&](std::ofstream& f) {
+            f.write(reinterpret_cast<const char*>(d.ip_bin.data()), static_cast<std::streamsize>(d.ip_bin.size()));
+        });
 
-    bool boot_file_seen = false;
+    bool boot_file_seen = !a.files.empty();
     uint64_t bytes = 0;
     constexpr uint32_t kChunk = 512;  // sectors a read: 1 MiB
     std::vector<uint8_t> buffer(size_t(kChunk) * kSectorData);
-    for (const GdFile& file : d.files) {
+    for (const GdFile& file : files) {
         // "IP.BIN" is what the system area is written as; a disc file of that name would be lost.
         if (file.path == "IP.BIN") throw Failure{"the disc has a file named IP.BIN in its root"};
         if (file.path == d.ip.boot_file) boot_file_seen = true;
         const std::filesystem::path target = dir / std::filesystem::path(file.path);
         std::filesystem::create_directories(target.parent_path(), ec);
-        if (ec) throw Failure{std::format("cannot create {}", target.parent_path().string())};
+        if (ec) throw Failure{std::format("cannot create {}", utf8_path(target.parent_path()))};
         write(target, [&](std::ofstream& f) {
             uint32_t sector = file.sector;
             for (uint64_t left = file.size; left;) {
@@ -252,13 +278,17 @@ int cmd_extract(const Args& a) {
     }
     if (!boot_file_seen)
         throw Failure{std::format("IP.BIN names the boot file {}, which isn't in the disc's root", d.ip.boot_file)};
-    std::println("{} files, {} bytes, and IP.BIN written to {}", d.files.size(), bytes, dir.string());
-    std::println("boot file: {}", (dir / d.ip.boot_file).string());
+    if (!a.files.empty()) {
+        std::println("{} files, {} bytes, written to {}", files.size(), bytes, utf8_path(dir));
+        return 0;
+    }
+    std::println("{} files, {} bytes, and IP.BIN written to {}", d.files.size(), bytes, utf8_path(dir));
+    std::println("boot file: {}", utf8_path(dir / d.ip.boot_file));
     return 0;
 }
 
 int cmd_info(const Args& a) {
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     std::optional<IpBin> ip;
     if (a.ip) ip = must(IpBin::parse(read_file(*a.ip)), *a.ip);
     const std::string json = to_json(boot, ip ? &*ip : nullptr);
@@ -268,7 +298,7 @@ int cmd_info(const Args& a) {
 }
 
 int cmd_insns(const Args& a) {
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     Output out(a.out);
     list_words(out.get(), boot.image(), boot.base());
     return 0;
@@ -283,7 +313,7 @@ int cmd_disasm(const Args& a) {
 }
 
 int cmd_profile(const Args& a) {
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     std::map<sh4::Op, uint64_t> counts;
     const std::span<const uint8_t> image = boot.image();
     const uint64_t words = image.size() / 2;
@@ -312,7 +342,7 @@ int cmd_profile(const Args& a) {
 }
 
 int cmd_cfg(const Args& a) {
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     Cfg cfg(boot);
     cfg.run();
     std::print("{}", cfg.summary());
@@ -321,7 +351,7 @@ int cmd_cfg(const Args& a) {
 }
 
 int cmd_coverage(const Args& a) {
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     Cfg cfg(boot);
     cfg.run();
     const Coverage c = cfg.coverage();
@@ -337,7 +367,7 @@ int cmd_coverage(const Args& a) {
 }
 
 int cmd_trial(const Args& a) {
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     Cfg cfg(boot);
     cfg.run();
     std::print("{}", cfg.trial(a.base));
@@ -353,7 +383,7 @@ constexpr size_t rt_frame_steps = 16;
 
 int cmd_lift(const Args& a) {
     if (!a.out_dir) throw Failure{"lift needs --out <dir>"};
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     const KnownBuild* build = known_build(boot.sha256);
     if (!build) throw Failure{std::format("{}: not a supported program (SHA-256 {})", a.input, boot.sha256)};
     Cfg cfg(boot);
@@ -374,13 +404,13 @@ int cmd_lift(const Args& a) {
     for (const uint32_t head : build->idle)
         if (!std::ranges::any_of(cfg.functions(), [&](const auto& e) { return std::ranges::binary_search(e.second.insns, head); }))
             throw Failure{std::format("the wait loop at {:08x} (KnownBuild::idle) is in no function", head)};
-    const std::filesystem::path dir(*a.out_dir);
+    const std::filesystem::path dir = native_path(*a.out_dir);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    if (ec) throw Failure{std::format("cannot create {}", dir.string())};
+    if (ec) throw Failure{std::format("cannot create {}", utf8_path(dir))};
     // Stale chunks from an earlier run would be compiled too.
     for (const auto& entry : std::filesystem::directory_iterator(dir))
-        if (entry.path().filename().string().starts_with("lifted_")) std::filesystem::remove(entry.path());
+        if (utf8_path(entry.path().filename()).starts_with("lifted_")) std::filesystem::remove(entry.path());
 
     constexpr size_t kPerFile = 250;
     constexpr std::string_view kHead = "// Generated by qilin lift. Derived from the game: do not commit.\n";
@@ -395,7 +425,7 @@ int cmd_lift(const Args& a) {
     size_t lifted = 0, replaced = 0, in_chunk = 0, chunks = 0, instructions = 0;
     const auto flush = [&] {
         if (chunk.empty()) return;
-        write_text((dir / std::format("lifted_{:03}.cpp", chunks++)).string(),
+        write_text(utf8_path(dir / std::format("lifted_{:03}.cpp", chunks++)),
                    std::format("{}#include \"functions.hpp\"\nnamespace qilin::gen {{\n{}}}  // namespace qilin::gen\n", kHead, chunk));
         chunk.clear();
         in_chunk = 0;
@@ -439,8 +469,8 @@ int cmd_lift(const Args& a) {
         }
     }
     flush();
-    write_text((dir / "functions.hpp").string(), decls + "}  // namespace qilin::gen\n");
-    write_text((dir / "table.cpp").string(),
+    write_text(utf8_path(dir / "functions.hpp"), decls + "}  // namespace qilin::gen\n");
+    write_text(utf8_path(dir / "table.cpp"),
                table + std::format("}};\nextern const size_t g_function_count = {};\nextern const char g_lifted_sha256[] = \"{}\";\n",
                                    cfg.functions().size(), boot.sha256) +
                    [&] {
@@ -451,17 +481,17 @@ int cmd_lift(const Args& a) {
                        return s + std::format("}};\nextern const size_t g_jump_site_count = {};\n}}  // namespace qilin::rt\n",
                                               jump_sites.size());
                    }());
-    write_text((dir / "stubs.cpp").string(), stubs + "}  // namespace qilin::gen\n");
+    write_text(utf8_path(dir / "stubs.cpp"), stubs + "}  // namespace qilin::gen\n");
     // The literals compiled as constants, sorted: checked builds stop on a store into one.
     std::string lits = std::format("{}#include \"guest.hpp\"\n#ifdef QILIN_CHECKED_MEMORY  // checked builds only\nnamespace qilin::rt {{\nextern const Region g_folded[] = {{\n", kHead);
     for (const auto& [addr, size] : folded) lits += std::format("    {{0x{:08x}u, 0x{:08x}u}},\n", addr, addr + size);
-    write_text((dir / "literals.cpp").string(),
+    write_text(utf8_path(dir / "literals.cpp"),
                lits + std::format("}};\nextern const size_t g_folded_count = {};\n}}  // namespace qilin::rt\n#endif\n", folded.size()));
-    write_text((dir / "lift_report.txt").string(), report);
+    write_text(utf8_path(dir / "lift_report.txt"), report);
 
     const size_t total = cfg.functions().size();
     std::println("{} of {} functions lifted ({}), {} instructions, into {} files in {}", lifted, total,
-                 percent(lifted, total, 1), instructions, chunks, dir.string());
+                 percent(lifted, total, 1), instructions, chunks, utf8_path(dir));
     if (replaced) std::println("{} replaced by the port's native code", replaced);
     std::vector<std::pair<std::string, size_t>> sorted(reasons.begin(), reasons.end());
     std::ranges::sort(sorted, [](const auto& x, const auto& y) { return x.second > y.second; });
@@ -524,7 +554,7 @@ const HwDevice* hw_device(uint32_t v) {
 }
 
 int cmd_hardware(const Args& a) {
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     Cfg cfg(boot);
     cfg.run();
     // device -> register (literal value) -> functions naming it
@@ -555,7 +585,7 @@ int cmd_hardware(const Args& a) {
 // mnemonic and the registers it names (tools/check/verify_arm.py compares
 // these with binutils).
 int cmd_armdis(const Args& a) {
-    std::ifstream f(a.input, std::ios::binary);
+    std::ifstream f(native_path(a.input), std::ios::binary);
     if (!f) throw Failure{std::format("cannot read {}", a.input)};
     const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)), {});
     const uint32_t base = a.base;
@@ -575,15 +605,15 @@ int cmd_armdis(const Args& a) {
 // arm_table.cpp (every function, sorted, and the driver's SHA-256), into --out.
 int cmd_armlift(const Args& a) {
     if (!a.out_dir) throw Failure{"armlift needs --out <dir>"};
-    std::ifstream f(a.input, std::ios::binary);
+    std::ifstream f(native_path(a.input), std::ios::binary);
     if (!f) throw Failure{std::format("cannot read {}", a.input)};
     const std::vector<uint8_t> file((std::istreambuf_iterator<char>(f)), {});
     arm::ArmLifter lifter(arm::Image::of_driver(file));
     lifter.run();
-    const std::filesystem::path dir(*a.out_dir);
+    const std::filesystem::path dir = native_path(*a.out_dir);
     std::filesystem::create_directories(dir);
     for (const auto& entry : std::filesystem::directory_iterator(dir))
-        if (entry.path().filename().string().starts_with("arm_")) std::filesystem::remove(entry.path());
+        if (utf8_path(entry.path().filename()).starts_with("arm_")) std::filesystem::remove(entry.path());
     constexpr std::string_view kHead = "// Generated by qilin armlift. Derived from the game: do not commit.\n";
     std::string decls = std::format("{}#pragma once\n#include \"arm_guest.hpp\"\nnamespace qilin::armgen {{\nusing arm_rt::Context;\n", kHead);
     std::string table = std::format("{}#include \"arm_functions.hpp\"\nnamespace qilin::arm_rt {{\nextern const FnEntry g_functions[] = {{\n", kHead);
@@ -591,7 +621,7 @@ int cmd_armlift(const Args& a) {
     size_t chunks = 0, in_chunk = 0, bad = 0, insns = 0;
     const auto flush = [&] {
         if (chunk.empty()) return;
-        write_text((dir / std::format("arm_lifted_{:02}.cpp", chunks++)).string(),
+        write_text(utf8_path(dir / std::format("arm_lifted_{:02}.cpp", chunks++)),
                    std::format("{}#include \"arm_functions.hpp\"\nnamespace qilin::armgen {{\nnamespace rt = qilin::arm_rt;\n{}}}  // namespace qilin::armgen\n", kHead, chunk));
         chunk.clear();
         in_chunk = 0;
@@ -605,17 +635,17 @@ int cmd_armlift(const Args& a) {
         if (++in_chunk == 100) flush();
     }
     flush();
-    write_text((dir / "arm_functions.hpp").string(), decls + "}  // namespace qilin::armgen\n");
-    write_text((dir / "arm_table.cpp").string(),
+    write_text(utf8_path(dir / "arm_functions.hpp"), decls + "}  // namespace qilin::armgen\n");
+    write_text(utf8_path(dir / "arm_table.cpp"),
                table + std::format("}};\nextern const unsigned g_function_count = {};\nextern const char g_driver_sha256[] = \"{}\";\n}}  // namespace qilin::arm_rt\n",
                                    lifter.functions().size(), sha256_hex(file)));
     std::println("{} functions, {} instructions, {} literal words, {} stops where the code reaches something this core doesn't run, into {}",
-                 lifter.functions().size(), insns, lifter.literals().size(), bad, dir.string());
+                 lifter.functions().size(), insns, lifter.literals().size(), bad, utf8_path(dir));
     return 0;
 }
 
 int cmd_fpmode(const Args& a) {
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     Cfg cfg(boot);
     cfg.run();
     const FpSummary t = cfg.fp_summary();
@@ -643,7 +673,7 @@ int cmd_fpmode(const Args& a) {
 }
 
 int cmd_suspects(const Args& a) {
-    const BootFile boot = must(BootFile::load(a.input), a.input);
+    const BootFile boot = must(BootFile::load(native_path(a.input)), a.input);
     Cfg cfg(boot);
     cfg.run();
     for (const Suspect& s : cfg.suspects()) std::println("{:08x} {}", s.start, s.why);
@@ -651,9 +681,45 @@ int cmd_suspects(const Args& a) {
     return 0;
 }
 
+// The launcher's contract (identify.hpp): JSON whatever happens, and only
+// exit codes 0, 3 and 2.
+int cmd_identify(int argc, char** argv) {
+    std::optional<std::string> path, build;
+    bool json = false;
+    std::string problem;
+    for (int i = 2; i < argc; ++i) {
+        const std::string_view a = argv[i];
+        if (a == "--json") json = true;
+        else if (a == "--build" && i + 1 < argc) build = argv[++i];
+        else if (!a.starts_with("-") && !path) path = std::string(a);
+        else problem = std::format("identify: unexpected argument {}", a);
+    }
+    if (!path) problem = "identify takes one disc image";
+    if (!json) problem = "identify needs --json";
+    Identity id;
+    if (!problem.empty()) {
+        id.message = problem;
+    } else {
+        try {
+            id = identify(native_path(*path), build.value_or(""));
+        } catch (const std::exception& e) {
+            id = Identity{};
+            id.message = std::format("The recompiler failed: {}.", e.what());
+        }
+    }
+    std::print("{}", to_json(id));
+    std::fflush(stdout);
+    return id.code;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Windows: the arguments as UTF-8, from the UTF-16 command line (paths may be any text).
+    const qilin::CommandLine command_line(argc, argv);
+    argc = command_line.count();
+    argv = command_line.values();
+    if (argc >= 2 && std::string_view(argv[1]) == "identify") return cmd_identify(argc, argv);
     if (argc == 2 && std::string_view(argv[1]) == "--version") {
         std::println("qilin " QILIN_VERSION);
         return 0;

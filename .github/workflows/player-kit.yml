@@ -1,0 +1,84 @@
+name: Windows download
+
+# Builds the game's Windows download (tools/player-kit/package.sh, as Toy
+# Commander--QilinRecomp's): on every push, as an artifact to check; on a
+# version tag (vX.Y.Z), attached to that tag's GitHub Release as
+# MetropolisStreetRacer--QilinRecomp-X.Y.Z-windows-x64.zip. No game data is
+# used or included: players lift the game's program from their own disc image
+# with the bundled tools.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # to create the release and attach the download
+
+env:
+  LLVM_MINGW: "20261104"
+  LLVM_MINGW_CROSS_SHA256: 919380403de87dca3c581c2053230cd298af5e891286628ba0613b7fed370926
+  LLVM_MINGW_WINDOWS_SHA256: 552191b5754c49a5a20723276a6fc56541ea1922c4c50b7b669022333fc1b40f
+  ZSTD_LICENSE_SHA256: 7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8   # zstd v1.5.7 LICENSE (BSD), for libchdr's bundled decompressor
+  GAME: msr
+  PACKAGE: MetropolisStreetRacer--QilinRecomp
+  TITLE: Metropolis Street Racer
+  DISC: the North American release (MK-51012, version 1.010)
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # the tags, for the version of an untagged build
+      - name: Annotate compiler messages
+        run: echo "::add-matcher::.github/matchers/compilers.json"
+      - name: Ninja and zip (Linux, for the cross build)
+        run: sudo apt-get update -q && sudo apt-get install -y -q ninja-build zip
+      - name: Get the toolchains (pinned, checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools" && cd "$RUNNER_TEMP/tools"
+          base=https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW
+          curl -sSfL -o cross.tar.xz "$base/llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64.tar.xz"
+          curl -sSfL -o windows.zip "$base/llvm-mingw-$LLVM_MINGW-ucrt-x86_64.zip"
+          echo "$LLVM_MINGW_CROSS_SHA256  cross.tar.xz" | sha256sum -c
+          echo "$LLVM_MINGW_WINDOWS_SHA256  windows.zip" | sha256sum -c
+          curl -sSfL -o zstd-LICENSE https://raw.githubusercontent.com/facebook/zstd/v1.5.7/LICENSE
+          echo "$ZSTD_LICENSE_SHA256  zstd-LICENSE" | sha256sum -c
+          echo "ZSTD_LICENSE=$PWD/zstd-LICENSE" >> "$GITHUB_ENV"
+          mkdir cross windows
+          tar xJf cross.tar.xz -C cross
+          unzip -q windows.zip -d windows
+          echo "LLVM_MINGW_CROSS=$PWD/cross/llvm-mingw-$LLVM_MINGW-ucrt-ubuntu-22.04-x86_64" >> "$GITHUB_ENV"
+          echo "LLVM_MINGW_WINDOWS=$PWD/windows/llvm-mingw-$LLVM_MINGW-ucrt-x86_64" >> "$GITHUB_ENV"
+      - name: Package
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="${GITHUB_REF_NAME#v}"
+          else version="$(git describe --tags --always --match "v*")"; version="${version#v}"; fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          tools/player-kit/package.sh "$GAME" "$version" "$PWD/$PACKAGE-$version-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE }}-${{ env.VERSION }}-windows-x64
+          path: ${{ env.PACKAGE }}-${{ env.VERSION }}-windows-x64.zip
+          retention-days: 14
+      # The release may already be there (the Linux or macOS download's
+      # workflow made it), or be made by one of them at the same moment:
+      # upload if it exists, else create it, and once more after a pause if
+      # that lost the race.
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip="$PACKAGE-$VERSION-windows-x64.zip"
+          attach() {
+            if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+              gh release upload "$GITHUB_REF_NAME" "$zip" --clobber
+            else
+              gh release create "$GITHUB_REF_NAME" "$zip" --title "$TITLE QilinRecomp $VERSION" \
+                --notes "To play: download $zip below, unzip it, open the folder and double-click Play $TITLE.exe. Choose your disc (or drag it onto the window); the first start builds the game from it in a few minutes. You need your own disc, $DISC, as a .cue with its .bin tracks, a .gdi or a .chd. Changes: CHANGELOG.md."
+            fi
+          }
+          attach || { sleep 20; attach; }

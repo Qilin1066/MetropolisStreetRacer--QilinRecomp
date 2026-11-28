@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iterator>
 
+#include "path.hpp"
 #include "sha256.hpp"
 
 namespace qilin {
@@ -118,6 +119,8 @@ std::expected<IpBin, std::string> IpBin::parse(std::span<const uint8_t> data) {
     return ip;
 }
 
+std::span<const KnownBuild> known_builds() { return kKnownBuilds; }
+
 const KnownBuild* known_build(std::string_view sha256_hex) {
     for (const KnownBuild& b : kKnownBuilds)
         if (b.sha256 == sha256_hex) return &b;
@@ -126,9 +129,9 @@ const KnownBuild* known_build(std::string_view sha256_hex) {
 
 std::expected<BootFile, std::string> BootFile::load(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) return fail("cannot open " + path.string());
+    if (!f) return fail("cannot open " + utf8_path(path));
     const std::vector<uint8_t> bytes{std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
-    if (f.bad()) return fail("cannot read " + path.string());
+    if (f.bad()) return fail("cannot read " + utf8_path(path));
     return parse(bytes);
 }
 

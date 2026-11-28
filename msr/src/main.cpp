@@ -43,6 +43,8 @@
 #include "sh4.hpp"
 #include "ta.hpp"
 #include "video.hpp"
+#include "command_line.hpp"
+#include "path.hpp"
 #include "sha256.hpp"
 #include "sound_cpu.hpp"
 #include "system.hpp"
@@ -101,43 +103,44 @@ std::optional<std::vector<uint8_t>> read_in_folder(const std::filesystem::path& 
     return read_whole(at);
 }
 
-// The game and IP.BIN from the player's disc image (.cue or .gdi), or, for
+// The game and IP.BIN from the player's disc image (.cue, .gdi or .chd), or, for
 // development, from a folder of the extracted disc (served as a disc too).
 Disc read_disc(const std::filesystem::path& path) {
     Disc d;
+    const std::string shown = qilin::utf8_path(path);  // for messages (a Windows path may be any text)
     std::error_code ec;
     if (std::filesystem::is_directory(path, ec)) {
         auto program = read_whole(path / "MSR.BIN");
-        if (!program) rt::fatal("%s: no MSR.BIN in this folder", path.string().c_str());
+        if (!program) rt::fatal("%s: no MSR.BIN in this folder", shown.c_str());
         d.program = std::move(*program);
         if (auto ip = read_whole(path / "IP.BIN")) d.ip_bin = std::move(*ip);
         auto movie = read_in_folder(path, {"MOVIES", "MSR.SFD"});
-        if (!movie) rt::fatal("%s: no MOVIES/MSR.SFD in this folder", path.string().c_str());
+        if (!movie) rt::fatal("%s: no MOVIES/MSR.SFD in this folder", shown.c_str());
         d.movie = std::move(*movie);
         std::string why;
         d.drive = msr::Drive::of_folder(path, why);
-        if (!d.drive) rt::fatal("%s: %s", path.string().c_str(), why.c_str());
+        if (!d.drive) rt::fatal("%s: %s", shown.c_str(), why.c_str());
         return d;
     }
     auto disc = qilin::GdRom::open(path);
-    if (!disc) rt::fatal("%s: %s", path.string().c_str(), disc.error().c_str());
+    if (!disc) rt::fatal("%s: %s", shown.c_str(), disc.error().c_str());
     d.image = std::move(*disc);
     auto files = d.image->files();
-    if (!files) rt::fatal("%s: %s", path.string().c_str(), files.error().c_str());
+    if (!files) rt::fatal("%s: %s", shown.c_str(), files.error().c_str());
     for (const qilin::GdFile& f : *files)
         if (f.path == "MSR.BIN") {
             auto bytes = d.image->read_file(f);
-            if (!bytes) rt::fatal("%s: MSR.BIN: %s", path.string().c_str(), bytes.error().c_str());
+            if (!bytes) rt::fatal("%s: MSR.BIN: %s", shown.c_str(), bytes.error().c_str());
             d.program = std::move(*bytes);
         } else if (f.path == "MOVIES/MSR.SFD") {
             auto bytes = d.image->read_file(f);
-            if (!bytes) rt::fatal("%s: MOVIES/MSR.SFD: %s", path.string().c_str(), bytes.error().c_str());
+            if (!bytes) rt::fatal("%s: MOVIES/MSR.SFD: %s", shown.c_str(), bytes.error().c_str());
             d.movie = std::move(*bytes);
         }
-    if (d.program.empty()) rt::fatal("%s: no MSR.BIN on this disc (is it Metropolis Street Racer?)", path.string().c_str());
-    if (d.movie.empty()) rt::fatal("%s: no MOVIES/MSR.SFD on this disc", path.string().c_str());
+    if (d.program.empty()) rt::fatal("%s: no MSR.BIN on this disc (is it Metropolis Street Racer?)", shown.c_str());
+    if (d.movie.empty()) rt::fatal("%s: no MOVIES/MSR.SFD on this disc", shown.c_str());
     auto ip = d.image->system_area();
-    if (!ip) rt::fatal("%s: IP.BIN: %s", path.string().c_str(), ip.error().c_str());
+    if (!ip) rt::fatal("%s: IP.BIN: %s", shown.c_str(), ip.error().c_str());
     d.ip_bin = std::move(*ip);
     d.drive = msr::Drive::of_image(*d.image);
     return d;
@@ -183,15 +186,19 @@ LONG WINAPI crashed(EXCEPTION_POINTERS* e) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Windows: the arguments as UTF-8, from the UTF-16 command line (the disc's path may be any text).
+    const qilin::CommandLine command_line(argc, argv);
+    argc = command_line.count();
+    argv = command_line.values();
     if (argc != 2) {
-        std::fprintf(stderr, "usage: msr <disc image (.cue or .gdi), or a folder of the extracted disc>\n");
+        std::fprintf(stderr, "usage: msr <disc image (.cue, .gdi or .chd), or a folder of the extracted disc>\n");
         return 1;
     }
 #ifdef _WIN32
     SetUnhandledExceptionFilter(crashed);
 #endif
     dreamcast::set_command_line(argc, argv);  // for the menu's "Restore and restart"
-    Disc disc = read_disc(argv[1]);
+    Disc disc = read_disc(qilin::native_path(argv[1]));
     // The game this build was lifted from, and nothing else: lifted code is that file's.
     const std::string sha = qilin::sha256_hex(disc.program);
     if (sha != rt::g_lifted_sha256)

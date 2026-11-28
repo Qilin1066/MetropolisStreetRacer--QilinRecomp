@@ -34,6 +34,7 @@
 #include "transfer.hpp"
 #include "system.hpp"
 #include "gdrom.hpp"
+#include "identify.hpp"
 #include "guest.hpp"
 #include "fiber.hpp"
 #include "memory.hpp"
@@ -1303,6 +1304,91 @@ void test_gdrom() {
     fs::remove_all(dir);
 }
 
+// The launcher's identify contract (identify.hpp; tools/player-kit/launcher/ADOPTING.md):
+// the supported disc, another build, an unknown version, a disc without the
+// program, and inputs that can't be read; and .chd images libchdr refuses.
+void test_identify() {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "qilin_msr_identify";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    SyntheticDisc s;
+    const auto write_disc = [&](uint32_t track5_at) {
+        write_file(dir / "disc (Track 1).bin", raw_track(nullptr, 0, 4));
+        write_file(dir / "disc (Track 2).bin", std::vector<uint8_t>(size_t(6) * 2352, 0x11));
+        write_file(dir / "disc (Track 3).bin", raw_track(s.at(45000), 45000, SyntheticDisc::kTrack3Sectors));
+        write_file(dir / "disc (Track 4).bin", std::vector<uint8_t>(size_t(SyntheticDisc::kTrack4Sectors) * 2352, 0x22));
+        write_file(dir / "disc (Track 5).bin", raw_track(s.at(45050), track5_at, SyntheticDisc::kTrack5Sectors));
+        write_file(dir / "disc.cue", kCue);
+    };
+    write_disc(45050);
+    const fs::path cue = dir / "disc.cue";
+    const std::string sha = sha256_hex(s.boot);
+    const std::string zero(64, '0');
+    const SupportedDisc discs[] = {
+        {"Fixture (World)", "T-00000", "V1.002", "1ST_READ.BIN", sha},
+        {"Other Game (Europe)", "T-99999", "V2.010", "1ST_READ.BIN", zero},
+    };
+    const SupportedDisc other_first[] = {
+        {"Fixture (World)", "T-00000", "V1.002", "1ST_READ.BIN", zero},
+        {"Other Game (Europe)", "T-99999", "V2.010", "1ST_READ.BIN", sha},
+    };
+    const SupportedDisc elsewhere[] = {{"Fixture (World)", "T-00000", "V1.002", "MSR.BIN", sha}};
+
+    const Identity right = identify(cue, "Fixture (World)", discs);
+    CHECK(right.ok && right.code == 0 && right.title == "Fixture (World)" && right.id == "T-00000" && right.version == "1.002");
+    CHECK(right.message == "This is Fixture (World), T-00000 version 1.002: the right disc.");
+    const Identity any = identify(cue, "", discs);
+    CHECK(any.ok && any.code == 0);
+    // Another build's disc: readable, not the supported one.
+    const Identity other = identify(cue, "Fixture (World)", other_first);
+    CHECK(!other.ok && other.code == 3 && other.title == "Other Game (Europe)");
+    CHECK(other.message == "This is Other Game (Europe). This download is for Fixture (World), T-00000 version 1.002.");
+    // A version nobody knows: what the bootstrap says, and what's needed.
+    const Identity unknown = identify(cue, "Other Game (Europe)", std::span(discs + 1, 1));
+    CHECK(!unknown.ok && unknown.code == 3 && unknown.title == "A SYNTHETIC DISC" && unknown.id == "T-00000" && unknown.version == "1.002");
+    CHECK(unknown.message == "This disc isn't a version this download knows. Its bootstrap says it is A SYNTHETIC DISC, product T-00000, "
+                             "version 1.002. This download is for Other Game (Europe), T-99999 version 2.010.");
+    // A Dreamcast disc without the game's program.
+    const Identity absent = identify(cue, "Fixture (World)", elsewhere);
+    CHECK(!absent.ok && absent.code == 3 && absent.title == "A SYNTHETIC DISC");
+    CHECK(absent.message == "This disc (A SYNTHETIC DISC, product T-00000, version 1.002) has no MSR.BIN, the game's program. "
+                            "This download is for Fixture (World), T-00000 version 1.002.");
+    CHECK(identify(cue, "No Such Build", discs).code == 2);
+    // The real table: this synthetic disc isn't Metropolis Street Racer.
+    CHECK(supported_discs().size() == 1 && supported_discs()[0].sha256.size() == 64);
+    const Identity real = identify(cue, "Metropolis Street Racer (USA)");
+    CHECK(!real.ok && real.code == 3 && real.message.ends_with("This download is for Metropolis Street Racer (USA), MK-51012 version 1.010."));
+    // The JSON: one object, the message escaped.
+    Identity quoted = right;
+    quoted.message = "a \"quote\"\\ and\na line";
+    CHECK(to_json(quoted) == "{\"ok\": true, \"title\": \"Fixture (World)\", \"id\": \"T-00000\", \"version\": \"1.002\", "
+                             "\"message\": \"a \\\"quote\\\"\\\\ and\\na line\"}\n");
+    CHECK(to_json(Identity{}).starts_with("{\"ok\": false, "));
+
+    // Unreadable: the program's sectors say they are elsewhere; a missing
+    // track; a missing file; a folder; a file that isn't a disc image (with a
+    // name in another script); a .chd that isn't one.
+    write_disc(45051);
+    const Identity broken = identify(cue, "Fixture (World)", discs);
+    CHECK(!broken.ok && broken.code == 2 && broken.message.starts_with("Can't read 1ST_READ.BIN from this disc"));
+    fs::remove(dir / "disc (Track 5).bin");
+    const Identity damaged = identify(cue, "Fixture (World)", discs);
+    CHECK(!damaged.ok && damaged.code == 2 && damaged.message.starts_with("Can't read this disc image"));
+    CHECK(identify(dir / "missing.cue", "", discs).code == 2);
+    CHECK(identify(dir, "", discs).code == 2);
+    const fs::path unicode = dir / fs::path(u8"保存.bin");
+    write_file(unicode, std::string_view("\x09\x00", 2));
+    const Identity not_image = identify(unicode, "", discs);
+    CHECK(!not_image.ok && not_image.code == 2 && not_image.message.ends_with("isn't a disc image: choose the disc's .cue, .gdi or .chd file."));
+    write_file(dir / "bad.chd", std::string(4096, 'x'));
+    const auto chd = GdRom::open(dir / "bad.chd");
+    CHECK(!chd.has_value() && chd.error().contains("not a CHD"));
+    CHECK(identify(dir / "bad.chd", "", discs).code == 2);
+    CHECK(GdRom::is_image("a.GDI") && GdRom::is_image("b.chd") && GdRom::is_image("c.Cue") && !GdRom::is_image("d.iso"));
+    fs::remove_all(dir);
+}
+
 // A longjmp across frames, by hand in the shape the lifter generates: `outer`
 // calls setjmp (here, a site armed by hand), then `middle`, which calls
 // `inner`, which "returns" to the site with the stack pointer it had.
@@ -1814,6 +1900,7 @@ int main() {
     test_floating_point();
     test_lifter_floating_point();
     test_gdrom();
+    test_identify();
     test_nonlocal_return();
     test_guest_threads();
     test_folder_drive();
